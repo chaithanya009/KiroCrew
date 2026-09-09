@@ -33,9 +33,12 @@ def _make_kiro_session(kiro_dir, sid: str) -> None:
 
 @pytest.fixture()
 def patched(tmp_path, monkeypatch):
+    from kiro_crew import session_map as sm_mod
+
     kiro = tmp_path / "kiro"
     monkeypatch.setattr("kiro_crew.session_map.config_dir", lambda: tmp_path)
     monkeypatch.setattr("kiro_crew.session_map._KIRO_SESSIONS_DIR", kiro)
+    sm_mod._reset_adopted_source_cache()
     return tmp_path, kiro
 
 
@@ -159,6 +162,156 @@ class TestResumeHardGate:
         _write_map(tmp_path, {"1718000000.123456": "sid-live"})
         SessionMap()
         assert (kiro / "sid-live.json").exists()
+
+
+class TestHostPairRetirement:
+    def test_window_append_survives_host_witness_retirement(self, tmp_path, monkeypatch):
+        """A turn appended after revalidation stays recoverable in the host journal."""
+        from kiro_crew import session_map as sm_mod
+
+        source = tmp_path / "host-sessions"
+        source.mkdir()
+        sid = "sid-window"
+        host_json = source / f"{sid}.json"
+        host_jsonl = source / f"{sid}.jsonl"
+        adopted_jsonl = tmp_path / "adopted.jsonl"
+        journal = '{"role":"user","content":"before"}\n'
+        appended = '{"role":"assistant","content":"window append"}\n'
+        host_json.write_text("{}", encoding="utf-8")
+        host_jsonl.write_text(journal, encoding="utf-8")
+        adopted_jsonl.write_text(journal, encoding="utf-8")
+        host_json_stat = host_json.lstat()
+        host_jsonl_stat = host_jsonl.lstat()
+        real_unlink = sm_mod.os.unlink
+
+        def _append_before_witness_unlink(path, *args, **kwargs):
+            if path == host_json:
+                with host_jsonl.open("a", encoding="utf-8") as stream:
+                    stream.write(appended)
+            return real_unlink(path, *args, **kwargs)
+
+        monkeypatch.setattr(sm_mod.os, "unlink", _append_before_witness_unlink)
+
+        assert sm_mod._retire_host_pair(
+            sid,
+            source,
+            host_json,
+            host_jsonl,
+            host_json_stat,
+            host_jsonl_stat,
+        )
+
+        assert not host_json.exists()
+        assert host_jsonl.exists(), "retirement destroyed the journal containing a window append"
+        assert host_jsonl.read_text(encoding="utf-8") == journal + appended
+        assert adopted_jsonl.read_text(encoding="utf-8") == journal
+
+    def test_retirement_removes_only_the_witness_and_converges(self, tmp_path, monkeypatch):
+        """The state witness retires while the inert journal remains recoverable."""
+        from kiro_crew import session_map as sm_mod
+
+        source = tmp_path / "host-sessions"
+        target = tmp_path / "adopted-sessions"
+        source.mkdir()
+        sid = "sid-converged"
+        host_json = source / f"{sid}.json"
+        host_jsonl = source / f"{sid}.jsonl"
+        host_json.write_text("{}", encoding="utf-8")
+        host_jsonl.write_text('{"role":"user","content":"kept"}\n', encoding="utf-8")
+        _make_kiro_session(target, sid)
+        monkeypatch.setattr(sm_mod, "_adopted_transcript_source", lambda: source)
+        monkeypatch.setattr(sm_mod, "_KIRO_SESSIONS_DIR", target)
+
+        assert sm_mod._retire_host_pair(
+            sid,
+            source,
+            host_json,
+            host_jsonl,
+            host_json.lstat(),
+            host_jsonl.lstat(),
+        )
+
+        assert not host_json.exists()
+        assert host_jsonl.is_file()
+        assert sm_mod.host_transcript_pending(sid) is False
+        assert sm_mod._serve_verdict(sid, sm_mod.MigrationOutcome.MIGRATED) == sid
+
+
+class TestServeVerdict:
+    def test_withholds_only_when_the_host_witness_vanished_without_an_adopted_pair(
+        self, tmp_path, monkeypatch
+    ):
+        from kiro_crew import session_map as sm_mod
+
+        source = tmp_path / "host-sessions"
+        target = tmp_path / "adopted-sessions"
+        source.mkdir()
+        target.mkdir()
+        sid = "sid-verdict"
+        monkeypatch.setattr(sm_mod, "_adopted_transcript_source", lambda: source)
+        monkeypatch.setattr(sm_mod, "_KIRO_SESSIONS_DIR", target)
+
+        _make_kiro_session(target, sid)
+        assert sm_mod._serve_verdict(sid, sm_mod.MigrationOutcome.FAILED) == sid
+        assert sm_mod._serve_verdict(sid, sm_mod.MigrationOutcome.NOT_PENDING) == sid
+
+        (target / f"{sid}.json").unlink()
+        (target / f"{sid}.jsonl").unlink()
+        _make_kiro_session(source, sid)
+        assert sm_mod._serve_verdict(sid, sm_mod.MigrationOutcome.FAILED) is None
+
+        (source / f"{sid}.json").unlink()
+        (source / f"{sid}.jsonl").unlink()
+        assert sm_mod._serve_verdict(sid, sm_mod.MigrationOutcome.FAILED) is None
+
+        # The witness is back beside no journal: never resumable, nothing to lose.
+        (source / f"{sid}.json").write_text("{}", encoding="utf-8")
+        assert sm_mod._serve_verdict(sid, sm_mod.MigrationOutcome.FAILED) == sid
+        (source / f"{sid}.jsonl").write_text("{}\n", encoding="utf-8")
+        assert sm_mod._serve_verdict(sid, sm_mod.MigrationOutcome.FAILED) == sid
+
+    @pytest.mark.asyncio
+    async def test_second_migrator_retirement_withholds_and_keeps_mapping(
+        self, patched, monkeypatch
+    ):
+        from kiro_crew import session_map as sm_mod
+        from kiro_crew.config.paths import isolated_kiro_home
+
+        tmp_path, _ = patched
+        source = tmp_path / "host-sessions"
+        own_home = tmp_path / "foreign-home"
+        own_home.mkdir()
+        own_kiro_home = isolated_kiro_home(own_home)
+        own_kiro_home.mkdir()
+        target = own_kiro_home / "sessions" / "cli"
+        sid = "sid-second-migrator"
+        key = "slack:1718000000.654321"
+        _make_kiro_session(source, sid)
+        _write_map(tmp_path, {key: sid})
+        session_map = SessionMap()
+        host_json = source / f"{sid}.json"
+        host_jsonl = source / f"{sid}.jsonl"
+        monkeypatch.setattr(sm_mod, "_adopted_transcript_source", lambda: source)
+        monkeypatch.setattr(sm_mod, "_KIRO_SESSIONS_DIR", target)
+        monkeypatch.setattr(sm_mod, "foreign_data_home", lambda: own_home)
+
+        def _retired_by_another_migrator(*_args, **_kwargs):
+            host_json.unlink()
+            return False
+
+        monkeypatch.setattr(sm_mod, "_retire_host_pair", _retired_by_another_migrator)
+
+        lookup = await sm_mod.resolve_resume_sid(session_map, key)
+
+        assert lookup == sm_mod.ResumeLookup(None, withheld=True)
+        # Holds for THIS open only: the next open's guarded ``get()`` retires the
+        # entry through ``_repair_or_remove_stale`` (audited / ``discarded_sid``),
+        # which is the intended reconciliation of a witness another instance retired.
+        assert session_map.mapped_sid(key) == sid
+        assert host_jsonl.is_file()
+        assert not host_json.exists()
+        assert not (target / f"{sid}.json").exists()
+        assert not (target / f"{sid}.jsonl").exists()
 
 
 class TestMigrationCollision:
