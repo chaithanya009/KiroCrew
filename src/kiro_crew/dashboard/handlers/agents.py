@@ -4707,6 +4707,23 @@ async def api_kirocrew_agents_create(request: web.Request) -> web.Response:
             },
             status=400,
         )
+    # The crew name must satisfy the same grammar ``GET /api/members`` applies
+    # when it lists the roster (``members.py`` skips any row failing
+    # ``_AGENT_NAME_RE``). Persisting a name that fails it -- a space, a non-ASCII
+    # letter, a leading dash -- would create a crew no roster surface can show or
+    # open; refused here, once, for every client of this route. Same BOUNDARY
+    # as the credential rule above: names already stored are not renamed.
+    if not _AGENT_NAME_RE.match(name):
+        return web.json_response(
+            {
+                "error": (
+                    "Agent name must use letters, digits, '-' or '_' only, "
+                    "start and end with a letter or digit, and be at most 64 characters."
+                ),
+                "code": "invalid_agent_name",
+            },
+            status=400,
+        )
     # The template pointer must be EXPLICIT. Defaulting it to "kirocrew" would
     # make every crew created without naming a template an alias for the DEFAULT
     # agent: dispatch flattens an alias to its `kiro_agent`
@@ -4910,8 +4927,18 @@ async def api_kirocrew_agents_create(request: web.Request) -> web.Response:
         source="dashboard",
         resources=name,
     )
+    # `member_id` is the crew's IMMUTABLE identity (allocated with its member
+    # memory; `member_config_for_id` resolves it and never a name or slug), so a
+    # client that must bind something to the crew it just made -- the Meet
+    # CrewMates flow's schedule -- can do so without going back through the
+    # mutable display name.
     return web.json_response(
-        {"ok": True, "name": name, "memory_store": cfg.agents[name].memory_store}
+        {
+            "ok": True,
+            "name": name,
+            "memory_store": cfg.agents[name].memory_store,
+            "member_id": cfg.agents[name].member_id,
+        }
     )
 
 
