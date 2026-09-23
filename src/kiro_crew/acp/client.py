@@ -61,6 +61,7 @@ from kiro_crew.acp import seed_provenance
 from kiro_crew.acp._dispatch import (
     ACP_BACKENDS_META_IDENTITY,
     DRAIN_YIELD_AFTER_S,
+    _dumps_degraded,
     _measure_tool_output,
     agent_version_from_init,
     build_permission_event,
@@ -13267,7 +13268,7 @@ class AcpClient:
             input_str = ""
             if tool_call_id and raw_input:
                 input_str = (
-                    json.dumps(raw_input, indent=2)
+                    _dumps_degraded(raw_input, indent=2)
                     if isinstance(raw_input, (dict, list))
                     else str(raw_input)
                 )
@@ -13458,7 +13459,7 @@ class AcpClient:
                             if "stdout" in j and j.get("stdout"):
                                 output_parts.append(str(j["stdout"]))
                             else:
-                                output_parts.append(json.dumps(j, default=str))
+                                output_parts.append(_dumps_degraded(j, default=str))
                 # Path 3: an object that is not that envelope at all. Mirrors
                 # ``_dispatch._build_tool_result_event`` -- ``rawOutput`` is
                 # unstructured passthrough, so ``items[]`` is one producer's
@@ -13473,7 +13474,7 @@ class AcpClient:
                 # method, because a cut taken before redaction can split a
                 # credential into fragments no pattern matches.
                 if raw_output and "items" not in raw_output:
-                    output_parts.append(json.dumps(raw_output, default=str))
+                    output_parts.append(_dumps_degraded(raw_output, default=str))
 
         tool_status = str(update.get("status") or "")
         if not output_parts:
@@ -13549,10 +13550,7 @@ class AcpClient:
         # the merged toolLog entry / message meta lines up across both events.
         input_str = ""
         if isinstance(raw_input, (dict, list)) and raw_input:
-            try:
-                input_str = json.dumps(raw_input, indent=2)
-            except (TypeError, ValueError):
-                input_str = str(raw_input)
+            input_str = _dumps_degraded(raw_input, indent=2)
         elif isinstance(raw_input, str):
             input_str = raw_input
         # Edit-style diff content blocks: prefer the rendered unified diff over
@@ -13653,7 +13651,12 @@ class AcpClient:
                         continue
                     try:
                         entry = json.loads(line)
-                    except json.JSONDecodeError:
+                    # A line past the decoder's recursion ceiling raises
+                    # ``RecursionError``, which is a ``RuntimeError`` and not a
+                    # ``JSONDecodeError``: unlisted, it reaches the method's
+                    # catch-all arm and costs every LATER line's results too,
+                    # since the saved offset has already moved past this one.
+                    except (json.JSONDecodeError, RecursionError):
                         continue
                     if entry.get("kind") != "ToolResults":
                         continue
@@ -13675,7 +13678,7 @@ class AcpClient:
                                     if out:
                                         output_parts.append(out[:4000])
                                 else:
-                                    output_parts.append(json.dumps(d, indent=2)[:4000])
+                                    output_parts.append(_dumps_degraded(d, indent=2)[:4000])
                             elif rc.get("kind") == "text":
                                 output_parts.append(str(rc.get("data", ""))[:4000])
                         if output_parts:
