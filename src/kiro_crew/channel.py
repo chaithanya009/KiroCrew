@@ -34,6 +34,17 @@ logger = logging.getLogger(__name__)
 _MAX_AGENTS = 3
 _MAX_CHANNELS = 1
 _MAX_MESSAGES = 200
+# One bound for EVERY string an approval message retains: the prose input,
+# the card title, and each ``meta`` value. ``_MAX_MESSAGES`` caps the ring by
+# count; this caps what each retained entry can weigh, so a model-authored
+# command cannot grow the persisted channel without bound. Shared by name so
+# the prose and the metadata can never bound the same population differently.
+_APPROVAL_FIELD_MAX_CHARS = 500
+# The card title of a grantable shell command is this prefix plus the command,
+# and the exact tier sends the title back (minus the prefix) as its consent
+# proof. The whole title must fit the bound above, or the proof would be a
+# prefix of the pending command; the grant check below subtracts this.
+_APPROVAL_SHELL_TITLE_PREFIX = "Running: "
 _MAX_A2A_EXCHANGES = 3
 
 # Max time an agent blocks on its inbox before re-checking its stop condition,
@@ -244,6 +255,16 @@ class ChannelMessage:
     thread_id: str | None = None  # parent message ID (None = top-level)
     reply_to: str | None = None  # agent ID of parent message sender
     reply_count: int = 0  # thread reply count (top-level only)
+    # Structured facts beside the prose, for renderers that make decisions
+    # from the message rather than display it. An approval carries the
+    # server's own verdict on which trust tiers it can record (see the
+    # approval post in ``_stream_task``), so the card is gated by server fact
+    # instead of a client regex over ``content``. Flat string values only,
+    # mirroring chat's ``perm_meta``; every value is already display-redacted.
+    # ``None`` for every other message and for messages persisted before the
+    # field existed -- their prose is unchanged, so a renderer that ignores
+    # ``meta`` (Slack mirrors, older dashboards) shows exactly what it did.
+    meta: dict[str, str] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -257,6 +278,7 @@ class ChannelMessage:
             "thread_id": self.thread_id,
             "reply_to": self.reply_to,
             "reply_count": self.reply_count,
+            "meta": self.meta,
         }
 
 
@@ -399,6 +421,7 @@ class Channel:
         mention: str | list[str] | None = None,
         msg_type: str = "progress",
         thread_id: str | None = None,
+        meta: dict[str, str] | None = None,
     ) -> ChannelMessage:
         # Normalize mentions to a set
         mentions: set[str] = set()
@@ -425,6 +448,7 @@ class Channel:
             msg_type=msg_type,
             thread_id=thread_id,
             reply_to=reply_to,
+            meta=meta,
         )
         self.messages.append(msg)
         self._msg_index[msg.id] = msg
@@ -604,6 +628,7 @@ class Channel:
                 thread_id=md.get("thread_id"),
                 reply_to=md.get("reply_to"),
                 reply_count=md.get("reply_count", 0),
+                meta=md.get("meta"),
             )
             ch.messages.append(msg)
             ch._msg_index[msg.id] = msg
@@ -1167,7 +1192,7 @@ async def _stream_task(
                 # tool_input is model-authored and size-unbounded, so the
                 # full-text pass runs off-loop (no-blocking-call-on-event-loop).
                 sanitized_input = await asyncio.to_thread(
-                    redact_and_truncate, event.tool_input, 500
+                    redact_and_truncate, event.tool_input, _APPROVAL_FIELD_MAX_CHARS
                 )
                 # The card's tool name. For a shell tool prefer the CANONICAL
                 # command (from ``tool_input``) over the display title: kiro's
@@ -1185,12 +1210,19 @@ async def _stream_task(
                 # already removed. Either signal makes the command display-only.
                 _safe_cmd, _cmd_credential_redacted = redact_credentials(_cmd)
                 _safe_cmd, _cmd_url_redacted = redact_exfiltration_urls(_safe_cmd)
+                # A command whose TITLE (prefix + command) would exceed the
+                # retained-field bound is display-only too: the title is the
+                # exact tier's consent proof, and an elided title can never
+                # equal the pending command -- a grant keyed on a prefix is a
+                # grant the user did not read. Measured on the title's length,
+                # not the command's, so a grantable title is always complete.
                 _command_grantable = bool(_cmd) and not (
                     bool(getattr(event, "tool_input_redacted", False))
                     or _cmd_credential_redacted
                     or _cmd_url_redacted
                     or _safe_cmd != _cmd
                     or "[REDACTED" in _cmd
+                    or len(_APPROVAL_SHELL_TITLE_PREFIX) + len(_cmd) > _APPROVAL_FIELD_MAX_CHARS
                 )
                 if _cmd:
                     # ``Running:`` is the channel UI's explicit proof that
@@ -1215,14 +1247,22 @@ async def _stream_task(
                     # readers are not all engineers, so it names neither bytes
                     # nor redaction.
                     _card_name = (
-                        f"Running: {_safe_cmd}"
+                        f"{_APPROVAL_SHELL_TITLE_PREFIX}{_safe_cmd}"
                         if _command_grantable
                         else f"Shell command (exact text unverified): {_safe_cmd}"
                     )
                 else:
                     _card_name = event.text or event.title or ""
-                sanitized_name, _ = redact_credentials(_card_name)
-                sanitized_name, _ = redact_exfiltration_urls(sanitized_name)
+                # Redacted, then bounded at retention: the name is stored in
+                # the prose and in ``meta`` and must not outgrow either. An
+                # elided name ends in a visible marker so a cut command can
+                # never read as a complete one; a grantable title is never
+                # elided (the grant check above bounds it), so the marker only
+                # ever lands on a display-only card.
+                sanitized_name, _ = redact_exfiltration_urls(_card_name)
+                sanitized_name, _ = redact_credentials(sanitized_name)
+                if len(sanitized_name) > _APPROVAL_FIELD_MAX_CHARS:
+                    sanitized_name = sanitized_name[: _APPROVAL_FIELD_MAX_CHARS - 1] + "…"
                 loop = asyncio.get_running_loop()
                 # Bind-target for a per-command trust decision on THIS
                 # approval: the canonical shell command ("" for non-shell
@@ -1234,6 +1274,27 @@ async def _stream_task(
                 approval_future = loop.create_future()
                 agent._pending_approval_command = _cmd if _command_grantable else ""
                 agent._approval_future = approval_future
+                # The card's structured facts, beside the unchanged prose. The
+                # server is the only side that can refuse a per-command tier
+                # (``handlers_channel.approve``), so it states here which
+                # tiers THIS approval can record: ``is_shell`` gates both
+                # per-command tiers, ``base_derivable`` the base tier alone,
+                # and ``base_command`` is the very binary the endpoint would
+                # grant -- a compound ``cat f | wc -l`` has none, where a
+                # first-token guess would have offered ``cat``. Values are the
+                # already-redacted display strings, each within
+                # ``_APPROVAL_FIELD_MAX_CHARS`` (the base is one token of a
+                # command already under that bound); the raw command never
+                # leaves this scope.
+                _base_binary = _shell_base_binary(_cmd) if _command_grantable else None
+                approval_meta: dict[str, str] = {
+                    "tool_title": sanitized_name,
+                    "tool_input": sanitized_input,
+                    "is_shell": "1" if _cmd else "",
+                    "command_grantable": "1" if _command_grantable else "",
+                    "base_derivable": "1" if _base_binary else "",
+                    "base_command": _base_binary or "",
+                }
                 try:
                     # Posting and waiting are one ownership scope. If the post
                     # itself fails, neither the Future nor its command authority
@@ -1244,6 +1305,7 @@ async def _stream_task(
                         from_role=agent.role,
                         msg_type="approval",
                         thread_id=thread_id,
+                        meta=approval_meta,
                     )
                     decision = await asyncio.wait_for(approval_future, timeout=3600)
                 except asyncio.TimeoutError:
