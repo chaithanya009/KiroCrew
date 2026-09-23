@@ -2089,6 +2089,25 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         "apps/builtins/dev_fleet/repository.py",
         "apps/builtins/dev_fleet/live.py",
         "apps/builtins/dev_fleet/worktree_ops.py",
+        # Same Dev Fleet surface: redacts a failed systemd/launchd command's
+        # stderr at the point of capture, before its bounded tail becomes the
+        # cutover failure reason the app's own routes render.
+        "apps/builtins/dev_fleet/gateway_service.py",
+        # Capture-side, not egress: the GitHub Issues provider scrubs `gh`'s
+        # stderr as it captures a failed poll or action, before the bounded tail
+        # becomes the error text. The surfaces that SHOW that text (the app's
+        # routes and dispatch) are the registered sinks.
+        "apps/builtins/ops_mission_control/backend/providers/github_issues.py",
+        # Gate-side log hygiene, same shape as update_provider: the tailnet
+        # probe and mise activation redact a failed CLI's stderr before its
+        # bounded tail is written to the gateway debug log; an auth-key or
+        # registry URL in that stderr must not reach the log ring / /api/logs.
+        "dashboard/tailnet.py",
+        "env.py",
+        # Operator's own terminal during `kirocrew setup`: redacts npm's and
+        # electron-builder's stderr (a registry URL can carry a token) before
+        # the bounded tail is printed. Same classification as cli_commands.py.
+        "cli_setup.py",
         "apps/builtins/issue_radar/backend/routes.py",
         "apps/builtins/meetings/backend/domain/session.py",
         # Live translation redacts the MODEL's answer before writing it to the

@@ -4754,7 +4754,20 @@ async def run_script_hook(
         stderr_text = _decode_capped(stderr_b, stderr_trunc).strip()
         stdout_safe = redact_via_context(stdout_text) if stdout_text else ""
         stderr_safe_full = redact_via_context(stderr_text) if stderr_text else ""
-        stderr_safe = stderr_safe_full[:500]
+        # An exit-2 deny reason is authored text and reads from the head; any
+        # other failure is a crash whose diagnosis is printed last, so its
+        # last_error excerpt keeps the tail. When the byte cap fired the real
+        # tail was discarded before decoding, so the head is the only honest
+        # excerpt left, and the truncation marker is re-appended so the excerpt
+        # still says it is clipped. Redaction already ran on the full capped
+        # stream above, so neither cut can sever a secret.
+        if exit_code == 2:
+            stderr_safe = stderr_safe_full[:500]
+        elif stderr_trunc:
+            head_len = 500 - len(_HOOK_TRUNCATION_MARKER)
+            stderr_safe = stderr_safe_full[:head_len] + _HOOK_TRUNCATION_MARKER
+        else:
+            stderr_safe = stderr_safe_full[-500:]
         hook.last_run = time.time()
         if exit_code == 2:
             hook.last_status = "blocked"
