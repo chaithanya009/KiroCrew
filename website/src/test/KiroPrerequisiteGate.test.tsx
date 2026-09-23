@@ -43,6 +43,7 @@ function status(overrides: Partial<KiroPrerequisiteStatus> = {}): KiroPrerequisi
     docs_url: 'https://kiro.dev/cli/',
     login_command: 'kiro-cli login',
     sso_login_command: 'kiro-cli login --use-device-flow --license pro',
+    bundled_cli: false,
     setup_allowed: true,
     sandbox_unavailable: false,
     sandbox_failure_kind: '',
@@ -222,6 +223,44 @@ describe('KiroPrerequisiteGate', () => {
     expect(screen.getByRole('button', { name: /Check again/ })).toBeEnabled()
     expect(screen.queryByRole('button', { name: 'Sign in to Kiro' })).not.toBeInTheDocument()
     expect(screen.queryByText(/unverified executable/)).not.toBeInTheDocument()
+    // A PATH install: bare commands, nothing muted, no bundled-copy hint.
+    expect(screen.queryByText(/built into the desktop app/)).not.toBeInTheDocument()
+  })
+
+  it('mutes the shared bundled path and hints once below both commands', async () => {
+    // A desktop install resolves the app's own kiro-cli, which is not on the
+    // user's PATH, so both commands open with the same quoted absolute path and
+    // differ only after `login`. Two full lines read as one command shown twice,
+    // so the shared run is muted and the tail carries the weight; the copied
+    // text is still the whole command. The hint saying what the path is applies
+    // to both commands equally, so it appears ONCE, below both boxes, not under
+    // the first one only.
+    const bin =
+      "'/Applications/Kiro Crew.app/Contents/Resources/backend-dist/kiro-cli/kiro-cli-chat'"
+    vi.mocked(api.kiroPrerequisite).mockResolvedValue(status({
+      installed: true,
+      authenticated: false,
+      bundled_cli: true,
+      login_command: `${bin} login`,
+      sso_login_command: `${bin} login --use-device-flow --license pro`,
+    }))
+
+    renderWithProviders(
+      <KiroPrerequisiteGate><div>Dashboard loaded</div></KiroPrerequisiteGate>,
+    )
+
+    await screen.findByText(/Sign in with Kiro CLI on the gateway host/)
+    const codes = screen.getAllByText(
+      (_, el) => el?.tagName === 'CODE' && (el.textContent ?? '').startsWith(bin),
+    )
+    expect(codes.map((c) => c.textContent)).toEqual([
+      `${bin} login`,
+      `${bin} login --use-device-flow --license pro`,
+    ])
+    for (const code of codes) {
+      expect(code.querySelector('span.text-muted')?.textContent).toBe(`${bin} `)
+    }
+    expect(screen.getAllByText(/built into the desktop app/)).toHaveLength(1)
   })
 
   it('exposes no way to start a sign-in from the dashboard', async () => {
