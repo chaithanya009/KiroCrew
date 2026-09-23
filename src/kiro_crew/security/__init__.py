@@ -295,6 +295,8 @@ from .exfil import (
     oauth_rejection_is_endpoint_exemptible,
     oauth_url_contains_credential,
     redact_exfiltration_urls,
+    redact_exfiltration_urls_with_records,
+    bounded_blocked_links,
     scan_exfiltration_urls,
 )
 from .helpers import (
