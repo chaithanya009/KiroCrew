@@ -21,7 +21,7 @@ import { reportVoiceFailure } from '../lib/voiceFailure'
 import {
   fetchHistory, sseChatMessage, sseChatMessageUpdate, sseChatMessagePatchByTs, sseThinkingChunk, refreshSlot, warmSlotCache, sseContextUsage, clearMessages, clearSlotCache, setVoicePlaying, setVoiceAudio, resolveByApprovalId, clearSubagentsForSnapshot, sseSubagentPending, sseSubagentSpawn, sseSubagentQueued, sseSubagentTool, sseSubagentStalled, sseSubagentRetrying, sseSubagentDone, sseSubagentSnapshot, sseSubagentBatchUpdate, sseSubagentBatchChunks, sseToolActivity, sseToolResult, sseActivityEvent, sseSideResult, sseWorkflowEvent, setSlotStatusDetail, removeQueuedMessage, appendQueuedMessage, cancelQueuedMessage, editQueuedMessage, reorderQueuedMessages, appendSlotMessage, setQuestionCard, resolveQuestionCard, setFollowupCard, setFolderSuggestion, sseMcpAppRender, setAutomations, sseAutomation, removeAutomation, sseSideQueue, reconcileWorkflowRuns,
 } from '../store/chatSlice'
-import { selectSidebarSubagentCounts, selectSidebarWorkflowActive, selectSidebarAutomationRunningKeys } from '../store/chatSlice'
+import { selectSidebarSubagentCounts, selectSidebarWorkflowActive, selectSidebarAutomationRunningKeys, queueEntryAttachments } from '../store/chatSlice'
 import { normalizeRunSessionKey } from '../apps/workflows/runModel'
 import { anchorForSlot, loadLayout, sessionSlots } from './splitLayoutStore'
 import { TAB_ID } from '../api/tabId'
@@ -1942,7 +1942,10 @@ export function useWebSocket() {
             syncPendingQuestions()
             break
           case 'queue_edit':
-            dispatch(editQueuedMessage(data))
+            // The frame's `meta` is the entry's post-edit attachment lists;
+            // `attachments` (present even when empty) tells the reducer this
+            // is the server's word on them, not an optimistic local edit.
+            dispatch(editQueuedMessage({ ...data, attachments: queueEntryAttachments((data as { meta?: unknown }).meta) }))
             break
           case 'queue_reorder':
             dispatch(reorderQueuedMessages(data))
