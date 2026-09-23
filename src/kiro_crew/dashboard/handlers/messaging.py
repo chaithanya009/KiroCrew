@@ -5885,7 +5885,23 @@ async def api_teams_activity(request: web.Request) -> web.Response:
     # no-dashboard-imports property. ``on_activity`` reads the parsed dict from
     # the request mapping, so the body is parsed exactly once and never past the
     # cap.
-    body, cap_error = await read_bounded_json(request, max_bytes=TEAMS_MAX_ACTIVITY_BYTES)
+    #
+    # ``require_json_content_type=False`` is what KEEPS that true here, and is not
+    # a relaxation of this route's perimeter. The shared helper's 415 returns
+    # before a single byte is read; the ``status == 413`` filter below then drops
+    # it, because a verdict derived from body CONTENT must not precede the JWT
+    # check. The body would therefore reach ``on_activity`` unstashed and be
+    # re-parsed by its bare ``request.json()`` fallback on a stream nobody has
+    # read -- bounded only by the app-wide ``client_max_size``, not by
+    # ``TEAMS_MAX_ACTIVITY_BYTES``. Opting out means the capped read runs, so an
+    # over-cap activity is still refused 413 whatever media type it declared.
+    # Whether to REFUSE a non-JSON media type from the Connector is a separate
+    # decision about an external contract; see ``read_bounded_json``.
+    body, cap_error = await read_bounded_json(
+        request,
+        max_bytes=TEAMS_MAX_ACTIVITY_BYTES,
+        require_json_content_type=False,
+    )
     if cap_error is not None and cap_error.status == 413:
         return cap_error
     if body is not None:

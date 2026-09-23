@@ -143,6 +143,7 @@ from kiro_crew.dashboard.origin import (
     check_origin,
     dashboard_socket_path,
     frame_ancestors_value,
+    is_proxied_request,
     mark_audit_claimed,
     resolve_dashboard_host,
     should_canonicalize_host,
@@ -566,6 +567,54 @@ _STRICT_INTERNAL_API_PATHS = frozenset(
 _PRE_AUDIT_DENY_STATUSES = frozenset({401, 403})
 
 
+#: Suffix appended to an audited identity that reached the gateway THROUGH a
+#: proxy rather than from the client itself. ``<name>_via_proxy`` means a
+#: forwarder presented it.
+#:
+#: The converse does NOT read across the whole SEL. A plain name means "made
+#: directly" only on the records :func:`audit_actor` reaches: the ok/error rows
+#: of both servers' ``sel_audit_middleware``, and the raised-refusal rows that
+#: go through :func:`_audit_denied`. ``token_auth`` writes its own returned
+#: 401/403 records with its own ``caller`` (``user_id``, ``app_name``,
+#: ``"unattributable"``, ``peer.login``, ...) and never calls this helper, so a
+#: forwarded request refused there is filed under a plain name. Routing those
+#: sites through here would edit a module this change does not touch.
+_VIA_PROXY_SUFFIX = "_via_proxy"
+
+
+def audit_actor(request: web.Request, caller: str) -> str:
+    """The identity to file this request's audit record under.
+
+    ``caller`` is the label the middleware was built with (``dashboard_user``
+    for the full dashboard, ``mcp_tool`` for the headless API server), or an
+    identity a deny site already derived from the request.
+
+    A FORWARDED request is filed under a DIFFERENT name. The gateway binds
+    loopback, so remote access arrives through a same-host forwarder (a tunnel,
+    a sidecar, a reverse proxy) which presents the credential it was given: with
+    the owner's cookie that is indistinguishable from the owner sitting at the
+    machine, and every such request was recorded as plain ``dashboard_user``.
+    That is the one fact an operator reading the log afterwards most needs and
+    could not get -- whether an action was taken by the person or arrived over a
+    forwarding path on their behalf.
+
+    The signal is :func:`origin.is_proxied_request`: any ``Forwarded`` /
+    ``X-Forwarded-*`` / ``X-Real-IP`` header. It is the predicate the rest of
+    this module already trusts for "``request.remote`` is not the client", and
+    it over-warns rather than under-warns (a client that sends a forwarding
+    header with no proxy in the path is reported as forwarded). For an audit
+    label, over-warning is the safe direction: it never files a forwarded action
+    as the person's own.
+
+    Its known limit is the same one :func:`origin.is_direct_local_request`
+    documents: a forwarder that strips every forwarding header is invisible
+    here. This makes the ordinary product paths distinguishable, which is what
+    the log could not do at all before; it is not a boundary against a forwarder
+    that is deliberately hiding.
+    """
+    return f"{caller}{_VIA_PROXY_SUFFIX}" if is_proxied_request(request) else caller
+
+
 async def _audit_denied(caller: str, request: web.Request, error: str) -> None:
     """Record a middleware refusal in the SEL, best-effort.
 
@@ -597,12 +646,18 @@ async def _audit_denied(caller: str, request: web.Request, error: str) -> None:
     a second time. The claim is set unconditionally, before the write: a write
     that failed here fails identically in the boundary, so retrying in the
     boundary buys nothing.
+
+    ``caller`` goes through :func:`audit_actor`, so a refusal that arrived
+    through a forwarder is filed under ``<caller>_via_proxy``. Applied here, in
+    the one helper every barrier's deny path already calls, rather than at each
+    of the three call sites -- a new barrier gets it by using the helper.
     """
     mark_audit_claimed(request)
+    actor = audit_actor(request, caller)
 
     def _write() -> None:
         sel().log_api_access(
-            caller=caller,
+            caller=actor,
             operation=f"{request.method} {request.path}",
             outcome="denied",
             resources=request.path,
@@ -5042,10 +5097,14 @@ async def start_dashboard(
                 mark_audit_claimed(request)
                 from kiro_crew.sel import sel
 
+                # Every mutating /api/ call was filed under the flat
+                # ``dashboard_user``, so an action a forwarder relayed on the
+                # owner's behalf read exactly like the owner performing it.
+                actor = audit_actor(request, "dashboard_user")
                 try:
                     resp = await handler(request)  # type: ignore[operator]
                     sel().log_api_access(
-                        caller="dashboard_user",
+                        caller=actor,
                         operation=f"{request.method} {request.path}",
                         outcome="ok" if resp.status < 400 else "error",
                         resources=request.path,
@@ -5053,7 +5112,7 @@ async def start_dashboard(
                     return resp  # type: ignore[return-value]
                 except Exception as exc:
                     sel().log_api_access(
-                        caller="dashboard_user",
+                        caller=actor,
                         operation=f"{request.method} {request.path}",
                         outcome="error",
                         resources=request.path,
@@ -6147,10 +6206,13 @@ async def start_api_server(
             mark_audit_claimed(request)
             # ``sel`` is imported at module scope (top of file); no in-function
             # import needed (host/csrf middleware below call it unqualified too).
+            # Same forwarder distinction as the dashboard chain's: this server is
+            # reached the same way, so its records must be readable the same way.
+            actor = audit_actor(request, "mcp_tool")
             try:
                 resp = await handler(request)  # type: ignore[operator]
                 sel().log_api_access(
-                    caller="mcp_tool",
+                    caller=actor,
                     operation=f"{request.method} {request.path}",
                     outcome="ok" if resp.status < 400 else "error",
                     resources=request.path,
@@ -6158,7 +6220,7 @@ async def start_api_server(
                 return resp  # type: ignore[return-value]
             except Exception as exc:
                 sel().log_api_access(
-                    caller="mcp_tool",
+                    caller=actor,
                     operation=f"{request.method} {request.path}",
                     outcome="error",
                     resources=request.path,

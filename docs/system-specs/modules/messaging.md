@@ -3604,6 +3604,15 @@ the internet:
   `TEAMS_MAX_ACTIVITY_BYTES` and stashes the parsed dict under
   `TEAMS_ACTIVITY_REQUEST_KEY`, so `on_activity` never re-parses an unbounded
   body. The cap lives in the route, keeping `client.py` free of dashboard imports.
+  The route passes `require_json_content_type=False`, and that is what keeps the
+  sentence above true rather than a relaxation of this perimeter:
+  `read_bounded_json`'s 415 returns before a byte is read, the route forwards only
+  a 413 (a verdict from body CONTENT must not precede the JWT check), so a live
+  gate here would drop the 415, skip the stash, and hand `on_activity`'s bare
+  `request.json()` fallback an untouched stream bounded only by the app-wide
+  `client_max_size`. Whether to REFUSE a non-JSON media type from the Connector is
+  a separate decision about an external contract; today the route accepts it, and
+  caps it.
 - **Replay drop and an in-flight ceiling.** The Connector legitimately redelivers
   when the bot misses its ack window, so a duplicate `activity.id` is dropped
   idempotently (audited `denied_replayed_activity`) rather than refused — checked
