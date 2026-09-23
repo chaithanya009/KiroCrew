@@ -342,10 +342,32 @@ interface SelectionToolbarProps {
   containerRef: React.RefObject<HTMLElement | null>
   /** Actions to show in the toolbar */
   actions: SelectionAction[]
-  /** External trigger (e.g. from the code editor) — shows toolbar at given position with given text */
-  externalSelection?: { text: string; x: number; y: number } | null
+  /**
+   * External trigger for a selection the document does not hold — a code
+   * editor's, or one made inside a sandboxed iframe and relayed by its bridge.
+   * Shows the toolbar at the given viewport position with the given text. With
+   * a `composer`, this opens the box the same way a DOM selection does
+   * (`onOpen` fires before focus moves), so a host whose body is an iframe
+   * gets the one annotation flow too; it has no DOM range to save, so Escape
+   * cannot hand the selection back and the box does not follow a scroll.
+   * Setting it back to null while that box is open CLOSES the box (the host
+   * revoked the selection, so there is nothing left to submit against).
+   * `start` is the selection's character offset in ITS document, when the
+   * host knows it: with the text it keys the `draftStore` slot, so a draft
+   * interrupted by a teardown comes back over the same passage here too.
+   */
+  externalSelection?: { text: string; x: number; y: number; start?: number } | null
   /** Type-first annotation input; see `SelectionComposer`. Omit for the plain action row. */
   composer?: SelectionComposer
+  /**
+   * Only `externalSelection` opens this toolbar; a document selection inside
+   * `containerRef` is ignored. For a host whose annotatable text lives in a
+   * sandboxed iframe: the container around the frame still holds selectable
+   * text of its own (a "could not render" notice, a Retry button), and a
+   * comment anchored to THAT would be pinned to text the artifact does not
+   * contain. The container is still used for click-away dismissal.
+   */
+  externalOnly?: boolean
   /**
    * Hide the toolbar without discarding its state. The file viewer keeps
    * inactive tabs MOUNTED (display:none), but this toolbar portals to
@@ -358,7 +380,7 @@ interface SelectionToolbarProps {
 
 /** Generic floating toolbar that appears when user selects text within a container.
  *  Extensible — pass any actions (quote, copy, etc.) via the `actions` prop. */
-export default function SelectionToolbar({ containerRef, actions, externalSelection, composer, suspended = false }: SelectionToolbarProps) {
+export default function SelectionToolbar({ containerRef, actions, externalSelection, composer, suspended = false, externalOnly = false }: SelectionToolbarProps) {
   const [visible, setVisible] = useState(false)
   // Mirrors for the document listeners (bound once): whether the box is up,
   // and whether the host has hidden it.
@@ -366,6 +388,8 @@ export default function SelectionToolbar({ containerRef, actions, externalSelect
   visibleRef.current = visible
   const suspendedRef = useRef(suspended)
   suspendedRef.current = suspended
+  const externalOnlyRef = useRef(externalOnly)
+  externalOnlyRef.current = externalOnly
   // The composer's draft text lives HERE, not in `ComposerBox`, so it survives
   // a suspension (the box unmounts while its tab is hidden) and comes back
   // with the tab. Reset on submit and on every close.
@@ -392,6 +416,12 @@ export default function SelectionToolbar({ containerRef, actions, externalSelect
   // via React DOM and throw (an uncaught post-teardown ReferenceError).
   const copyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const selectedTextRef = useRef('')
+  // The selection EXACTLY as made: boundary whitespace included, every range
+  // included. `selectedTextRef` is the trimmed first-range passage (anchors and
+  // actions want that); the copy shortcut wants what the user selected — a
+  // double-click word selection carries its trailing space, and "copy" that
+  // drops it is a copy the user has to repair.
+  const rawSelectedTextRef = useRef('')
   const toolbarRef = useRef<HTMLDivElement>(null)
   const sourceRef = useRef<'dom' | 'external' | null>(null)
 
@@ -447,10 +477,27 @@ export default function SelectionToolbar({ containerRef, actions, externalSelect
     composerRef.current?.onDraftChange?.(hasDraft, passage)
   }, [])
 
+  // A draft interrupted by a teardown (slot switch) comes back into the box —
+  // but only over the passage it was written for: same text AND same position
+  // (`savedSelectionRef`), so a repeated sentence elsewhere in the document
+  // does not inherit a comment about its twin. Only on a fresh open: a box that
+  // is already up keeps what it holds.
+  const restoreDraft = useCallback((text: string) => {
+    const store = composerRef.current?.draftStore
+    if (visibleRef.current || !store) return
+    const saved = store.read(text, savedSelectionRef.current?.start ?? -1)
+    if (saved && saved.trim()) {
+      setComposerText(saved)
+      onComposerDraftChange(true)
+    }
+  }, [onComposerDraftChange])
+
   const checkSelection = useCallback(() => {
     // A hidden tab's toolbar must not react to selections made in whatever is
     // on screen instead.
     if (suspendedRef.current) return
+    // The container's own text is not annotatable here (see `externalOnly`).
+    if (externalOnlyRef.current) return
     // A typed draft is anchored to the selection it was written for. A new
     // selection while it is open must NOT silently move the anchor under the
     // draft (the text would be submitted against the wrong passage): the box
@@ -496,6 +543,10 @@ export default function SelectionToolbar({ containerRef, actions, externalSelect
     if (!text) { setVisible(false); return }
 
     selectedTextRef.current = text
+    // EVERY selected character, every range: the anchor is pinned to range 0
+    // (above), but a copy that silently drops the other ranges of a Firefox
+    // ctrl+drag selection is a copy the user has to redo.
+    rawSelectedTextRef.current = sel.toString()
 
     const rect = measureRange.getBoundingClientRect()
     selectionRectRef.current = rect
@@ -533,20 +584,10 @@ export default function SelectionToolbar({ containerRef, actions, externalSelect
       // A notice from an earlier copy attempt does not belong to this selection.
       setCopyFailed(false)
       activeComposer.onOpen?.(text)
-      // A draft interrupted by a teardown (slot switch) comes back into the box
-      // — but only over the passage it was written for: same text AND same
-      // position, so a repeated sentence elsewhere in the file does not inherit
-      // a comment about its twin.
-      if (!visibleRef.current && activeComposer.draftStore) {
-        const saved = activeComposer.draftStore.read(text, savedSelectionRef.current?.start ?? -1)
-        if (saved && saved.trim()) {
-          setComposerText(saved)
-          onComposerDraftChange(true)
-        }
-      }
+      restoreDraft(text)
     }
     setVisible(true)
-  }, [containerRef, onComposerDraftChange])
+  }, [containerRef, restoreDraft])
 
   // After the toolbar mounts/repositions, measure it and clamp its position so
   // it stays fully inside the viewport. We position by the top-left (left/top)
@@ -600,17 +641,6 @@ export default function SelectionToolbar({ containerRef, actions, externalSelect
     // while hidden leaves `pos` untouched, and resuming must re-clamp against
     // the viewport it comes back to rather than the one it left.
   }, [visible, pos, composerGrowTick, composer, copyFailed, suspended])
-
-  // External trigger (editor selections that don't use window.getSelection)
-  useEffect(() => {
-    if (externalSelection) {
-      selectedTextRef.current = externalSelection.text
-      selectionRectRef.current = new DOMRect(externalSelection.x, externalSelection.y, 0, 0)
-      setPos({ x: externalSelection.x, y: externalSelection.y + 8 })
-      sourceRef.current = 'external'
-      setVisible(true)
-    }
-  }, [externalSelection])
 
   useEffect(() => {
     // Every deferred selection check has to be cancellable. These fire 0-50ms
@@ -811,6 +841,54 @@ export default function SelectionToolbar({ containerRef, actions, externalSelect
   // host clears it itself when one of its own guards discards.
   useEffect(() => () => { onComposerDraftChange(false); fireComposerClose() }, [fireComposerClose, onComposerDraftChange])
 
+  // External trigger (editor / in-iframe selections that don't use
+  // window.getSelection). Declared AFTER the visibility effect above on
+  // purpose: an external selection present at mount opens the composer in the
+  // mount-time effect pass, and the visibility effect's mount run (which sees
+  // the initial `visible === false`) would otherwise fire `onClose` on the box
+  // this effect had just opened.
+  useEffect(() => {
+    if (!externalSelection) {
+      // The host REVOKED the selection it handed over (a version switch, edit
+      // mode, the frame changed): its anchor is gone with it, so a box still
+      // open on that selection would submit against nothing and silently lose
+      // the draft. Close it now, in the same effect pass — the visibility
+      // effect then tells the host `onClose` once. The host's own clear after
+      // a submit or close arrives with the box already down and is a no-op.
+      if (sourceRef.current === 'external' && visibleRef.current) {
+        sourceRef.current = null
+        setVisible(false)
+      }
+      return
+    }
+    // Same rule as `checkSelection`: a typed draft keeps the anchor it was
+    // written for, so a new external selection does not re-target it.
+    if (visibleRef.current && composerRef.current && composerDraftRef.current) return
+    selectedTextRef.current = externalSelection.text
+    rawSelectedTextRef.current = externalSelection.text
+    // The point handed over is the selection's BOTTOM-left; its height is not
+    // known, so the composer's above-the-selection placement (which measures
+    // from the rect's top) would end exactly over the annotated line. With no
+    // rect the box takes the below-the-point placement instead, like the pill.
+    selectionRectRef.current = composerRef.current ? null : new DOMRect(externalSelection.x, externalSelection.y, 0, 0)
+    setPos({ x: externalSelection.x, y: externalSelection.y + 8 })
+    sourceRef.current = 'external'
+    const activeComposer = composerRef.current
+    if (activeComposer) {
+      // The selection lives in another document (or an editor), so there is no
+      // container range to rebuild: a zero LENGTH keeps Escape from restoring
+      // one (and the scroll-follow from moving the box), while the host's
+      // `start` keys the draft slot exactly as a container offset would.
+      savedSelectionRef.current = { start: externalSelection.start ?? -1, length: 0 }
+      composerClosedRef.current = false
+      setComposerAutoFocus(!isTouchDevice())
+      setCopyFailed(false)
+      activeComposer.onOpen?.(externalSelection.text)
+      restoreDraft(externalSelection.text)
+    }
+    setVisible(true)
+  }, [externalSelection, restoreDraft])
+
   const handleComposerSubmit = useCallback((comment: string) => {
     const text = selectedTextRef.current
     const trimmed = comment.trim()
@@ -873,8 +951,9 @@ export default function SelectionToolbar({ containerRef, actions, externalSelect
   // a type-first box must not introduce. Result-aware: the checkmark shows only
   // when the clipboard actually took the text; a refusal is reported by the box.
   const handleComposerCopyShortcut = useCallback(async (): Promise<boolean> => {
-    const text = selectedTextRef.current
-    if (!text) return false
+    // The raw selection, not the trimmed passage: see `rawSelectedTextRef`.
+    const text = rawSelectedTextRef.current
+    if (!text.trim()) return false
     setCopyFailed(false)
     const ok = await copyToClipboard(text)
     if (ok) flashCopied(); else setCopyFailed(true)
