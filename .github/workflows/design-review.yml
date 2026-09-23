@@ -161,21 +161,29 @@ jobs:
           : > "$SHOT_MAP"
           : > "$CLIPS"
           . .github/scripts/pr-attachment-evidence.sh
-          # Committed images this revision adds or changes, present at HEAD --
-          # the same paths and formats the UX lane admits.
+          # Only regular, byte-typed media enters the rendered-evidence list.
+          # Extensions select candidates; file(1) establishes what they are.
           committed=""
           while IFS= read -r path; do
             [ -n "$path" ] || continue
-            if git cat-file -e "HEAD:$path" 2>/dev/null; then
-              committed="${committed}${path}"$'\n'
+            if [ ! -f "$path" ] || [ -L "$path" ]; then
+              echo "::warning::SKIPPED (not a regular file at HEAD): $path"
+              continue
             fi
-          done < <(git diff --name-only "$BASE_SHA"...HEAD | grep -iE '^(temp-screenshots/|\.github/screenshots/).*\.(png|jpe?g|webp|gif|webm|mp4|mov)$' || true)
+            mime="$(file --mime-type -b -- "$path")"
+            case "$mime" in
+              image/png|image/jpeg|image/webp|image/gif|video/mp4|video/quicktime|video/webm)
+                committed="${committed}${path}"$'\n' ;;
+              *)
+                echo "::warning::SKIPPED (mime $mime): $path" ;;
+            esac
+          done < <(git diff --name-only --diff-filter=AM "$BASE_SHA"...HEAD | grep -iE '^(temp-screenshots/|\.github/screenshots/).*\.(png|jpe?g|webp|gif|webm|mp4|mov)$' || true)
           k="$(printf '%s' "$committed" | grep -c . || true)"
           {
             echo "RENDERED EVIDENCE OF THIS REVISION -- written by the workflow. The description's text is not the predicate; this file is."
             echo "attachments downloaded and typed as images: $n"
             echo "attachments downloaded and typed as recordings: $clips"
-            echo "committed images this revision adds or changes: $k"
+            echo "committed images or recordings this revision adds or changes, typed by their bytes: $k"
             echo "attachment downloads that failed for a transport reason (presence unconfirmed, not absent): ${failed:-0}"
             echo
             echo "images (opaque copies, body order):"
@@ -184,10 +192,10 @@ jobs:
             echo "recordings:"
             if [ -s "$CLIPS" ]; then cat "$CLIPS"; else echo "(none)"; fi
             echo
-            echo "committed images:"
+            echo "committed images or recordings:"
             if [ -n "$committed" ]; then printf '%s' "$committed"; else echo "(none)"; fi
           } > "$EVIDENCE"
-          echo "Rendered evidence: $n image(s), $clips recording(s), $k committed image(s); ${failed:-0} download(s) failed."
+          echo "Rendered evidence: $n image(s), $clips recording(s), $k committed media item(s); ${failed:-0} download(s) failed."
 
       # Dependabot (a design review adds little to a mechanical version bump)
       # and let the advisory status pass — same skip contract as the Opus 5 /
@@ -281,8 +289,8 @@ jobs:
             RENDERED EVIDENCE: before you judge the missing-evidence trigger below,
             Read ${{ runner.temp }}/design-evidence.txt. The workflow wrote it: it
             downloaded every github.com/user-attachments asset the description
-            offers, typed each by its bytes, and (on a same-repo pull request)
-            listed the committed images this revision adds or changes. That
+            offers, typed each by its bytes, and listed the committed images or
+            recordings this revision adds or changes after typing their bytes. That
             file is the predicate for "rendered evidence of THIS revision": a
             URL in the description that is not in it did not download or is
             not an image, and is not evidence. A non-zero "failed for a
@@ -445,10 +453,13 @@ jobs:
               list the workflow wrote (RENDERED EVIDENCE above) names no image
               or recording downloaded from its description (a
               github.com/user-attachments asset the workflow fetched and typed;
-              a URL that did not download is not evidence) and none committed
-              at HEAD that THIS checkout can render (on a fork pull request the head is
-              never checked out, so a committed image is not evidence here --
-              the same rule the fork UX lane applies; the attachment is). An
+              a URL that did not download is not evidence) and no committed
+              image or recording it names (media this revision adds or changes
+              under temp-screenshots/ or .github/screenshots/ counts the same
+              as an attachment -- in a same-repo checkout as the file at HEAD,
+              on a fork pull request as bytes the workflow read out of the
+              object store; a committed path the list does not name was not
+              admitted and is not evidence -- the rule the UX lanes apply). An
               image hosted off a commit outside this PR, or one the description
               itself says shows another PR's state, is not evidence of this
               revision. You cannot judge the shape of a surface you have not
