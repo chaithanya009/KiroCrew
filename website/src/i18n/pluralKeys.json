@@ -96,6 +96,8 @@
   "components.artifactFolderDeleteDialog.artifact",
   "components.artifactFolderDeleteDialog.subfolder",
   "components.artifactPanel.comment",
+  "components.autoNudgePopover.judge_verdict",
+  "components.autoNudgePopover.judge_verdict_untimed",
   "components.commentOverlay.comment",
   "components.commentThreadPopover.comment",
   "components.crewWebhookSection.unbound_tokens_can_wake_any_crew",
