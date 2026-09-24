@@ -2811,6 +2811,14 @@ def validate_file_path(raw: str) -> str | None:
     ``realpath`` on a UNC path is itself the outbound SMB probe), the Windows
     link-target screen (a link can launder the same probe past the
     lexical UNC check), is_sensitive_path(), realpath canonicalization.
+
+    On Windows the canonicalization runs with every existing component of the
+    screened path held open, so the chain the screen inspected is the chain
+    ``realpath`` traverses -- see :func:`_resolve_held`. On POSIX the resolution is
+    ``realpath`` on the string the gates judged, unchanged: there is no UNC there,
+    so following a link is a local lookup rather than a network authentication, and
+    the resolved path is judged by ``is_sensitive_path`` either way.
+
     Returns the canonical path or None if rejected.
     """
     if not raw:
@@ -2863,13 +2871,56 @@ def validate_file_path(raw: str) -> str | None:
         screened = _screen_windows_links(target)
         if screened is None:
             return None
-        target = screened
+        return _resolve_held(screened)
     # `realpath` consumes the SAME string the walk inspected -- resolving a
     # different form would traverse a chain the walk never saw.
     path = os.path.realpath(target)
     if is_sensitive_path(path):
         return None
     return path
+
+
+def _resolve_held(screened: str) -> str | None:
+    """Resolve *screened* with every existing component of it held open.
+
+    The Windows tail of :func:`validate_file_path`. The screen above computes a
+    candidate the lexical gates admit and the link walk found nothing to refuse, but it
+    reaches each component BY NAME: between the last name it looked at and the
+    ``realpath`` below, anything running as this user -- which in this product includes
+    an agent, in directories an agent may write -- can put a junction at one of those
+    components. ``realpath`` then follows it, and following a junction aimed at a share
+    is an outbound SMB authentication to a host the planter chose. The window is
+    ``check -> realpath``, not ``check -> open``: by the time a consumer opens the file,
+    the probe has already happened.
+
+    Holding the chain closes it (see
+    :func:`kiro_crew.pinned_fs.hold_no_follow_chain`). A component that cannot be
+    renamed or deleted cannot be replaced, so the components the walk proved are the
+    components ``realpath`` traverses -- and the resolution runs INSIDE the hold for
+    exactly that reason.
+
+    Fails closed three ways: a component that turns out to be a link after all is
+    refused rather than resolved, since the screen either missed it or it arrived just
+    now and neither is distinguishable from here; a component whose state cannot be read
+    at all -- a permission denial, a sharing violation, an unreachable host -- is refused
+    for the same reason; and a path the walk declines to hold is refused rather than
+    resolved unheld.
+
+    ``CHAIN_MISSING`` is not a refusal. A validated path is routinely one that does not
+    exist yet -- every write caller hands one in -- and the components below the name
+    that holds nothing cannot redirect anything, because there is nothing at them to
+    redirect through.
+    """
+    try:
+        with pinned_fs.held_no_follow_chain(screened, max_depth=_MAX_SCREENED_PATH_DEPTH) as chain:
+            if chain.outcome == pinned_fs.CHAIN_REPARSE:
+                return None
+            path = os.path.realpath(screened)
+            if is_sensitive_path(path):
+                return None
+            return path
+    except (OSError, ValueError):
+        return None
 
 
 def _darwin_case_alias_matches(fd: int, path: str, opened_path: str) -> bool:

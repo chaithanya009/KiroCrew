@@ -7112,6 +7112,62 @@ def open_file_no_reparse(path: str | os.PathLike, *, nonblocking: bool = False) 
     return fd
 
 
+def is_reparse_point_fd(fd: int) -> bool:
+    """Whether the object *fd* refers to is a reparse point (symlink or junction).
+
+    The descriptor-side twin of :func:`kiro_crew.pinned_fs.is_reparse_point`, and the
+    only one of the two a walk can trust: the question is answered about the object
+    already held, so nothing can be swapped at that name between the answer and its
+    use.
+
+    Lives here rather than with the caller because the answer is a Windows file
+    attribute, and the bit belongs with the other ``FILE_ATTRIBUTE`` values in this
+    module -- a second copy next to a caller is a second place for it to drift.
+
+    Always False on POSIX, and that is correct rather than a gap: a descriptor there
+    was opened with ``O_NOFOLLOW``, which refuses a symlink at the name instead of
+    handing back a descriptor for it, so a POSIX caller learns about the link from the
+    ``ELOOP`` on the open. Windows has no such refusal -- ``OPEN_REPARSE_POINT`` opens
+    the link itself -- so on Windows this is where the link is found.
+    """
+    return bool(getattr(os.fstat(fd), "st_file_attributes", 0) & _WIN_FILE_ATTRIBUTE_REPARSE_POINT)
+
+
+def open_entry_no_follow(path: str | os.PathLike) -> int:
+    """Open whatever sits at *path* -- file, directory, or a reparse point itself.
+
+    The untyped sibling of :func:`pin_directory` and :func:`open_file_no_reparse`.
+    Those two assert what they opened and refuse anything else, which is right for a
+    caller that knows; a caller walking a path one component at a time does not yet
+    know, and needs the three answers kept apart. ``NotADirectoryError`` for a
+    reparse point and for a plain file are the same exception from
+    :func:`pin_directory`, so a walk built on it cannot tell "a link is sitting
+    here, read its target" from "this component is an ordinary file, the path ends".
+
+    The descriptor is the answer: read ``st_file_attributes`` off ``os.fstat`` on
+    Windows, or ``os.fstat`` alone on POSIX, and the caller learns what is there
+    from the object it is already holding rather than from a second look by name.
+
+    Never follows. On Windows that is ``OPEN_REPARSE_POINT``, so a junction aimed at
+    a share is opened as the junction and the share is not contacted; on POSIX it is
+    ``O_NOFOLLOW``, which refuses a symlink at the name with ``ELOOP`` instead --
+    the two platforms report a link differently and a caller has to handle both.
+
+    ``O_NONBLOCK`` on POSIX so a FIFO at the name cannot make the open wait for a
+    writer. Release the descriptor with ``os.close``.
+    """
+    if IS_POSIX:
+        return os.open(
+            os.fspath(path),
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0),
+        )
+    # pragma: no cover below -- the ctypes route is Windows-only and the Windows CI
+    # shards run with --no-cov, so the statement is unmeasurable anywhere rather than
+    # merely untested. What it returns IS measured: the walk that consumes it is
+    # exercised on POSIX through this function's own POSIX branch.
+    return _win_open_without_following(path)  # pragma: no cover
+
+
 _WIN_FILE_SHARE_READ_WRITE_DELETE = 0x00000001 | 0x00000002 | 0x00000004
 
 
