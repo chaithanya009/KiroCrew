@@ -1240,7 +1240,10 @@ applier — a raised turn budget is in force on the next prompt.
    provider's cancel lands -- already see it; `prev_turn_cancelled` is set only
    after the ack and is too late for them.
 2. `clear_queue(key)` — queue drop is unconditional on first press (skipped
-   with `preserve_queue=True`).
+   with `preserve_queue=True`). Passing no ownership predicate is what makes the
+   drop whole-session, which is what a Stop button press means. A per-sender
+   stop verb passes one and drops only that principal's entries; see
+   "Hard cancel: `/stop`" in `messaging.md`.
 3. If `force=True`: skip cancel, go straight to hard kill (step 5).
 4. Send `session/cancel` via `provider.cancel(wait_ack_timeout=budget)`:
    - `"acked"` → set `session.prev_turn_cancelled = True`, call `on_soft` callback, return `"soft"`.

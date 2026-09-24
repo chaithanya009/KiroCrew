@@ -87,6 +87,7 @@ from kiro_crew.messaging.link import (
 from kiro_crew.messaging.queue_drain import (
     drain_until_quiet,
     entry_channel,
+    owner_token,
     register_drain,
     tag_entry,
 )
@@ -304,15 +305,29 @@ def _inbound_origin(msg: InboundMessage) -> _QueuedOrigin:
     )
 
 
+def _entry_owner(origin: _QueuedOrigin) -> str:
+    """The neutral token naming the principal *origin* came from.
+
+    Built from ``sender_key``, the same value that decides whether two queued messages
+    may share one turn, so "whose entry is this" and "may these collapse together" can
+    never answer differently. ``/stop`` compares it to drop one person's queued messages
+    and leave everybody else's.
+    """
+    return owner_token(_CHANNEL, origin.sender_key)
+
+
 def _origin_kwargs(origin: _QueuedOrigin) -> dict[str, str]:
     """An origin as prefixed queue-entry keyword arguments, plus the neutral channel.
 
     The channel rides with them because a drain must be able to tell an entry it owns
     from one another transport recorded BEFORE it reads any channel-specific field,
-    and because the value names which peer drain to wake for a foreign entry.
+    and because the value names which peer drain to wake for a foreign entry. The owner
+    rides with them for the mirror reason on the clear side: ``/stop`` must tell one
+    person's entries from another's across every transport on the queue, and the
+    prefixed fields below are unreadable to it on a foreign entry.
     """
     recorded = {f"{_ORIGIN_PREFIX}{name}": value for name, value in origin._asdict().items()}
-    return tag_entry(recorded, _CHANNEL)
+    return tag_entry(recorded, _CHANNEL, _entry_owner(origin))
 
 
 def _queued_origin(kwargs: dict) -> _QueuedOrigin | None:
@@ -858,7 +873,9 @@ class TelegramDispatcher:
             await self._reply(chat_id, _HELP_TEXT, thread=reply_thread)
             return
         if cmd == "stop":
-            await self._handle_stop(route, chat_id, session_key=resumed_key)
+            await self._handle_stop(
+                route, chat_id, origin=_inbound_origin(msg), session_key=resumed_key
+            )
             return
         if cmd == "model":
             await self._handle_model(
@@ -1799,9 +1816,6 @@ class TelegramDispatcher:
                         **rkw,
                     )
                 if texts and origin is not None:
-                    # The receipt too: its bubble was posted into the chat of
-                    # whoever queued first, so editing it under the opener's address
-                    # reaches a different chat, where that message id does not exist.
                     await self._receipt_flip_locked(
                         session_key, int(origin.chat_id), texts, own_deferred
                     )
@@ -1923,7 +1937,7 @@ class TelegramDispatcher:
             ):
                 return False
             await self._queue.create_or_grow_locked(
-                session_key, self._receipt_surface(chat_id, thread), text
+                session_key, self._receipt_surface(chat_id, thread), text, _entry_owner(origin)
             )
             return True
 
@@ -2123,9 +2137,10 @@ class TelegramDispatcher:
         route: tuple[str, str],
         chat_id: int,
         *,
+        origin: _QueuedOrigin,
         session_key: str | None = None,
     ) -> None:
-        """Hard cancel: abort the in-flight turn and clear everything.
+        """Hard cancel: abort the in-flight turn and clear THIS caller's queued messages.
 
         The cooperative-cancel contract, the lock ordering across
         ``clear_queue`` + the receipt finalize, and both replies live in
@@ -2134,6 +2149,11 @@ class TelegramDispatcher:
         because ``editMessageText`` is not threaded -- the message id already
         identifies the message within its Topic -- while the reply itself must
         land back in the originating Topic.
+
+        *origin* is this caller's own, recorded the same way their queued entries were,
+        so the clear matches their entries and no one else's: under
+        ``dm_scope = "unified"`` this queue also holds other people's messages, and on
+        another transport too.
         """
         assert self.client is not None
         reply = await stop_running_turn(
@@ -2141,6 +2161,7 @@ class TelegramDispatcher:
             session_key or self._session_key(route),
             queue=self._queue,
             surface=self._receipt_surface(chat_id, None),
+            owner=_entry_owner(origin),
         )
         await self._reply(chat_id, reply, thread=self._route_thread(route))
 

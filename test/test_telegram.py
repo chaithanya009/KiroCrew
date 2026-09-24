@@ -550,7 +550,7 @@ class FakeSessions:
     def dequeue(self, key: str) -> Any:
         return self.queued.pop(0) if self.queued else None
 
-    def clear_queue(self, key: str) -> None:
+    def clear_queue(self, key: str, owned_by: Any = None) -> None:
         self.queued.clear()
 
     def has_session(self, key: str) -> bool:

@@ -1539,6 +1539,20 @@ only from a queue persisted before this contract existed, and its entry is held
 rather than answered or discarded. The alternative would be to let whichever channel
 drained next claim it, which is the original defect.
 
+**`queued_channel` answers which transport must answer an entry; it does not answer
+WHOSE the entry is.** A caller-scoped `/stop` needs that second question, and the
+channel tag cannot answer it: under `unified` two people on the SAME transport share
+one queue, so their entries carry the same tag. Every entry therefore also records a
+neutral `queued_owner` — `messaging/queue_drain.py::owner_token(channel_type,
+sender_key)`, built from the very `sender_key` that already decides whether two
+queued messages may collapse into one turn, so ownership and collapsing can never
+answer differently. The channel name leads the token, so two transports that happen
+to spell a user id the same way are still two principals, and it is built in one
+place so a producer and a clear cannot disagree about the spelling. An entry
+carrying NO `queued_owner` is nobody's to withdraw: every partial clear leaves it
+queued rather than guessing, the same way an untagged channel makes it nobody's to
+answer.
+
 **Setting a foreign entry aside is not enough, because it was already accepted and
 receipted.** A drain runs only from the tail of its own channel's turn, so a
 cross-transport entry left in the queue waited for that transport to finish some
@@ -1612,12 +1626,47 @@ command can never be answered with the card.
 ### Hard cancel: `/stop`
 
 `/stop` (alias `/cancel`; `!stop` / `!cancel` on Discord) aborts the running
-turn, drops every queued message, and finalizes the receipt to `🛑 Cancelled`.
+turn, drops the CALLER's queued messages, and withdraws that caller's lines from
+the receipt -- finalizing it to `🛑 Cancelled` only once nothing else is queued.
 `clear_queue` and the receipt finalize run together under `ReceiptQueue.lock`.
 All of that, including both reply strings, is
 `messaging/commands.py::stop_running_turn(sessions, session_key, *, queue,
-surface)`; a dispatcher supplies the session key and its bound `ReceiptSurface`
-and sends the returned text.
+surface, owner)`; a dispatcher supplies the session key, its bound
+`ReceiptSurface` and the caller's owner token, and sends the returned text.
+
+**The queue drop is the CALLER's, not the session's.** Under `unified` one queue
+holds several principals, so `clear_queue` takes an ownership predicate over an
+entry's kwargs and drops only the entries whose `queued_owner` matches. Everybody
+else's messages stay queued and still owed an answer. `owner` has no default, so
+a channel wired up later cannot inherit a whole-queue clear by leaving it out;
+omitting the predicate at `clear_queue` still clears everything, which is what
+the whole-session callers mean (`/new`, a generation bump, teardown). The receipt
+follows, and what it may WRITE is bounded by the fact that one bubble can carry
+several principals' lines while its `msg_id` addresses a message in exactly one
+of their conversations -- whoever OPENED it. So a caller-scoped `/stop` withdraws
+the caller's lines from the record, DROPS the registry entry, and writes only when
+the caller is that opener: then `surface` addresses the bubble and it finalizes as
+`🛑 Cancelled` over the caller's own withdrawn lines, never over what remains,
+which belongs to other principals. When somebody else opened it, nothing is
+written at all.
+
+Dropping the entry is what keeps a later drain safe. A drain flips using the chat
+of the entry it is answering, so an entry left behind after its opener stopped
+would hand that drain an id minted in a DIFFERENT chat, and `edit_message`
+addresses a message by that per-chat id pair -- the edit would land on whatever
+unrelated message holds that number there. The cost is that a bubble whose opener
+stopped goes stale rather than being flipped, and the next mid-turn burst opens a
+fresh one.
+
+Which conversation a shared bubble belongs to is NOT settled here: it stays with
+the receipt registry's own key, which is `session_key` alone (#12575). Every
+transition therefore still takes its address from its caller, and `opened_by` is
+what lets a caller-scoped `/stop` tell whether its own address is the right one.
+
+The running turn is cancelled whoever it belongs to: a session records the
+asyncio task holding it, not the sender that task is answering. `session.cancelled`
+is likewise left alone by a caller-scoped clear, because its bare message
+timestamps say nothing about whose they are.
 
 **Cancel is cooperative before it is fatal.** The shared handler calls
 `provider.cancel(wait_ack_timeout=0)`, which writes an ACP `session/cancel`
@@ -1648,7 +1697,7 @@ user-facing string has exactly one owner.
 
 | Command | Shared half | Per-channel half |
 |---|---|---|
-| `/stop` | `commands.stop_running_turn(sessions, session_key, *, queue, surface) -> str` | the send; which session key a resumed conversation stops |
+| `/stop` | `commands.stop_running_turn(sessions, session_key, *, queue, surface, owner) -> str` | the send; which session key a resumed conversation stops; the caller's `owner_token` |
 | `/yolo` | `commands.run_yolo_command(arg, *, source, caller, phrasing) -> str` | the send; `source` (also the grant's audit source), the trusted `caller`, and a `YoloPhrasing` |
 | `/link` | `link.rebind_conversation_location(sessions, *, key, location, unlink_command) -> str` | the send; `location` (the channel's one spelling of "this conversation"); any refusal only a resume-capable channel can hit |
 | `/unlink` | `link.release_conversation_location(sessions, *, key, location, channel) -> (str, swept)` | the send; the opt-out write ordered before it; any dashboard nudge for a swept binding |
@@ -2138,8 +2187,8 @@ answer is not permission: a raised evaluation and a `Decision` without
 - **A media-only inbound message is a message**: a transport whose text extraction comes back empty may only drop the envelope when there are also no media items. Weixin previously returned early on empty text, so an uncaptioned screenshot was discarded with no reply and no log line — the sender saw a successful send while the agent was never told anything arrived. Emptiness is a reason to drop only when the whole envelope is empty.
 - **Unknown formats remain passive and complete**: `messaging/attachments.py` preserves video and unrecognized formats as byte-identical, randomized temporary files, supplies their local paths and original metadata to the agent, and transfers cleanup ownership through the current or queued turn. Opaque bytes are never automatically parsed, extracted, or executed; an inlineable image suffix is stripped from the temporary path so the suffix-typed ACP image sink cannot claim them, and any later tool access still crosses the normal permission and hook boundaries.
 - **Weixin inbound media is CDN-indirect**: iLink envelopes never carry bytes, only a `CDNMedia` reference (`encrypt_query_param` + `aes_key`) whose object is AES-128-ECB encrypted on the WeChat CDN. `weixin/media.py` owns that protocol work (URL construction with percent-encoded params, key decoding, decrypt, a streaming size cap enforced on bytes read rather than `Content-Length`); `weixin/attachments.py` maps the four CDN-backed item types onto the shared `Attachment` and hands them to `messaging/attachments.py`, which keeps classification, limits, signature validation and temp-file ownership channel-neutral. The `aes_key` field carries **two** encodings for the same value — `base64(raw 16 bytes)` for images, `base64(ascii hex)` for file/voice/video — discriminated by decoded length plus a strict hex check, because guessing wrong yields plausible garbage rather than an error. A voice item that already carries server-side `text` short-circuits the download: iLink voice is SILK, which no shipped transcription backend decodes, so the local path is strictly worse than the transcript the server gave us. `files_inbound=True` reflects this; `files_outbound` stays `False` until the `getuploadurl` + encrypted CDN PUT half lands.
-- **A mid-turn queue receipt is edited, never deleted**: it flips in place to `▶️ Now answering` on drain and to `🛑 Cancelled` on `/stop`. It is the durable record that a held message was accepted, so no path may delete it.
-- **A queued burst drains as ONE turn, under ONE envelope taken from the messages**: `_drain_queue` joins the held texts in arrival order into a single combined turn (capped by `_MAX_COLLAPSE` and, on Discord, the attachment ingest limit), never N replayed turns. Anything past a cap is re-enqueued together with everything behind it so FIFO order stays exact. Because `dm_scope = "unified"` can fold several people onto one queue, every queue-carrying channel records a per-entry origin, collapses only entries sharing a sender and a place, and replays from the first entry's origin -- grouping on sender and place, never on a per-message id, which would stop the collapse altogether. A deferred entry is re-enqueued WITH its origin, or it would inherit the next first entry's identity one iteration later. An entry recorded by ANOTHER transport sharing that queue is set aside and its owner's drain is woken (`messaging/queue_drain.py`), because setting aside an already-receipted message without waking anyone leaves it unanswered until that transport next speaks.
+- **A mid-turn queue receipt is edited, never deleted**: it flips in place to `▶️ Now answering` on drain and to `🛑 Cancelled` on `/stop`. It is the durable record that a held message was accepted, so no path may delete it. A caller-scoped `/stop` withdraws that caller's OWN lines from the record, drops the registry entry, and writes `🛑 Cancelled` over those lines only when the caller is the principal who OPENED the bubble -- otherwise `msg_id` names a message in somebody else's conversation. The entry may not survive: a drain flips using the chat of the entry it answers, so a surviving entry whose opener has stopped would hand it an id minted in another chat and overwrite an unrelated message there.
+- **A queued burst drains as ONE turn, under ONE envelope taken from the messages**: `_drain_queue` joins the held texts in arrival order into a single combined turn (capped by `_MAX_COLLAPSE` and, on Discord, the attachment ingest limit), never N replayed turns. Anything past a cap is re-enqueued together with everything behind it so FIFO order stays exact. Because `dm_scope = "unified"` can fold several people onto one queue, every queue-carrying channel records a per-entry origin, collapses only entries sharing a sender and a place, and replays from the first entry's origin -- grouping on sender and place, never on a per-message id, which would stop the collapse altogether. Beside that origin every entry also records a neutral `queued_owner`, read off the same sender key, which is what lets `/stop` drop one person's queued messages and leave everybody else's. A deferred entry is re-enqueued WITH its origin, or it would inherit the next first entry's identity one iteration later. An entry recorded by ANOTHER transport sharing that queue is set aside and its owner's drain is woken (`messaging/queue_drain.py`), because setting aside an already-receipted message without waking anyone leaves it unanswered until that transport next speaks.
 - **A mid-turn steer requires a genuinely live turn**: gate on `provider.has_active_turn()`, never on `sessions.is_busy()` alone, which stays true through post-turn bookkeeping. Steering an ended prompt is silently swallowed, producing an acknowledgement with no answer.
 - **Cancel is cooperative before it is fatal**: `/stop` sends the ACP `session/cancel` notification and lets the turn stop at its next safe point; escalation to a hard kill happens only after the soft-stop budget elapses without an ack. On a shared runtime the cooperative path is the only one that cannot take a co-tenant down with it.
 - **Transport shutdown is quiescent**: a client that fast-acks inbound work in background tasks cancels and awaits those tasks before closing their shared network session or returning from shutdown. Teams owns this ordering in `TeamsClient.close()`, so a gateway teardown cannot leave a turn unwinding against an already-closed Connector session; `WeComClient.close()` owns the same one for its turn tasks, which borrow the client's `aiohttp` session for the `response_url` fallback.

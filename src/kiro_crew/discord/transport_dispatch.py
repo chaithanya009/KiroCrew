@@ -93,6 +93,7 @@ from kiro_crew.messaging.link import (
 from kiro_crew.messaging.queue_drain import (
     drain_until_quiet,
     entry_channel,
+    owner_token,
     register_drain,
     tag_entry,
 )
@@ -226,15 +227,29 @@ def _inbound_origin(msg: InboundMessage) -> _QueuedOrigin:
     )
 
 
+def _entry_owner(origin: _QueuedOrigin) -> str:
+    """The neutral token naming the principal *origin* came from.
+
+    Built from ``sender_key``, the same value that decides whether two queued messages
+    may share one turn, so "whose entry is this" and "may these collapse together" can
+    never answer differently. ``/stop`` compares it to drop one person's queued messages
+    and leave everybody else's.
+    """
+    return owner_token(_CHANNEL, origin.sender_key)
+
+
 def _origin_kwargs(origin: _QueuedOrigin) -> dict[str, str]:
     """An origin as prefixed queue-entry keyword arguments, plus the neutral channel.
 
     The channel rides with them because a drain must be able to tell an entry it owns
     from one another transport recorded BEFORE it reads any channel-specific field,
-    and because the value names which peer drain to wake for a foreign entry.
+    and because the value names which peer drain to wake for a foreign entry. The owner
+    rides with them for the mirror reason on the clear side: ``/stop`` must tell one
+    person's entries from another's across every transport on the queue, and the
+    prefixed fields below are unreadable to it on a foreign entry.
     """
     recorded = {f"{_ORIGIN_PREFIX}{name}": value for name, value in origin._asdict().items()}
-    return tag_entry(recorded, _CHANNEL)
+    return tag_entry(recorded, _CHANNEL, _entry_owner(origin))
 
 
 def _queued_origin(kwargs: dict) -> _QueuedOrigin | None:
@@ -1427,10 +1442,6 @@ class DiscordDispatcher:
                         **rkw,
                     )
                 if texts and origin is not None:
-                    # The receipt too: its bubble was posted into the channel of
-                    # whoever queued first, so editing it under the opener's address
-                    # reaches a different channel, where that message id does not
-                    # exist.
                     await self._receipt_flip_locked(
                         session_key,
                         origin.channel_id,
@@ -1501,7 +1512,10 @@ class DiscordDispatcher:
             # An attachment-only message has no text; show a placeholder rather
             # than a blank entry in the receipt.
             await self._queue.create_or_grow_locked(
-                session_key, self._receipt_surface(channel_id), text or ATTACHMENT_PLACEHOLDER
+                session_key,
+                self._receipt_surface(channel_id),
+                text or ATTACHMENT_PLACEHOLDER,
+                _entry_owner(origin),
             )
             return True
 
@@ -1559,7 +1573,7 @@ class DiscordDispatcher:
         thread_id: str,
         resumed_key: str | None,
     ) -> None:
-        """Hard cancel: abort the in-flight turn and clear everything.
+        """Hard cancel: abort the in-flight turn and clear THIS caller's queued messages.
 
         The cooperative-cancel contract, the lock ordering across ``clear_queue``
         + the receipt finalize, and both replies live in
@@ -1567,6 +1581,11 @@ class DiscordDispatcher:
         Discord's address and stops the session the turn is actually running
         under, which for a resumed conversation is its owner rather than this
         channel's own DM session.
+
+        The owner token is built from the same three fields an inbound records on its
+        queue entries, so the caller matches their own entries and no one else's: under
+        ``dm_scope = "unified"`` this queue also holds other people's messages, and on
+        another transport too.
         """
         assert self.client is not None
         reply = await stop_running_turn(
@@ -1574,6 +1593,11 @@ class DiscordDispatcher:
             resumed_key or self._session_key(user_id, thread_id),
             queue=self._queue,
             surface=self._receipt_surface(channel_id),
+            owner=_entry_owner(
+                _QueuedOrigin(
+                    user_id=str(user_id), channel_id=str(channel_id), thread_id=str(thread_id or "")
+                )
+            ),
         )
         await self.client.send_message(channel_id, reply)
 

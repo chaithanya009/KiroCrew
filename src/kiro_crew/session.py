@@ -2940,9 +2940,22 @@ class SessionManager:
         """Consume a queued-message cancellation marker."""
         return self._allocation_boundary().is_cancelled(key, msg_ts)
 
-    def clear_queue(self, key: str) -> None:
-        """Clear queued messages and their temporary paths."""
-        self._allocation_boundary().clear_queue(key)
+    def clear_queue(self, key: str, owned_by: Callable[[dict], bool] | None = None) -> None:
+        """Clear queued messages and their temporary paths.
+
+        *owned_by* narrows the clear to the entries it selects, for a caller acting for
+        ONE principal rather than for the whole session: under
+        ``messaging.dm_scope = "unified"`` every allow-listed person's direct messages
+        share one key and therefore one queue, so clearing all of it on one person's
+        ``/stop`` discards messages other people are still waiting for an answer to. The
+        predicate reads a queue entry's keyword arguments and nothing here interprets
+        them, so which fields name a principal stays with the channels that wrote them
+        (``messaging/queue_drain.py``).
+
+        Omitted, the whole queue goes, which is what a whole-session request means:
+        teardown, a generation bump, a fresh conversation.
+        """
+        self._allocation_boundary().clear_queue(key, owned_by)
 
     async def is_provider_alive(self, key: str) -> bool | None:
         """Probe a folded session provider outside the registry lock."""
