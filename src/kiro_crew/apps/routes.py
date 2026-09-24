@@ -33,8 +33,11 @@ from kiro_crew.apps import official_catalog
 from kiro_crew.apps.backend import (
     get_app_backend_port,
     list_app_processes,
+    record_unstopped_backend,
+    recorded_backend_port,
     start_app_backend,
     stop_app_backend,
+    unstopped_backend_port,
 )
 from kiro_crew.apps.bridges import (
     RegistrationResult,
@@ -613,6 +616,42 @@ async def _deregister_app_off_loop(name: str) -> RegistrationResult:
     )
 
 
+async def _stop_backend_and_observe(name: str) -> tuple[int | None, bool]:
+    """Stop *name*'s backend and return the port it is STILL listening on, if any.
+
+    ``stop_app_backend``'s own return value cannot answer this. It is ``False``
+    both for "there was nothing to stop" (never started, already dead) and for
+    "something is running that I did not stop" (a fixed-port backend never
+    adopted at boot, an adoption with no usable PIDs), and ``True`` only says the
+    process it was TRACKING is gone — which is silent about a detached worker the
+    app spawned for itself. Those need opposite handling, so the port is OBSERVED
+    rather than the flag believed. Same contract ``teardown_app_runtime`` applies
+    on disable and on trust withdrawal.
+
+    The hint is captured BEFORE the stop because the stop drops both the live
+    tracking entry and the pidfile record, and those are the only gateway-owned
+    evidence of which port this backend actually used. It is preferred over the
+    manifest deliberately: ``app.json`` sits inside the app directory and is
+    writable by any app trusted to run code, so a declared port could be
+    relabelled to hide from this probe.
+    """
+    loop = asyncio.get_running_loop()
+    port_hint = await loop.run_in_executor(subprocess_executor(), recorded_backend_port, name)
+    await loop.run_in_executor(subprocess_executor(), stop_app_backend, name)
+    live_port = await loop.run_in_executor(
+        subprocess_executor(), lambda: unstopped_backend_port(name, port_hint=port_hint)
+    )
+    if live_port is None:
+        return None, True
+    # The listener holds the port the manifest declares, so a later install of
+    # the same name finds a healthy answer there and would adopt it as its own
+    # backend. Record the pair so adoption refuses until that process exits.
+    recorded = await loop.run_in_executor(
+        subprocess_executor(), record_unstopped_backend, name, live_port
+    )
+    return live_port, recorded
+
+
 async def _app_may_run_after_install(name: str, *, fresh_install: bool = False) -> bool:
     """Read whether installed app resources may run after an install or update."""
 
@@ -1100,7 +1139,7 @@ async def handle_uninstall_app(request: web.Request) -> web.Response:
     2. Cron cleanup precondition (gateway-managed; abort with retryable 409 if
        the cron store stays busy — runs FIRST, before anything destructive)
     3. Run onUninstall script (if declared)
-    4. Stop backend + deregister resources (gateway-managed only)
+    4. Stop the backend (every app) + deregister resources (gateway-managed only)
     5. Clean removable dependencies (unless keep_dependencies=true)
     6. Remove app files (preserve data/ unless purge_data=true)
 
@@ -1122,6 +1161,10 @@ async def handle_uninstall_app(request: web.Request) -> web.Response:
     resources = info.get("resources", "gateway")
     manifest = info.get("manifest", {})
     uninstall_log: list[str] = []
+    # Kept apart from ``uninstall_log``: this is the one thing a caller must not
+    # read as ordinary progress prose. It is serialized as ``warnings``, which the
+    # CLI already renders per item, so a delegated uninstall shows it too.
+    backend_warnings: list[str] = []
 
     # Parse body
     # Preserve app data unless the caller supplies the dedicated destructive
@@ -1345,11 +1388,45 @@ async def handle_uninstall_app(request: web.Request) -> web.Response:
             if script_output.get("failed"):
                 uninstall_log.append("onUninstall script failed (exit code non-zero)")
 
-        # Step 3: Stop backend + deregister resources (gateway-managed only)
-        if resources == "gateway":
-            await asyncio.get_running_loop().run_in_executor(
-                subprocess_executor(), stop_app_backend, name
+        # Step 3: Stop the backend, then deregister gateway-managed resources.
+        #
+        # The stop runs for EVERY app; `resources` does not gate it. That field
+        # comes from the app's own installed metadata, so gating the stop on it
+        # hands a trusted app a switch for its own teardown: declare
+        # `resources: "app"` and the uninstall deletes the files while the backend
+        # keeps executing, holding its port, its app secret and its proxied
+        # routes. Deregistration still honors the field — an app that owns its
+        # agents, skills and crons must not have the gateway delete them — but the
+        # PROCESS is not the app's to keep. Same split `teardown_app_runtime`
+        # makes on disable and on trust withdrawal.
+        #
+        # A still-listening port is REPORTED, not made to abort. By here the
+        # non-idempotent onUninstall script has already run, so refusing would
+        # strand a half-removed app that no retry can finish cleanly, and an app
+        # that cannot be uninstalled is a worse outcome than one whose port is
+        # named as still in use. What must not happen is claiming a clean stop.
+        live_port, recorded = await _stop_backend_and_observe(name)
+        if live_port is not None:
+            logger.warning(
+                "backend for app %r is still listening on port %s after uninstall stop",
+                name,
+                live_port,
             )
+            backend_warnings.append(
+                f"backend still listening on port {live_port} after the stop — the "
+                f"gateway stopped every process it was tracking, so this one is not "
+                f"ours to stop and it is still running"
+            )
+            if not recorded:
+                # The record is what makes a later install of this name refuse to
+                # adopt that listener. Losing it silently is what turns a reported
+                # leak into an adopted one, so the failure is reported too.
+                backend_warnings.append(
+                    f"could not record port {live_port} as held by a process this "
+                    f"gateway does not own — reinstalling {name!r} may adopt that "
+                    f"listener instead of starting its own backend"
+                )
+        if resources == "gateway":
             await _deregister_app_off_loop(name)
 
         # Step 4: Clean dependencies (atomic classify + ledger update)
@@ -1440,6 +1517,8 @@ async def handle_uninstall_app(request: web.Request) -> web.Response:
     resp = result.to_dict()
     if uninstall_log:
         resp["uninstall_log"] = "\n".join(uninstall_log)
+    if backend_warnings:
+        resp["warnings"] = backend_warnings
     if cleaned_deps:
         resp["cleaned_dependencies"] = cleaned_deps
     return web.json_response(resp)

@@ -2042,6 +2042,28 @@ def _start_app_backend_body(app_name: str, manifest: Any) -> AppProcess | None:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.settimeout(1)
                 s.connect(("127.0.0.1", port))
+            # A listener that outlived this app's uninstall is not evidence that
+            # the app's backend is running, so it is refused BEFORE the health
+            # probe below can make it look like one. The probe and the owner
+            # capture establish that something healthy answers and which PIDs
+            # hold the socket; neither reads the code that listener executes.
+            if adoption_refused_after_uninstall(app_name, port):
+                try:
+                    sel().log_api_access(
+                        caller="gateway", operation="app_backend_adopt",
+                        outcome="refused_unstopped_after_uninstall",
+                        resources=f"{app_name} port={port}",
+                    )
+                except Exception as exc:
+                    logger.debug("SEL audit failed for app %s adopt refusal: %s", app_name, exc)
+                logger.warning(
+                    "App %s: port %d is held by a listener that outlived this app's "
+                    "uninstall - refusing adoption. Stop that process, then start the "
+                    "app again.",
+                    app_name, port,
+                )
+                return None
+
             # Port occupied — probe health endpoint before giving up
             healthy = _probe_adoption_health(port, manifest.backend.healthCheck)
 
@@ -4748,6 +4770,139 @@ def retire_windows_app_tracking(pid: int, creation: int) -> None:
             for name in remove:
                 del data[name]
             atomic_write(_pidfile_path(), json.dumps(data), fsync=True)
+
+
+# ---------------------------------------------------------------------------
+# Uninstall tombstones
+# ---------------------------------------------------------------------------
+
+# Written when an uninstall's stop cannot prove the backend is gone, and read by
+# the adoption branch. Kept apart from the pidfile: the pidfile records processes
+# this gateway owns and the stop drops its row, so the one fact that matters
+# afterwards would be erased by the event that creates it.
+#
+# ONE FILE PER APP, not one shared document. The read has to fail CLOSED, since a
+# record the gateway cannot parse is not a record it may ignore, and a shared file
+# makes that unaffordable: one unparseable document would refuse adoption for
+# every app on the host. Per app, the same fail-closed read costs exactly the one
+# app whose own record is unreadable, and only while its port is occupied.
+_tombstone_lock = threading.Lock()
+
+
+def _tombstone_dir() -> Path:
+    return config_dir() / "app_backend_tombstones"
+
+
+def _tombstone_path(app_name: str) -> Path:
+    """The record file for *app_name*.
+
+    Sanitized the way ``app_backend_lifecycle_flock`` sanitizes its lock name.
+    That mapping is lossy, so two app names can land on one file; the app name is
+    stored INSIDE the record and checked on read, so a collision reads as
+    unreadable and refuses rather than answering with another app's record.
+    """
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", app_name) or "_"
+    return _tombstone_dir() / f"{safe}.json"
+
+
+class _TombstoneUnreadable(Exception):
+    """An app's record exists but cannot be trusted to say what it says."""
+
+
+def _read_tombstone(app_name: str) -> dict[str, Any] | None:
+    """*app_name*'s record: ``None`` for none, raising when one is unusable.
+
+    The three answers are deliberately distinct. A MISSING file means no
+    uninstall of this app ever left a port held, which is the ordinary case and
+    gates nothing. A file that is present but unparseable, one whose stored name
+    does not match, and one whose port is not a port all mean the gateway cannot
+    say what it recorded -- and "cannot say" must never be spent as "nothing to
+    say", which is the whole reason the record exists.
+    """
+    try:
+        with open(_tombstone_path(app_name), encoding="utf-8") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
+        raise _TombstoneUnreadable(str(exc)) from exc
+    if not isinstance(data, dict) or data.get("app") != app_name:
+        raise _TombstoneUnreadable("record does not identify this app")
+    port = data.get("port")
+    if not isinstance(port, int) or not (_MIN_PORT <= port <= _MAX_PORT):
+        raise _TombstoneUnreadable("record does not name a port in the app range")
+    return data
+
+
+def _drop_tombstone(app_name: str) -> None:
+    """Remove an app's record. Never raises."""
+    try:
+        with _tombstone_lock:
+            _tombstone_path(app_name).unlink(missing_ok=True)
+    except OSError as exc:
+        logger.debug("Could not drop app-backend tombstone for %s: %s", app_name, exc)
+
+
+def record_unstopped_backend(app_name: str, port: int) -> bool:
+    """Record that *app_name* is uninstalled with a listener still on *port*.
+
+    Returns whether the record landed, so the uninstall can REPORT a write it
+    could not make instead of swallowing it. It never raises, and the uninstall
+    never aborts on a false answer: by the time this runs the non-idempotent
+    onUninstall script has already run, so refusing would strand a half-removed
+    app that no retry can finish. An unrecorded leak the operator is told about
+    is recoverable; an app that cannot be removed is not.
+    """
+    if not (_MIN_PORT <= port <= _MAX_PORT):
+        return False
+    payload = json.dumps({"app": app_name, "port": port, "recorded_at": time.time()})
+    try:
+        with _tombstone_lock:
+            _tombstone_dir().mkdir(parents=True, exist_ok=True)
+            atomic_write(_tombstone_path(app_name), payload, fsync=True)
+        return True
+    except Exception as exc:  # noqa: BLE001 - an uninstall must not fail on this
+        logger.warning(
+            "App %s: cannot record the unstopped backend on port %d (%s), so a later "
+            "install of this app cannot refuse to adopt that listener",
+            app_name, port, exc,
+        )
+        return False
+
+
+def adoption_refused_after_uninstall(app_name: str, port: int) -> bool:
+    """Whether a recorded uninstall forbids adopting the listener on *port*.
+
+    Only a MISSING record permits adoption. A record naming this port refuses
+    while its listener still answers, and a record that exists but cannot be read
+    refuses outright -- an I/O failure is precisely the case that would otherwise
+    hand the survivor straight to the next install of the same name.
+
+    The refusal lifts on POSITIVE evidence, which is what keeps a legitimate
+    fixed-port app installable: a record is dropped as soon as the port it names
+    answers nothing, because the listener it describes has exited and there is
+    nothing left to refuse. A record naming a DIFFERENT port is kept and does not
+    gate this one, since the process it describes still holds that other port. An
+    unreadable record fences only this app, and only while its port is occupied:
+    a free port never reaches this question, so the app still installs and starts
+    its own backend.
+    """
+    try:
+        entry = _read_tombstone(app_name)
+    except _TombstoneUnreadable as exc:
+        logger.warning(
+            "App %s: its uninstall record is unreadable (%s), so adoption on port %d is "
+            "refused. No other app is affected. Delete %s once that port is known free.",
+            app_name, exc, port, _tombstone_path(app_name).name,
+        )
+        return True
+    if entry is None:
+        return False
+    recorded = int(entry["port"])
+    if not _port_is_listening(recorded):
+        _drop_tombstone(app_name)
+        return False
+    return recorded == port
 
 
 def _reap_orphaned_backend_group(
