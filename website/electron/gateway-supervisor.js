@@ -85,6 +85,10 @@ const DEFAULT_THEME_ACCENT = "#8E48FF";
 const THEME_ACCENT_RE = /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/;
 const INSTALLING_STATUS = "Finishing installation…";
 const RESTARTING_STATUS = "Restarting Kiro Crew to finish the update…";
+// The same handoff serves a caller that is not updating anything, and the splash
+// is the only surface the user is looking at while it runs, so the reason is the
+// caller's to name.
+const RESTARTING_FOR_LOCAL_GATEWAY_STATUS = "Restarting Kiro Crew to start a local gateway…";
 const POLL_INTERVAL_MS = 500;
 const ADOPTED_RECOVERY_WAIT_MS = 30_000;
 // loadFile query that tells loading.html it is being painted by a reconnect
@@ -306,8 +310,13 @@ function createGatewaySupervisor({
    * @param {boolean} [options.pinPort]  put expectPort in the successor's
    *        environment, for a caller choosing a port rather than predicting the
    *        one the successor would select for itself.
+   * @param {string} [options.restartingStatus]  what the splash says while the
+   *        handoff runs, since only the caller knows why it is restarting.
    */
-  async function relaunchViaConfirmedSuccessor(onFailed, { expectPort = PORT, pinPort = false } = {}) {
+  async function relaunchViaConfirmedSuccessor(
+    onFailed,
+    { expectPort = PORT, pinPort = false, restartingStatus = RESTARTING_STATUS } = {},
+  ) {
     const readyUrl = `http://localhost:${expectPort}${READY_PATH}`;
     const target = processObj.execPath;
     const args = Array.isArray(processObj.argv) ? processObj.argv.slice(1) : [];
@@ -339,7 +348,7 @@ function createGatewaySupervisor({
         } catch { /* window may be tearing down */ }
       }
     }
-    sendStatus(RESTARTING_STATUS);
+    sendStatus(restartingStatus);
     app.releaseSingleInstanceLock();
     let settled = false;
     let gone = false;
@@ -388,7 +397,7 @@ function createGatewaySupervisor({
       pollTimer = null;
       if (settled) return;
       // The splash loads asynchronously and may have missed the first send.
-      sendStatus(RESTARTING_STATUS);
+      sendStatus(restartingStatus);
       const readiness = await fetchGatewayReadiness(readyUrl);
       if (settled) return;
       if (readiness === "ready" || readiness === "starting") { confirm(); return; }
@@ -1870,7 +1879,7 @@ function createGatewaySupervisor({
               glog("successor never served; this process stays client-only and the setting is on for the next launch");
               showLoadingThenConnect(window, targetBackendUrl, { initialPath })
                 .catch((error) => glog(`resurfacing the gateway failure failed: ${error && error.message}`));
-            }, { expectPort: successorPort, pinPort: true });
+            }, { expectPort: successorPort, pinPort: true, restartingStatus: RESTARTING_FOR_LOCAL_GATEWAY_STATUS });
             return;
           }
           runLocalGateway = true;

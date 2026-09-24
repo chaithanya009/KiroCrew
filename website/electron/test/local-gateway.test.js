@@ -176,11 +176,18 @@ test("client-only: the local-start offer routes through a re-exec on a crew's po
   // served, so the handshake watches the port this process chose and pinned.
   // Polling this process's own port times out against a healthy successor and
   // then kills it.
-  assert.match(source, /async function relaunchViaConfirmedSuccessor\(onFailed, \{ expectPort = PORT, pinPort = false \} = \{\}\)/);
+  // The options stay on ONE line: splash-close.test.js slices this function's
+  // body up to the first two-space-indented `}`, so a multi-line destructure
+  // would end that slice at the parameter list instead of the function.
+  assert.match(source, /async function relaunchViaConfirmedSuccessor\(\n {4}onFailed,\n {4}\{ expectPort = PORT, pinPort = false, restartingStatus = RESTARTING_STATUS \} = \{\},\n {2}\) \{/);
   assert.match(source, /const readyUrl = `http:\/\/localhost:\$\{expectPort\}\$\{READY_PATH\}`;/);
   assert.match(source, /await fetchGatewayReadiness\(readyUrl\)/);
   assert.match(source, /const successorPort = predictLocalPort\(\);/);
-  assert.match(source, /\}, \{ expectPort: successorPort, pinPort: true \}\);/);
+  assert.match(source, /\}, \{ expectPort: successorPort, pinPort: true, restartingStatus: RESTARTING_FOR_LOCAL_GATEWAY_STATUS \}\);/);
+  // The splash is the only surface showing status during the handoff, and this
+  // caller is not updating anything, so it must not borrow the update wording.
+  assert.match(source, /const RESTARTING_FOR_LOCAL_GATEWAY_STATUS = "Restarting Kiro Crew to start a local gateway/);
+  assert.doesNotMatch(source, /restartingStatus = RESTARTING_FOR_LOCAL_GATEWAY_STATUS/);
   // Pinning the port is what makes the watched port and the bound port one
   // value: the successor reads KIROCREW_PORT ahead of its own selection.
   assert.match(
