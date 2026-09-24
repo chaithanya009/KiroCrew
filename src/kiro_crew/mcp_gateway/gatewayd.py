@@ -66,6 +66,7 @@ from kiro_crew.executors import (
     maintenance_executor,
     subprocess_executor,
 )
+from kiro_crew.managed_launcher import same_managed_launcher
 from kiro_crew.mcp_caller import CallerContext
 from kiro_crew.mcp_caller import _parent_pid as _ppid_fn
 from kiro_crew.mcp_caller import new_tenant_nonce
@@ -172,8 +173,9 @@ logger = logging.getLogger(__name__)
 #: ``acp.session_mcp.IDENTITY_BOUND_SERVERS``.
 #:
 #: Membership is necessary and NOT sufficient. ``_spawns_own_control_plane`` still
-#: compares the spawned binary by realpath and the argv exactly against the
-#: managed spec for this name, and refuses a child carrying non-empty ``LD_*``,
+#: compares the spawned binary by realpath (or, for a Toolbox dispatcher shim, by
+#: the launcher it dispatches to) and the argv exactly against the managed spec
+#: for this name, and refuses a child carrying non-empty ``LD_*``,
 #: ``DYLD_*``, or ``PYTHON*`` env, or an import root that shadows
 #: ``kiro_crew``, so the name alone hands over nothing.
 CONTROL_PLANE_BACKENDS = frozenset(KIROCREW_BIN_MCP_SERVERS)
@@ -194,9 +196,13 @@ def _spawns_own_control_plane(
     ``KIROCREW_MCP_TARGET_<NAME>`` mapping, so a spec that declares a
     third-party command under a reserved name would otherwise be handed the
     session's bearer token. The binary is compared by real path (a launcher
-    and its symlink are the same program) and the args exactly, against the
-    invocation the managed spec emits for that name -- the one source both the
-    spec writer and this check read. Anything unresolvable is not ours.
+    and its symlink are the same program), or as a Toolbox dispatcher shim whose
+    declared target is that launcher (``managed_launcher.same_managed_launcher``
+    -- a spec naming the server by its bare ``kirocrew`` resolves to the shared
+    ``toolbox-exec``, whose realpath is never the versioned binary), and the args
+    exactly, against the invocation the managed spec emits for that name -- the
+    one source both the spec writer and this check read. Anything unresolvable
+    is not ours.
 
     The invocation being ours is still not proof of what RUNS: the managed
     spec's module fallback excludes the child's working directory, but a
@@ -247,8 +253,16 @@ def _spawns_own_control_plane(
     expected_command = str(expected.get("command") or "")
     if not expected_command or not command:
         return _deny_control_plane(server_name, "spec or spawn command is empty")
+    child_env = env if env is not None else os.environ
+    # Same program by realpath, or the trusted Toolbox root's dispatcher shim
+    # whose index dispatches this name to the managed launcher
+    # (``managed_launcher``): a spec that names the server by its bare
+    # ``kirocrew`` resolves on PATH to that shim, whose realpath is the shared
+    # ``toolbox-exec`` and never the versioned binary. The child's environment
+    # is read too, because a dispatcher re-rooted by it would read a different
+    # index than the one judged here.
     try:
-        same_binary = os.path.realpath(command) == os.path.realpath(expected_command)
+        same_binary = same_managed_launcher(command, expected_command, child_env=child_env)
     except (OSError, ValueError):
         return _deny_control_plane(server_name, f"command {command!r} is unresolvable")
     if not same_binary:
@@ -259,7 +273,6 @@ def _spawns_own_control_plane(
     expected_argv = [str(a) for a in expected.get("args", [])]
     if argv != expected_argv:
         return _deny_control_plane(server_name, f"args {argv!r} differ from spec {expected_argv!r}")
-    child_env = env if env is not None else os.environ
     loader_env = next(
         (
             str(key).upper()
@@ -271,7 +284,11 @@ def _spawns_own_control_plane(
     )
     if loader_env:
         return _deny_control_plane(server_name, f"child environment carries non-empty {loader_env}")
-    shadow = _kiro_crew_import_is_shadowed(command, argv, work_dir)
+    # The launcher directory the shadow check reads is the PROGRAM's: under a
+    # dispatcher shim ``command``'s own directory is the dispatcher's, and the
+    # binary that runs -- and whose ``bin/`` could hold a foreign ``kiro_crew`` --
+    # is the managed one just matched.
+    shadow = _kiro_crew_import_is_shadowed(expected_command, argv, work_dir)
     if shadow:
         return _deny_control_plane(server_name, f"import root {shadow!r} shadows kiro_crew")
     return True

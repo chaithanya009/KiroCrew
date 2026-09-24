@@ -75,6 +75,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import shutil
 from collections.abc import Collection
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -89,7 +91,8 @@ from kiro_crew.agent import (
 )
 from kiro_crew.agent_discovery import _read_agent_spec, project_agent_files, project_agent_name
 from kiro_crew.agent_sdk.mcp_refs import parse_tools_refs
-from kiro_crew.env import sanitize_spec_env
+from kiro_crew.env import mcp_search_path, sanitize_spec_env, spec_path_key
+from kiro_crew.managed_launcher import same_managed_launcher
 from kiro_crew.mcp_cleanup import KIROCREW_BIN_MCP_SERVERS, mcp_entry_is_muted
 
 logger = logging.getLogger(__name__)
@@ -931,6 +934,58 @@ def _managed_element_env(declared: Any) -> dict[str, str]:
     return env
 
 
+def _which_on_mcp_search_path(command: str, env: Any) -> str | None:
+    """Resolve a bare declared command the way the rewriter and the MCP probe do.
+
+    The composition is :func:`kiro_crew.env.mcp_search_path`: the entry's own
+    ``env.PATH`` first (an operator pin wins), then the contributed MCP directories,
+    then the augmented host PATH. Same answer as ``mcp_gateway.rewriter`` gives the
+    same declaration, so a server that pools under the gateway and one the session
+    launches itself are judged against one file. ``None`` when nothing resolves.
+    """
+    path_key = spec_path_key(env) if isinstance(env, dict) else None
+    env_path = env.get(path_key, "") if path_key else ""
+    return shutil.which(command, path=mcp_search_path(str(env_path or "")))
+
+
+def _declares_managed_command(source: dict[str, Any], managed_command: str) -> bool:
+    """Whether *source*'s ``command`` runs Crew's own managed launcher.
+
+    The literal managed spelling passes as before. Anything else is judged as a
+    FILE: a bare name resolves on the MCP search path, then the resolved (or
+    absolute) command must be the same program as the managed launcher --
+    :func:`kiro_crew.managed_launcher.same_managed_launcher`, which holds by
+    realpath or through a Toolbox dispatcher shim whose declared target it is.
+    This is the spelling every externally installed spec carries (``"command":
+    "kirocrew"``): on PATH that is the Toolbox shim, whose realpath is the shared
+    dispatcher and never the versioned binary, so a string compare denied the
+    identity element to every such spec and every Crew tool answered
+    ``identity_unattested`` while mounting normally. A name that resolves
+    nowhere, or to any other file, still earns nothing.
+    """
+    declared = source.get("command")
+    if not isinstance(declared, str) or not declared or not managed_command:
+        return False
+    if declared == managed_command:
+        return True
+    resolved = (
+        declared
+        if os.path.isabs(declared)
+        else _which_on_mcp_search_path(declared, source.get("env"))
+    )
+    if not resolved:
+        return False
+    declared_env = source.get("env")
+    try:
+        return same_managed_launcher(
+            resolved,
+            managed_command,
+            child_env=declared_env if isinstance(declared_env, dict) else None,
+        )
+    except (OSError, ValueError):
+        return False
+
+
 def kiro_control_plane_servers(
     agent: str | None,
     *,
@@ -943,8 +998,13 @@ def kiro_control_plane_servers(
     Only an existing managed stdio declaration can be overridden. Native-only
     restrictions stay in the native declaration instead of being discarded by
     ACP shaping. Registry entries remain the enterprise catalog's responsibility.
-    The element's ``env`` is owned by :func:`_managed_element_env`, which holds it to
-    the rule the disk-writing consumer applies to this same population.
+    A declaration is managed when its ``command`` runs the managed launcher --
+    :func:`_declares_managed_command`: the literal spelling, or a bare or absolute
+    command that resolves to the same file, including through a Toolbox
+    dispatcher shim -- and its ``args`` are the managed args. The element then
+    carries the managed ``command``/``args`` rather than the spec's spelling, and
+    its ``env`` is owned by :func:`_managed_element_env`, which holds it to the
+    rule the disk-writing consumer applies to this same population.
 
     Covers every server in :data:`IDENTITY_BOUND_SERVERS` the spec grants, not
     only the control plane: an opt-in server such as ``kirocrew-dashboard`` is
@@ -992,12 +1052,24 @@ def kiro_control_plane_servers(
             or source.get("type", "stdio") != "stdio"
             or mcp_entry_is_muted(source)
             or source.get("disabledTools", []) != []
-            or ("command" in source and source["command"] != managed.get("command"))
+            or (
+                "command" in source
+                and not _declares_managed_command(source, str(managed.get("command") or ""))
+            )
             or ("args" in source and source["args"] != managed.get("args", []))
             for source in sources
         ):
             continue
-        owned = {**entry, "env": _managed_element_env(entry.get("env"))}
+        # The element carries the MANAGED invocation, not the spec's spelling. The
+        # gate above judged the file a declared ``kirocrew`` resolves to on Crew's
+        # search path; kiro-cli launching the bare word against ITS PATH could
+        # reach a different one, so the element names the file that was judged.
+        owned = {
+            **entry,
+            "command": managed["command"],
+            "args": list(managed.get("args", [])),
+            "env": _managed_element_env(entry.get("env")),
+        }
         element = acp_server_element(name, owned)
         if element is not None:
             out.append(element)

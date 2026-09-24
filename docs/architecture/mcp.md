@@ -1953,10 +1953,48 @@ earn the token: the server name arrives in the stub's register frame while the
 spawn target resolves separately from the spec-derived
 `KIROCREW_MCP_TARGET_<NAME>` mapping, so a spec could declare a third-party
 command under a reserved name. At spawn, `gatewayd._spawns_own_control_plane`
-compares the command actually exec'd (by real path) and its args against the
-invocation `agent.managed_mcp_spec_entry` emits for that name and records the
-verdict as `Backend.control_plane`; the handler forwards the token on that flag
-only. The invocation being ours is still not proof of what runs: the managed
+compares the command actually exec'd and its args against the invocation
+`agent.managed_mcp_spec_entry` emits for that name and records the verdict as
+`Backend.control_plane`; the handler forwards the token on that flag only. The
+command comparison is `managed_launcher.same_managed_launcher`: the same file by
+real path (a launcher and its symlink are one program), or the trusted Toolbox
+root's dispatcher shim whose index dispatches that name to the managed file. The
+second clause exists because a dispatcher is not a symlink: `~/.toolbox/bin/kirocrew`
+is one shared `~/.toolbox/tools/toolbox/<ver>/toolbox-exec`, which (measured
+against the real binary) keys on `argv[0]`'s basename, reads
+`<root>/tools/globalInfo.json` and execs `Commands.<name>.Path` verbatim, so its
+realpath is never the managed entry's, and a spec that names the server by its
+bare `kirocrew` -- what PATH resolves to that shim -- was denied the token on every
+Toolbox install while the server mounted and listed its tools normally
+(`identity_unattested` on every call). The resolver reads that same index without
+executing anything. It is anchored, not widened: the root is
+`managed_launcher.toolbox_root()` -- `$BUILDER_TOOLBOX_HOME` from the gateway's OWN
+environment, else `~/.toolbox` -- never derived from where the command happens to
+sit, so a tree merely shaped like Toolbox elsewhere is a foreign binary as before;
+the managed entry must itself live under that root (only a Toolbox install has a
+launcher a Toolbox dispatcher can front); the index entry must name that file by
+realpath (an index rewritten to name another file denies); and a child environment
+that could point its dispatcher anywhere else denies -- a `BUILDER_TOOLBOX_HOME`
+that is not the trusted root, or a `HOME` / `USERPROFILE` that is not this
+process's own home, each judged as the child would see it (a relative value
+resolves against the child's working directory, not this process's, so it
+denies unresolved) -- because the child dispatcher would then read an index this
+verdict never saw. The index sits in the
+same user-owned tree as the managed binary, so trusting it concedes no capability
+the realpath comparison did not already concede. The launcher-directory half of
+the shadow check below reads the DISPATCHED launcher's directory, not the
+dispatcher's. The session-side gate, `acp.session_mcp.kiro_control_plane_servers`,
+judges the SPEC's declaration by the same predicate (`_declares_managed_command`):
+the literal managed spelling, or a bare or absolute command that resolves -- a
+bare name on `env.mcp_search_path`, the composition the rewriter and the MCP probe
+use -- to the same program; the identity element it emits then carries the
+managed `command`/`args`, never the spec's PATH-dependent spelling, so kiro-cli
+launches the file the gate judged. That element is rebuilt at every session
+start from the running gateway's own launcher; if a Toolbox update reaps that
+launcher under a still-running gateway, kiro-cli's spawn of the element fails
+outright (`No such file or directory`, the server absent, no token handed to
+anything) rather than half-launching -- the same shape every Crew-written spec
+already has, and cleared by the gateway restart the update needs anyway. The invocation being ours is still not proof of what runs: the managed
 spec falls back to `<python> -m kiro_crew <sub>` when no launcher resolves, and
 the child's CWD could carry foreign code under our name. Python's `PYTHON*`
 environment namespace is an extensible interpreter control surface: entries can add roots, execute hooks, select an executable, or move
