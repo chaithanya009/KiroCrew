@@ -107,7 +107,11 @@ def reexec_python_module(module: str, args: Sequence[str], executable: str | Non
     _ensure_utf8_process_environment()
     resolved = executable or sys.executable
     argv0 = ntpath.basename(resolved) if IS_WINDOWS else resolved
-    argv = isolated_python_argv("-m", module, *args, executable=resolved)
+    # ``-P``: the successor inherits this process's cwd -- the home directory
+    # for a service-launched gateway -- and ``-m`` would put it first on
+    # sys.path, ahead of the standard library, so a stdlib-named directory
+    # there would shadow the stdlib in the restarted process.
+    argv = isolated_python_argv("-P", "-m", module, *args, executable=resolved)
     argv[0] = argv0
     os.execv(resolved, argv)
 

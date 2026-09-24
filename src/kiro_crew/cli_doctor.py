@@ -19,7 +19,15 @@ from pathlib import Path
 
 from kiro_crew import __version__ as _mc_version
 from kiro_crew import agent as _agent
-from kiro_crew import agent_state, dep_sync, diagnostics, platform_compat, sandbox, stt
+from kiro_crew import (
+    agent_state,
+    dep_sync,
+    diagnostics,
+    platform_compat,
+    sandbox,
+    stdlib_shadow,
+    stt,
+)
 from kiro_crew._bootstrap import _source_checkout_root
 from kiro_crew.acp.client import KIRO_CLI_BIN
 from kiro_crew.acp.kas_transport import (
@@ -4227,6 +4235,45 @@ def _venv_deps_ok(venv_py: Path) -> bool:
     return proc.returncode == 0
 
 
+def _doctor_import_path(issues: list[str]) -> None:
+    """Report where the standard library resolves from, and whether the launch
+    directory can shadow it.
+
+    The process entries refuse to start on a shadowed stdlib, so by the time
+    doctor runs the answer is normally clean; this row exists for the other
+    half of the diagnosis -- an install that still LETS the launch directory
+    onto ``sys.path`` (no ``-P``), so the same ``~/concurrent/`` that is harmless
+    from one directory breaks the gateway from another. A shadow reported here
+    is an issue; a launch entry on ``sys.path`` is a note, because a console
+    script's own ``bin/`` is the ordinary case for a pip install.
+    """
+    shadows = stdlib_shadow.find_shadowed_stdlib()
+    if shadows:
+        for s in shadows:
+            entry = s.path_entry or os.getcwd()
+            # ascii(): the path is caller-chosen bytes; escape control characters
+            # rather than write them to the terminal.
+            print(f"  import path: ❌ {s.name} shadowed by {ascii(s.resolved)}")
+            print(f"               sys.path entry {ascii(entry)} ({s.entry_kind})")
+        remedy = stdlib_shadow.remedy_command(shadows[0])
+        if remedy is None:
+            print(
+                "               Fix: move or rename the shadowed path above, or run from another directory"
+            )
+        else:
+            print(f"               Fix: {remedy}, or run from another directory")
+        issues.append("stdlib shadowed")
+        return
+    launch = None if getattr(sys.flags, "safe_path", False) else (sys.path[0] if sys.path else None)
+    if launch is None:
+        print("  import path: ✅ stdlib intact (launch directory kept off sys.path: -P)")
+    else:
+        print(
+            f"  import path: ✅ stdlib intact; launch entry on sys.path: {launch or os.getcwd()!r}"
+        )
+        print("               A stdlib-named directory placed there would shadow the stdlib")
+
+
 def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False) -> None:
     """Verify KiroCrew setup — check dependencies, config, credentials, connectivity.
 
@@ -4633,6 +4680,8 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
             if pip_install_channel_available():
                 print(f"               Fix: {pip_install_command_for('-e', '.')}")
             issues.append("python deps")
+
+    _doctor_import_path(issues)
 
     # SQLite FTS5 — required by memory + knowledge full-text search. On macOS
     # and Linux aarch64 we rely on the host sqlite3 build (pysqlite3-binary is

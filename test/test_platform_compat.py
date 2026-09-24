@@ -168,7 +168,7 @@ class TestReexecPythonModule:
         assert calls == [
             (
                 executable,
-                ["python.exe", "-s", "-m", "kiro_crew", "gateway", "--port", "5476"],
+                ["python.exe", "-s", "-P", "-m", "kiro_crew", "gateway", "--port", "5476"],
             )
         ]
         assert os.environ["PYTHONUTF8"] == "1"
@@ -187,7 +187,7 @@ class TestReexecPythonModule:
 
         pc.reexec_python_module("kiro_crew", ["gateway"])
 
-        assert calls == [(executable, [executable, "-s", "-m", "kiro_crew", "gateway"])]
+        assert calls == [(executable, [executable, "-s", "-P", "-m", "kiro_crew", "gateway"])]
         assert os.environ["PYTHONUTF8"] == "1"
         assert os.environ["PYTHONIOENCODING"] == "utf-8:backslashreplace"
 
@@ -212,11 +212,16 @@ class TestReexecPythonModule:
         )
         source_root = str(Path(__file__).resolve().parents[1] / "src")
         inherited_path = os.environ.get("PYTHONPATH", "")
+        # The probe directory rides on PYTHONPATH, not on the cwd: the re-exec
+        # passes -P, which keeps the successor's cwd off sys.path, so a probe
+        # found only through the cwd would vanish on the second hop.
         env = {
             **os.environ,
             "PYTHONUTF8": "0",
             "PYTHONIOENCODING": "cp1252",
-            "PYTHONPATH": os.pathsep.join(p for p in (source_root, inherited_path) if p),
+            "PYTHONPATH": os.pathsep.join(
+                p for p in (str(tmp_path), source_root, inherited_path) if p
+            ),
         }
 
         result = subprocess.run(

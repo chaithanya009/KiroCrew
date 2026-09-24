@@ -556,7 +556,10 @@ def _pin_host_cli_command(app_name: str, cfg: dict[str, Any]) -> dict[str, Any]:
     existing = env.get("PYTHONPATH", "")
     env["PYTHONPATH"] = f"{pkg_parent}{os.pathsep}{existing}" if existing else pkg_parent
     env.setdefault("KIROCREW_HOME", str(app_dir(app_name).parent.parent))
+    # ``-P``: the MCP host spawns this server with a cwd Kiro Crew does not
+    # choose; keeping it off sys.path is the same guarantee the launchers give.
     argv = platform_compat.isolated_python_argv(
+        "-P",
         "-m",
         "kiro_crew",
         *list(cfg.get("args") or []),

@@ -836,11 +836,14 @@ function createGatewaySupervisor({
     let spawnArgs = ["gateway", "--no-open", "--port", String(PORT)];
     // Node refuses .cmd/.bat without shell:true. Use the relocatable bundled
     // Python directly instead of opening the command-injection-prone shell path.
+    // `-P` mirrors the shim this replaces (bin/kirocrew.cmd): it keeps the spawn
+    // cwd off sys.path, so a stdlib-named directory there cannot shadow the
+    // interpreter's own standard library.
     if (bin.endsWith("kirocrew.cmd")) {
       const pythonExe = path.resolve(path.dirname(bin), "..", "python.exe");
       if (fs.existsSync(pythonExe)) {
         spawnBin = pythonExe;
-        spawnArgs = ["-s", "-m", "kiro_crew", ...spawnArgs];
+        spawnArgs = ["-s", "-P", "-m", "kiro_crew", ...spawnArgs];
       } else {
         const errorMessage = describeIncompleteBundle([]);
         userError(`spawn REFUSED: bundled interpreter absent at ${pythonExe} — install likely still extracting`);

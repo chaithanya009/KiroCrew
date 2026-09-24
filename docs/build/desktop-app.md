@@ -328,13 +328,20 @@ same way). Key details:
 - **Interpreter** is a python-build-standalone CPython 3.12 with `@executable_path`-
   relative dylib references (genuinely portable, no system Python dependency).
 - **Entry point** is `bin/kirocrew` — a shell script that execs
-  `bin/python3.12 -s -m kiro_crew "$@"`.
+  `bin/python3.12 -s -P -m kiro_crew "$@"`. `-s` drops the user site; `-P`
+  keeps the caller's working directory off `sys.path`, so a stdlib-named
+  directory there (`~/concurrent/`, `~/json/`) cannot shadow the bundled
+  standard library. The Windows `bin\kirocrew.cmd` shim, the Electron
+  supervisor's direct `python.exe` spawn, and the CI replicas of both
+  (`.github/workflows/build.yml`'s shim, the installer test's gateway spawn)
+  pass the same two flags; `test/test_stdlib_shadow.py` pins every spelling.
 - **Stdlib probes verified** — `stdlib_probe_gate` fails the build if any package
   the launcher's readiness check probes is missing from the pruned tree, so a
   drifted probe list breaks the build instead of every user's launch (see
   [How the app finds and launches the backend](#how-the-app-finds-and-launches-the-backend)).
 - **Self-containment verified** — the build script runs
-  `PYTHONNOUSERSITE=1 bin/python3.12 -m kiro_crew --version` followed by
+  `PYTHONNOUSERSITE=1 bin/python3.12 -s -P -m kiro_crew --version` (the
+  launcher's exact argv) followed by
   `PYTHONNOUSERSITE=1 bin/python3.12 -c 'import kiro_crew.cli'` to catch any
   missing dependency before packaging. Bare `--version` is a pre-dispatch
   fast-path (see `docs/system-specs/modules/cli.md`), so the import probe is
