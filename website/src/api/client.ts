@@ -58,7 +58,11 @@ export const SKILLS_TIMEOUT_MS = 15_000
 export const SLASH_COMMANDS_TIMEOUT_MS = 15_000
 import { installApiTransport } from './apiTransport'
 import type { SessionSummary } from '../types/sessionSummary'
-import { queryClient, resolveDefaultMemoryMode } from './queryClient'
+import {
+  queryClient,
+  invalidateAcrossQueryClients,
+  resolveDefaultMemoryMode,
+} from './queryClient'
 import { getStoredConsent } from '../utils/themeConsent'
 import { recordError, parseErrorCode, requestPath } from '../utils/errorReport'
 import { i18nT } from '../i18n/t'
@@ -1857,7 +1861,7 @@ function showSessionExpiredBanner(lead?: string): void {
         // `data === undefined` narrows it to queries that never carried a
         // successful value: exactly the ones the lapse broke, and the only ones
         // with nothing to overwrite a draft with.
-        void queryClient.invalidateQueries({
+        invalidateAcrossQueryClients({
           predicate: (q) => q.state.status === 'error' && q.state.data === undefined,
         })
       })

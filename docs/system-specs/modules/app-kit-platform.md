@@ -50,8 +50,8 @@ The registry key `@kirocrew/ui` is internal to the host registry,
 not a browser import-map specifier.
 
 `@tanstack/react-query` resolves through the import map to a vendor stub backed
-by the host's existing module instance. Its hooks, providers and context are
-shared with the dashboard; apps must externalize this dependency rather than
+by the host's existing module instance. Its hooks, provider component and context
+are shared with the dashboard; apps must externalize this dependency rather than
 bundle a second copy. Runtime export parity and identity are regression-tested
 against the pinned dependency. That runtime export surface is app-facing: a
 dependency upgrade must preserve those names and their behavior, or ship an
@@ -61,6 +61,39 @@ Apps needing a newly added export declare `minKiroCrewVersion` for the first
 host release supplying it; this minimum-version gate is not protection against
 future incompatible removals. No independent dependency-version negotiation is
 introduced.
+
+The module is shared; the CACHE is not. An external app renders inside a
+host-mounted provider holding a client of that app's own, so `clear()`, the four
+`*Queries` methods with an absent filter, `setQueryData` and an empty-prefix
+`setQueryDefaults` all reach that app's keys only, and no host key is readable
+from an app bundle. The boundary is the client rather than a guarded wrapper
+because a missing filter means every key on four separate methods, so a separate
+cache answers the whole surface at once instead of a list that must stay complete.
+A builtin app keeps the dashboard's client, matching the namespace `useTrustedAppId()`
+already grants it: builtin pages are host code and share key prefixes with the
+dashboard deliberately. The client is held per app id AND per host session binding,
+so the cache an app returns to under one binding is the one it left, two installed
+apps cannot read each other's, and two mounts of ONE app under different bindings
+cannot either. The binding belongs in that identity because the same app id is
+hosted under several at once -- `AppPage` as `dashboard:ui`, a chat side panel as
+`dashboard:<slot>` per slot -- while the binding travels only as the `X-Session-Key`
+header `scopedApi` sends and an external app's query key is passed through
+unprefixed, since `useTrustedAppId()` refuses it a namespace. Without the binding in
+the key, two panels reading one key under two sessions share one entry and
+`staleTime: Infinity` serves the first session's value to the second panel with no
+error surface. A host that passes no binding shares one entry under a sentinel no
+app id can spell. Holding the
+client is not a retention guarantee for the queries in it: `resolveCacheRetention`
+returns `null` for an external app, so its queries expire on the client's own
+`gcTime` and the thirty-minute `APP_CACHE_RETENTION_MS` window belongs to builtin
+pages, which `BuiltinAppRoute` mounts `AppCacheRetention` for.
+Each app client registers with `registerRecoverableQueryClient`, and the host's
+post-lapse recovery invalidation runs through `invalidateAcrossQueryClients`, so a
+query an app lost to a session lapse heals on recovery like a dashboard query.
+That direction is host to app: it refreshes an app's own failed query and reaches
+no host key from an app bundle.
+The dashboard's own client is reachable from host code only; it is absent from
+the import map and from every vendor stub, which is what the boundary rests on.
 
 ## Host-mediated chat launch and cron toggles
 
