@@ -35,7 +35,7 @@ from kiro_crew.agent_discovery import (
     project_agent_name,
 )
 from kiro_crew.agent_sdk.provider_identity import is_claude_code
-from kiro_crew.agent_spec_format import is_agent_spec_name
+from kiro_crew.agent_spec_format import NATIVE_SKILL_ALIAS_PREFIX, is_agent_spec_name
 from kiro_crew.agents_janitor import sweep_agents_dir
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.cli_perf import _read_gateway_pid
@@ -134,6 +134,18 @@ logger = logging.getLogger(__name__)
 # attribute directly (``patch("kiro_crew.cli_doctor.KIRO_AGENTS_DIR", tmp)``),
 # so the name is kept and read through ``_agents_dir()``.
 KIRO_AGENTS_DIR: Path | None = None
+
+# Alias count above which the skill-view census warns. Every spawn projects one
+# ``kirocrew-skill-view-*.json`` per authored agent into the shared agents
+# directory, and kiro-cli reads EVERY file there on startup, so the count is a
+# startup cost for every session on the host. A healthy host carries live
+# sessions x authored agents (a few hundred); the measured trouble starts past a
+# couple of thousand -- about 8s of prune walk per spawn at 2,360 files, and
+# ``EMFILE: too many open files`` from kiro-cli at 15k. The reclaim drains a
+# backlog by a bounded number per spawn, so a count above this is either a
+# pre-reclaim backlog still draining or one this gateway cannot drain (another
+# data home's aliases, an unreadable lease record); the warning tells which.
+_SKILL_VIEW_BACKLOG_WARN = 2000
 
 
 def _agents_dir() -> Path:
@@ -3945,6 +3957,107 @@ def _doctor_agents_janitor(issues: list[str], sweep_backups: bool) -> None:
             print(f"{_INDENT}- {name!r}")
     else:
         print("  janitor:     ✅ no stale temp/backup files to reclaim")
+    _doctor_skill_view_census(agents_dir)
+
+
+def _doctor_skill_view_census(agents_dir: Path) -> None:
+    """Report how many projected skill-view aliases the agents directory holds.
+
+    Advisory and read-only, like the janitor line above it. The count matters
+    because kiro-cli enumerates every file in this directory on every startup
+    and the projection writes one alias per authored agent per spawn: a backlog
+    from a build that predates the lease-based reclaim reached 28k files on one
+    host and made every session start crawl. The gateway's reclaim drains its
+    own home's unreferenced aliases a bounded number per spawn; the report says
+    exactly which share that covers -- not aliases another data home owns, not
+    lease-named ones while their lease is held -- and refuses to promise any
+    drain while a lease record is unreadable, since the reclaim then keeps
+    everything. Once the census hit a retention bound its counts are floors and
+    the derived ones are not printed at all. The manual fallback is named,
+    never performed, and is a move rather than a delete: the doctor cannot
+    prove who authored a file that merely carries the prefix, and a move is
+    undoable.
+    """
+    from kiro_crew.agent_sdk.drivers import acp as acp_driver
+
+    counts = acp_driver.skill_view_alias_census(agents_dir)
+    total = counts.get("total", 0)
+    leased = counts.get("leased", 0)
+    foreign_unreferenced = counts.get("foreign_home", 0)
+    foreign_leased = counts.get("foreign_leased", 0)
+    foreign = foreign_unreferenced + foreign_leased
+    unreadable = counts.get("unreadable_leases", 0)
+    truncated = bool(counts.get("truncated", 0))
+    metadata_dir, lease_dir = acp_driver.skill_view_sidecar_dirs()
+    alias_glob = f"{NATIVE_SKILL_ALIAS_PREFIX}*.json"
+    # Two Kiro Crew data homes share this directory whenever they share
+    # ``~/.kiro``; the remedy must then stop every gateway that uses it, not
+    # only the one this doctor speaks for.
+    stopped = (
+        "with every gateway that uses this agents directory stopped"
+        if foreign
+        else "with the gateway stopped"
+    )
+
+    floor = "+" if truncated else ""
+    detail = f"{total}{floor} {alias_glob} alias(es)"
+    if total:
+        detail += f" ({leased}{floor} named by a lease record"
+        # Once a bound was hit "not named" is total minus a floor, which is
+        # neither a floor nor a ceiling, so only the measured counts are shown.
+        if not truncated:
+            detail += f", {total - leased} not"
+        if foreign:
+            detail += f", {foreign}{floor} owned by another Kiro Crew home"
+        detail += ")"
+    warn = bool(unreadable) or total > _SKILL_VIEW_BACKLOG_WARN
+    print(f"  skill views: {'⚠️ ' if warn else '✅'} {detail}")
+    if truncated:
+        print(f"{_INDENT}(floors: the census stopped at its retention bound)")
+    if unreadable:
+        print(
+            f"{_INDENT}{unreadable} lease record(s) in {lease_dir}/ cannot be read, and"
+            f" the reclaim keeps every alias while one exists. {stopped[0].upper()}"
+            f"{stopped[1:]}, move that directory out of the agents directory; every"
+            f" live projection republishes its own lease."
+        )
+    if total <= _SKILL_VIEW_BACKLOG_WARN:
+        return
+    if unreadable:
+        drain = " Nothing is reclaimed until the unreadable lease record(s) above are gone."
+    elif truncated:
+        # Past the lease bound the census did not read every record, and one
+        # unreadable record it did not reach would stop the reclaim entirely.
+        drain = (
+            " Unscanned lease records leave reclaimability unknown: the gateway"
+            " reclaims this home's unreferenced aliases a bounded number per spawn"
+            " only while every lease record is readable."
+        )
+    else:
+        drain = (
+            f" On every spawn the gateway reclaims a bounded number of the"
+            f" {total - leased - foreign_unreferenced} this home owns and no lease names."
+        )
+    if leased - foreign_leased > 0:
+        drain += (
+            " This home's lease-named aliases are kept while their lease is held; a"
+            " crash-stale lease is reclaimed on the next spawn."
+        )
+    if foreign:
+        drain += (
+            f" The {foreign}{floor} another Kiro Crew home owns never drain here;"
+            f" only that home's gateway reclaims them."
+        )
+    print(
+        f"{_INDENT}kiro-cli reads every file here on startup, so this many slows every"
+        f" session start.{drain}"
+    )
+    print(
+        f"{_INDENT}To clear it at once: {stopped}, move the {alias_glob} files and the"
+        f" {metadata_dir}/ directory out of the agents directory (a move is undoable;"
+        f" the doctor never deletes). Every spawn republishes the aliases it needs;"
+        f" authored agents keep their own names and are not touched."
+    )
 
 
 def _discord_intent_grants(token: str) -> intent_probe.IntentGrants:

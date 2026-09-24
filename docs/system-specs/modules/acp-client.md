@@ -153,6 +153,41 @@ authored native agent rather than risking a stale-snapshot overwrite or blocking
 startup. Active, foreign-home, unmarked, malformed, unreadable, oversized or
 otherwise uncertain alias files remain on disk.
 
+`kirocrew doctor`'s Agents Directory section reports the census read-only,
+through `census_projected_aliases` in this module, reached over the
+`agent_sdk.drivers.acp` seam like the doctor's other backend reads, so the
+record shapes stay here; the lease record itself is parsed by the one
+`_read_lease_record` the liveness probe also uses, and the data-home identity
+the `foreign_home` split is judged against is resolved inside the census with
+the publisher's own spelling, so no caller can hand it a differently normalised
+id. It counts how many `kirocrew-skill-view-*.json` aliases the directory
+holds, how many a lease record names, how many -- among the named and the
+unnamed separately -- an ownership sidecar attributes to another Kiro Crew data
+home (two homes share this directory whenever they share `~/.kiro`), and how
+many lease records are unreadable; a record nested past the interpreter limit
+reads as unreadable rather than aborting, for the probe and the census alike.
+What the census retains is bounded (`_CENSUS_MAX_ALIASES`,
+`_CENSUS_MAX_LEASES`, the diagnostic's own memory and I/O budget) and a hit
+bound is reported as `truncated`: the measured counts are then floors, the
+derived ones (not-named, this home's share) are not printed, and because an
+unscanned record could be the unreadable one that stops the reclaim, the report
+says reclaimability is unknown rather than promising a drain. A backlog left by a build that predates the reclaim is
+thereby visible without `ls`, and its drain can be watched across spawns. Above
+`_SKILL_VIEW_BACKLOG_WARN` (2,000; a healthy host carries live sessions x
+authored agents, a few hundred) it warns and says exactly which share the
+reclaim covers: this home's unreferenced aliases, a bounded number per spawn;
+this home's lease-named aliases are described as kept while their lease is
+held (the census probes no lock, so a crash-stale record is indistinguishable
+from a held one and is reclaimed on the next spawn's probe); aliases another
+data home owns, leased or not, never drain here; and while a lease record is
+unreadable nothing is reclaimed, which the report states instead of promising a
+drain. The manual fallback -- moving the aliases and their metadata directory
+out with the gateway stopped, or with every gateway that uses the directory
+stopped once another home's aliases are present -- is named without being
+performed and without suggesting a delete: the doctor
+cannot prove who authored a file that merely carries the prefix, and a move is
+undoable.
+
 Windows runtime teardown records the reaped return code after the owned-handle
 drain, before dropping the process reference, just as POSIX teardown does. The
 existing death summary is amended without changing its reason or stderr tail.

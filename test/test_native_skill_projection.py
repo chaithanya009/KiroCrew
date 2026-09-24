@@ -1329,3 +1329,91 @@ def test_workspace_settings_lock_failure_publishes_no_alias(native_tree, monkeyp
     assert projection.prepare_native_skill_projection(project) is None
     assert not list(agents.glob(f"{projection.NATIVE_SKILL_ALIAS_PREFIX}*.json"))
     assert not (project / ".kiro/settings/cli.json").exists()
+
+
+def test_census_counts_what_the_reclaim_would_keep_and_remove(native_tree, tmp_path, monkeypatch):
+    """The read-only census agrees with the lifecycle it describes, and changes nothing."""
+    _home, agents, project = native_tree
+    (agents / "custom.json").write_text('{"name":"custom"}', encoding="utf-8")
+    crew_home = projection.data_home().absolute().as_posix()
+
+    ended_dir = tmp_path / "subagent_00000001"
+    ended_dir.mkdir()
+    ended = projection.prepare_native_skill_projection(ended_dir)
+    assert ended is not None
+    published = len(ended.aliases)
+    del ended
+    gc.collect()
+    live = projection.prepare_native_skill_projection(project)
+    assert live is not None
+
+    before = sorted(str(p) for p in agents.rglob("*"))
+    census = projection.census_projected_aliases(agents)
+    assert sorted(str(p) for p in agents.rglob("*")) == before
+    # `live` reclaimed the ended run's aliases on its own spawn (cap covers
+    # them), so the directory holds exactly the live set, all lease-named.
+    assert census == {
+        "total": published,
+        "leased": published,
+        "foreign_home": 0,
+        "foreign_leased": 0,
+        "unreadable_leases": 0,
+        "truncated": 0,
+    }
+
+    # An alias another data home recorded is counted as foreign, never as
+    # something this gateway will drain; a malformed lease record is reported
+    # rather than skipped, because the reclaim treats it as "everything live".
+    foreign = agents / f"{projection.NATIVE_SKILL_ALIAS_PREFIX}{'f' * 24}.json"
+    foreign.write_text("{}", encoding="utf-8")
+    (agents / projection._PROJECTION_METADATA_DIR_NAME / f"{foreign.stem}.json").write_text(
+        json.dumps(
+            {
+                projection._MANAGED_MARKER: projection._MANAGED_MARKER_VALUE,
+                projection._MANAGED_CREW_HOME: crew_home + "-other",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (agents / projection._PROJECTION_LEASE_DIR_NAME / "9-broken.json").write_text(
+        "{", encoding="utf-8"
+    )
+    census = projection.census_projected_aliases(agents)
+    assert census == {
+        "total": published + 1,
+        "leased": published,
+        "foreign_home": 1,
+        "foreign_leased": 0,
+        "unreadable_leases": 1,
+        "truncated": 0,
+    }
+
+    # The other home's LIVE aliases -- named by its lease -- are split out too,
+    # since this gateway's reclaim refuses them whether or not the lease holds.
+    (agents / projection._PROJECTION_LEASE_DIR_NAME / "9-theirs.json").write_text(
+        json.dumps({"aliases": [foreign.stem]}), encoding="utf-8"
+    )
+    census = projection.census_projected_aliases(agents)
+    assert census["leased"] == published + 1
+    assert census["foreign_home"] == 0
+    assert census["foreign_leased"] == 1
+
+    # A RecursionError from json.loads is an unreadable record, not an abort.
+    (agents / projection._PROJECTION_LEASE_DIR_NAME / "9-deep.json").write_text(
+        "[" * 100000 + "]" * 100000, encoding="utf-8"
+    )
+    census = projection.census_projected_aliases(agents)
+    assert census["unreadable_leases"] == 2
+    assert (
+        projection._read_lease_record(
+            agents / projection._PROJECTION_LEASE_DIR_NAME / "9-deep.json"
+        )
+        is None
+    )
+
+    # Retention is bounded and the bound is reported, not silently exceeded.
+    monkeypatch.setattr(projection, "_CENSUS_MAX_LEASES", 1)
+    census = projection.census_projected_aliases(agents)
+    assert census["truncated"] == 1
+    assert census["total"] == published + 1
+    del live
