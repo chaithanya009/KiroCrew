@@ -45,6 +45,29 @@ BACKEND_HOST = "127.0.0.1"
 # process would be a name another system copies by hand.
 CONTROL_SECRET_HEADER = "X-SMC-Control-Secret"
 
+#: Ceiling on an object this task will read from the bucket into memory, or warn about
+#: sending to it.
+#:
+#: Pinned here because every process that moves an object reads it, and a second copy is
+#: the drift the shared key module exists to prevent in the other direction. The front
+#: holds a fetched transcript IN MEMORY for the length of a turn and the restore step holds
+#: an authority file long enough to validate and write it, so without a ceiling one object
+#: decides how much memory the task uses. The sidecar reads the same number to say so at
+#: upload time, when an operator can still act, rather than leaving a customer's turn to
+#: discover it.
+#:
+#: 64 MiB is far above any real transcript or slot index (both are JSON text) and far below
+#: the task's memory, so it separates "a big conversation" from "an object that should not
+#: be read at all" without needing to know which conversations exist.
+MAX_OBJECT_BYTES: int = 64 * 1024 * 1024
+
+#: Shortest backup cadence the container accepts, in seconds.
+#:
+#: A cycle opens and uploads every changed object, so a cadence below this spends the
+#: task on uploads instead of on turns. It is a floor and not a clamp: a value under
+#: it is refused, because an operator who asked for one second did not mean five.
+MIN_BACKUP_INTERVAL_SECS: int = 5
+
 
 class ConfigError(ValueError):
     """Raised when the environment is wrong in a way that must not be repaired.
@@ -69,13 +92,21 @@ class Settings:
     data_home: Path
     config_dir: Path
 
-    # Where the front reads a slot's transcript from on demand (Track B). These named the
-    # backup destination when the sidecar wrote here too; the backup subsystem was extracted
-    # from this PR, so today only the front's on-demand fetch reads this bucket, and it reads
-    # an empty one until the durability feature lands.
+    # Where the sidecar writes this task's state and where the front reads a slot's
+    # transcript from on demand. One bucket, one prefix, two directions: the key both
+    # sides derive lives in ``keys.py`` so they cannot disagree about it.
     crew_name: str
     backup_bucket: str | None
     backup_prefix: str
+
+    # Seconds between backup cycles. A task replacement loses at most the turns taken
+    # since the last completed cycle, so this is the width of that window, and the
+    # front's rule that a local transcript is never overwritten by a fetched one is
+    # written against it: the local copy leads the bucket by up to one interval.
+    #
+    # Carries a default for the same reason ``bundle_dir`` does: several tests build
+    # Settings by hand.
+    backup_interval_secs: int = 60
 
     # The crew bundle baked into the image (PACKAGING-CONTRACT.md, T3). The
     # supervisor installs it into the crew's read paths before the backend
@@ -140,6 +171,27 @@ def _int(name: str, default: int) -> int:
         return int(raw)
     except ValueError as exc:
         raise ConfigError(f"{name} must be an integer, got {raw!r}") from exc
+
+
+def _interval(name: str, default: int) -> int:
+    """Read a cadence in seconds, refusing one the container cannot honour.
+
+    A value at or below zero is not a faster cadence, it is a busy loop, and a value
+    under :data:`MIN_BACKUP_INTERVAL_SECS` spends the task on uploads. Both are
+    REFUSED rather than clamped, for the reason ``parse_route_prefix`` refuses a bare
+    word: a silently corrected cadence produces a deployment that behaves differently
+    from the one the operator described, and the difference first shows as cost.
+    """
+    value = _int(name, default)
+    if value < MIN_BACKUP_INTERVAL_SECS:
+        raise ConfigError(
+            f"{name} is {value}, below the {MIN_BACKUP_INTERVAL_SECS}-second floor. A "
+            "cycle opens and uploads every changed object, so a shorter cadence spends "
+            "the task on uploads instead of on turns. It is refused rather than raised "
+            "to the floor, because a value this low says the operator meant something "
+            "the container cannot do."
+        )
+    return value
 
 
 def _path(name: str, default: str) -> Path:
@@ -248,6 +300,7 @@ def load() -> Settings:
         crew_name=os.environ.get("SMC_CREW_NAME") or "",
         backup_bucket=os.environ.get("SMC_BACKUP_BUCKET") or None,
         backup_prefix=os.environ.get("SMC_BACKUP_PREFIX") or "",
+        backup_interval_secs=_interval("SMC_BACKUP_INTERVAL_SECS", 60),
         # The crew bundle in the image. Defaults to the real path; a test points
         # SMC_BUNDLE_DIR at a fixture. Never defaulted to a temp dir (see field).
         bundle_dir=_path("SMC_BUNDLE_DIR", "/app/crew-bundle"),

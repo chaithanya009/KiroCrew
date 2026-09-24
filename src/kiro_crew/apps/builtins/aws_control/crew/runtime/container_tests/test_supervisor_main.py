@@ -21,12 +21,14 @@ from container.supervisor.backend import require_api_key as _real_require_api_ke
 from container.supervisor.bundle import install_bundle as _real_install_bundle
 
 
-def make_settings(tmp_path: Path, *, bucket: str | None = "smc-test-bucket") -> Settings:
-    """Settings for the supervise phase.
+def make_settings(tmp_path: Path, *, bucket: str | None = None) -> Settings:
+    """Settings for the supervise phase, with durability NOT configured.
 
-    ``bucket`` still exists because the front's on-demand transcript fetch reads it; it no
-    longer gates a sidecar (there is none). It defaults to a value so the transcript-read
-    configuration is exercised; pass ``bucket=None`` for the no-bucket case.
+    ``bucket`` defaults to ``None`` because that is what this module is about: process
+    order, draining and exit codes, none of which involve a bucket. A bucket makes the
+    boot restore the authority files for real, against a store these tests neither have
+    nor want, and the startup order with a bucket is pinned by
+    ``test_supervisor_startup_order`` instead. Pass a name where a bucket is the subject.
     """
     data_home = tmp_path / "data"
     return Settings(

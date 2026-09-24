@@ -24,12 +24,11 @@ construction rather than by review.
   can quietly drop.
 * **A fetch that fails FAILS THE TURN.** A customer whose conversation appears
   forgotten is worse than an error, and the damage is worse than it first looks:
-  the backend would create a fresh transcript holding only this turn, and once a
-  durability writer exists it will replace whole objects (that is the write model
-  the extracted backup used and the one its replacement must keep), so the next
-  backup cycle would overwrite the customer's entire history in S3. Failing the
-  turn now keeps that hazard closed before the writer lands. The failure is
-  :class:`TranscriptUnavailable`, surfaced with its own error code.
+  the backend would create a fresh transcript holding only this turn, and the
+  sidecar replaces whole objects, so the next backup cycle would overwrite the
+  customer's entire history in S3. Failing the turn is what holds that hazard
+  closed. The failure is :class:`TranscriptUnavailable`, surfaced with its own
+  error code.
 * **Never log a transcript's contents.** The sid and the byte count only.
 
 **The filename, which is the part that was found the hard way.** The object is
@@ -70,13 +69,13 @@ import logging
 import os
 import re
 import stat
-import tempfile
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
-from ..common import Settings
+from .. import common
+from ..common import Settings, keys, statefile
 from .slotlock import SlotSerializer
 
 logger = logging.getLogger("smc.front.transcript")
@@ -103,36 +102,6 @@ THREAD_PREFIX = "dashboard"
 # matters: the non-printable pass produces ``-``, which the filename fold keeps.
 _NON_PRINTABLE_RE = re.compile(r"[^\x20-\x7e]")
 _FILENAME_UNSAFE_RE = re.compile(r"[^\w\-.]", flags=re.ASCII)
-
-# Namespace and key derivation for a transcript object in the S3 bucket. These moved HERE
-# from the backup layout module when the backup subsystem was extracted from this PR (the
-# durability design is tracked separately). The front's on-demand transcript fetch is
-# runtime, not backup, but it READS a key an eventual sidecar will WRITE, so the two must
-# derive the same key. Until the durability feature lands there is no writer, so this fetch
-# reads an empty bucket -- a capability the container does not yet have, not a regression.
-# When backup returns, the writer and this reader must share ONE derivation; the first live
-# deployment doubled the crew name in every key because two places each decided the prefix,
-# and it survived twelve green gates because writer and reader agreed with each other while
-# both disagreed with the contract. The lesson stands regardless of which module owns it.
-_TRANSCRIPT_DATA_NS = "data/"
-
-
-def _object_prefix(settings: Settings) -> str:
-    parts = [p for p in (settings.backup_prefix.strip("/"), settings.crew_name.strip("/")) if p]
-    return ("/".join(parts) + "/") if parts else ""
-
-
-def _sessions_prefix(settings: Settings) -> str:
-    """Rel-key prefix under which conversation transcripts live."""
-    try:
-        tail = settings.sessions_dir.relative_to(settings.data_home).as_posix()
-    except ValueError:
-        tail = settings.sessions_dir.name
-    return _TRANSCRIPT_DATA_NS + tail + "/"
-
-
-def _full_key(settings: Settings, rel_key: str) -> str:
-    return _object_prefix(settings) + rel_key
 
 
 class TranscriptUnavailable(RuntimeError):
@@ -221,12 +190,10 @@ class S3TranscriptReader:
 
 #: Ceiling on a transcript restored from the bucket.
 #:
-#: The bytes come from outside the container and are held IN MEMORY for the length of a
-#: turn, so without a ceiling one object decides how much memory this process uses. 64
-#: MiB is far above any real transcript (a conversation is JSONL text) and far below the
-#: task's memory, so it separates "a big conversation" from "an object that should not be
-#: read at all" without needing to know which conversations exist.
-MAX_TRANSCRIPT_BYTES: int = 64 * 1024 * 1024
+#: An alias, never a second number. The sidecar reads the same ceiling to warn at upload
+#: time about an object this reader would refuse, so two copies would let the writer
+#: promise what the reader declines. See ``common.config`` for why the value is what it is.
+MAX_TRANSCRIPT_BYTES: int = common.MAX_OBJECT_BYTES
 
 #: How much is read per chunk while enforcing that ceiling. Small enough that the
 #: overshoot before the refusal is bounded by this rather than by the object's size.
@@ -352,19 +319,19 @@ def transcript_stem(slot_id: str) -> str:
 
 
 def object_key(settings: Settings, stem: str) -> str:
-    """The full S3 key of a transcript, matching what a sidecar would write.
+    """The full S3 key of a transcript, from the derivation the writer also uses.
 
-    Derived from THIS module's own key helpers now that backup is extracted. When the
-    durability feature returns, its writer and this reader must derive the same key from a
-    single shared definition, because drift here is invisible: the fetch would simply miss,
-    and a customer whose history was not found is indistinguishable from a new one.
+    Delegates to :mod:`container.common.keys`, which is the single definition both
+    directions of the durability pair read. A second copy here is what the drift this
+    guards against is made of: the fetch would simply miss, and a customer whose
+    history was not found is indistinguishable from a new one.
 
     That is not hypothetical. The first live deployment doubled the crew name in every key
     (``crews/<crew>/<crew>/``) because two places each decided one prefix, and it survived
     twelve green gates because writer and reader agreed with each other while both disagreed
     with the contract.
     """
-    return _full_key(settings, f"{_sessions_prefix(settings)}{stem}.jsonl")
+    return keys.transcript_key(settings, stem)
 
 
 #: Longest single filename this build will construct for a transcript. 255 is the POSIX
@@ -443,6 +410,10 @@ def _write_without_clobbering(path: Path, data: bytes) -> None:
       before it is created or written into, because ``mkdir(exist_ok=True)``
       succeeds on a symlink to a directory and every write then lands wherever
       that link points.
+
+    The mechanism behind the first two is :func:`container.common.statefile.link_new`,
+    which the restore step writes through as well. The refusals stay here, because what
+    an existing file means is a question about this turn.
     """
     parent = path.parent
     if parent.is_symlink():
@@ -460,32 +431,21 @@ def _write_without_clobbering(path: Path, data: bytes) -> None:
         raise TranscriptUnavailable(
             f"the sessions directory could not be created at {parent} ({exc})."
         ) from exc
-    fd, tmp = tempfile.mkstemp(dir=str(parent), prefix=".smc-fetch-", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "wb") as fh:
-            fh.write(data)
-            fh.flush()
-            os.fsync(fh.fileno())
-        try:
-            os.link(tmp, str(path))
-        except FileExistsError:
-            # Something arrived at this path while the fetch was in flight, so the file
-            # the turn will use is NOT the one just written and has had none of this
-            # module's checks applied to it. Keeping the copy on disk is still right --
-            # whoever created it has the newer history -- but only if it is a
-            # transcript at all, so the entry that won is validated the same way the
-            # pre-fetch check validates one, through the same helper rather than a
-            # second check that could drift from it. A shape that fails raises, which
-            # fails this turn.
-            _probe_local_entry(path)
-            logger.info(
-                "transcript fetch: sid=%s appeared while fetching; keeping the "
-                "copy on disk, which is the newer one",
-                _sid_of(path.name),
-            )
-    finally:
-        if os.path.exists(tmp):
-            os.unlink(tmp)
+    if not statefile.link_new(path, data, prefix=".smc-fetch-"):
+        # Something arrived at this path while the fetch was in flight, so the file
+        # the turn will use is NOT the one just written and has had none of this
+        # module's checks applied to it. Keeping the copy on disk is still right --
+        # whoever created it has the newer history -- but only if it is a
+        # transcript at all, so the entry that won is validated the same way the
+        # pre-fetch check validates one, through the same helper rather than a
+        # second check that could drift from it. A shape that fails raises, which
+        # fails this turn.
+        _probe_local_entry(path)
+        logger.info(
+            "transcript fetch: sid=%s appeared while fetching; keeping the "
+            "copy on disk, which is the newer one",
+            _sid_of(path.name),
+        )
 
 
 #: Flags for a shape probe on a local transcript entry.

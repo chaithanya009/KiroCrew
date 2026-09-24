@@ -8,6 +8,8 @@ becomes the next disagreement.
 from .config import (
     BACKEND_HOST,
     CONTROL_SECRET_HEADER,
+    MAX_OBJECT_BYTES,
+    MIN_BACKUP_INTERVAL_SECS,
     ConfigError,
     Settings,
     load,
@@ -24,6 +26,8 @@ from .secret import (
 __all__ = [
     "BACKEND_HOST",
     "CONTROL_SECRET_HEADER",
+    "MAX_OBJECT_BYTES",
+    "MIN_BACKUP_INTERVAL_SECS",
     "ConfigError",
     "Settings",
     "load",

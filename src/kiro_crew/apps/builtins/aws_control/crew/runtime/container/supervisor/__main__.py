@@ -8,14 +8,16 @@ The order (``docs/system-specs/modules/aws-control.md``, "Three processes, one t
 
 1. Gate the environment (layout, model credential, sandbox) and install the crew
    bundle. Nothing has started.
-2. The backend starts and ``wait_until_ready`` returns (port answers AND the
+2. The authority files are restored to completion. This is before the backend on
+   purpose: the backend flushes the slot table from its own memory, so a backend
+   that starts first persists an empty one over the restored files.
+3. The backend starts and ``wait_until_ready`` returns (port answers AND the
    boot secret exists).
-3. The front process starts.
+4. The front process starts, and then the sidecar, whose first cycle copies what
+   the backend has written.
 
-There is no restore phase and no sidecar: the backup subsystem was extracted from
-this PR (durability is tracked separately). When it returns it must reinstate the
-rule that made it correct -- restore to completion before the backend starts, or
-the backend's periodic flush persists an empty slot table over the gap.
+A task with no bucket configured has no durability: steps 2 and the sidecar are
+both no-ops, the front says so once at startup, and the task serves turns.
 
 Shutdown drains process groups, not pids (see ``process.py``): a ``kiro-cli``
 worker is a two-process tree and signalling only the launcher orphans a child
@@ -41,6 +43,8 @@ from pathlib import Path
 
 from .. import common
 from ..common import Settings
+from ..sidecar import restore as restore_mod
+from ..sidecar.store import S3ObjectStore
 from . import backend as backend_mod
 from . import bundle as bundle_mod
 from .process import ProcessGroup, spawn_process_group
@@ -57,6 +61,13 @@ log = logging.getLogger("container.supervisor")
 # confirmed by reading the real source and booting the real backend.
 FRONT_DRAIN_SECS: float = 5.0
 BACKEND_DRAIN_SECS: float = 25.0
+# The sidecar's window is for ONE cycle: the uploads the backend's drain just produced,
+# not a full pass over the data home, since every earlier object is already recorded as
+# uploaded. The three windows sum to the longest an orderly stop can take, so the task's
+# configured stop timeout has to be at least that or the platform SIGKILLs this process
+# mid-drain. A cut final cycle costs at most the turns since the last interval, and the
+# objects it did upload are already durable, so the loss is bounded rather than total.
+SIDECAR_DRAIN_SECS: float = 10.0
 # How many discover-kill rounds the orphan sweep makes at teardown. Each round
 # reaps a layer, and a killed process's own children reparent to PID 1 and surface in the
 # NEXT round, so more than one is required to reach a worker's grandchildren. Bounded so a
@@ -68,6 +79,41 @@ _TEARDOWN_SWEEP_ROUNDS: int = 8
 def _start_front(settings: Settings) -> ProcessGroup:
     """Launch Track S1's front process (its documented ``__main__``)."""
     return spawn_process_group("front", [sys.executable, "-m", "container.front"])
+
+
+def _start_sidecar(settings: Settings) -> ProcessGroup | None:
+    """Launch the backup process, or ``None`` when there is nowhere to write.
+
+    A crew with no bucket has no durability, which the front already says once at
+    startup. Starting a writer with no destination would be worse than not starting one:
+    a process that runs and writes nothing looks exactly like a working backup.
+    """
+    if not settings.backup_bucket:
+        log.warning(
+            "sidecar: no bucket configured, so this task's state is not backed up and "
+            "does not survive replacement. Set SMC_BACKUP_BUCKET to make it durable."
+        )
+        return None
+    child = spawn_process_group("sidecar", [sys.executable, "-m", "container.sidecar"])
+    log.info("sidecar: started")
+    return child
+
+
+def restore_authority(settings: Settings) -> None:
+    """Bring the authority files back before the backend can flush over them.
+
+    Called from :func:`run` at the point where "before the backend starts" is enforced.
+    A failure RAISES, so the task does not start: booting without the slot table lets
+    the backend persist an empty one, and then the transcripts are still in the bucket
+    while the conversation list is gone.
+
+    With no bucket there is nothing to restore and this is a no-op, which is the same
+    call :func:`_start_sidecar` makes about the writer.
+    """
+    if not settings.backup_bucket:
+        return
+    result = restore_mod.restore_authority(settings, S3ObjectStore(settings.backup_bucket))
+    log.info("restore: %s", result.summary())
 
 
 def _wait_for_shutdown(children: Sequence[ProcessGroup]) -> str:
@@ -208,20 +254,30 @@ def _sweep_orphans_the_backend_cannot_reap(exclude: set[int]) -> None:
 def _teardown(
     front: ProcessGroup,
     backend: ProcessGroup,
+    sidecar: ProcessGroup | None = None,
 ) -> None:
-    """Drain the children in order: front, then backend, then sweep orphans.
+    """Drain the children in order: front, backend, sidecar, then sweep orphans.
 
-    The backend gets the longer drain so an in-flight turn can finish. Once it is gone,
-    anything of ours still running is a process it could not reap -- an escaped worker in its
-    own process group, which no group signal reached -- so we discover and kill those directly.
+    The backend gets the longer drain so an in-flight turn can finish. The sidecar goes
+    LAST and not first, because its final cycle is what makes an orderly replacement
+    lossless: the front stops new turns arriving, the backend flushes the turns it holds,
+    and only then does the writer get to upload what that flush produced.
+
+    Once the backend is gone, anything of ours still running is a process it could not
+    reap -- an escaped worker in its own process group, which no group signal reached --
+    so we discover and kill those directly.
     """
     log.info("draining front (%.0fs)", FRONT_DRAIN_SECS)
     front.terminate(FRONT_DRAIN_SECS)
     log.info("draining backend (%.0fs)", BACKEND_DRAIN_SECS)
     backend.terminate(BACKEND_DRAIN_SECS)
+    known = {front.pid, backend.pid}
+    if sidecar is not None:
+        log.info("draining sidecar (%.0fs)", SIDECAR_DRAIN_SECS)
+        sidecar.terminate(SIDECAR_DRAIN_SECS)
+        known.add(sidecar.pid)
     # The backend is gone. Anything of ours still running is a process it cannot reap --
     # an escaped worker in its own process group, which no group signal could reach.
-    known = {front.pid, backend.pid}
     _sweep_orphans_the_backend_cannot_reap(known)
 
 
@@ -431,12 +487,13 @@ def run(settings: Settings, *, wait_for_shutdown=_wait_for_shutdown) -> int:
     # connected by the time anything else could object.
     backend_mod.write_backend_config(settings)
 
-    # 1. Backend, then readiness. Nothing else has started yet.
-    #
-    # There is no restore phase: the backup subsystem was extracted from this PR (its
-    # durability design is tracked separately), so the container boots straight into the
-    # backend on a fresh data home. Cross-task-replacement persistence is a capability the
-    # container does not yet have, not a regression -- there is no crew container on main.
+    # 1. Restore, then the backend. Nothing has started yet, and the ORDER is the
+    #    correctness rule rather than an optimisation: the backend flushes the slot table
+    #    from its own memory, so a backend that starts first persists an empty one over
+    #    the restored files and the conversation list comes up blank with nothing to say
+    #    so. Transcripts are not restored here -- the front fetches the one a turn
+    #    continues, on that turn.
+    restore_authority(settings)
     backend = backend_mod.start_backend(settings, env=env)
     try:
         backend_mod.wait_until_ready(
@@ -450,16 +507,19 @@ def run(settings: Settings, *, wait_for_shutdown=_wait_for_shutdown) -> int:
         raise
     log.info("backend: ready on %s", settings.backend_base_url)
 
-    # 2. Front. There is no sidecar: backup was extracted from this PR.
+    # 2. Front, then the sidecar. The sidecar is started last because its first cycle
+    #    reads what the backend has written, and it is absent entirely when no bucket is
+    #    configured: that is a crew running without durability, not a fault.
     front = _start_front(settings)
     log.info("front: started")
+    sidecar = _start_sidecar(settings)
 
-    watched = [backend, front]
+    watched = [child for child in (backend, front, sidecar) if child is not None]
     try:
         why = wait_for_shutdown(watched)
         log.info("shutdown: %s", why)
     finally:
-        _teardown(front, backend)
+        _teardown(front, backend, sidecar)
     # The exit code has to distinguish the two reasons, because it is the only one
     # the platform reads. `_wait_for_shutdown` returns "signal" for an orderly stop
     # (ECS asked the task to go) and "<name> exited (code N)" when a child died
