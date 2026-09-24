@@ -1129,12 +1129,29 @@ async def api_channel_upload_file(request: web.Request) -> web.Response:
 
 
 async def api_upload(request: web.Request) -> web.Response:
-    """POST /api/upload — open native file picker and return selected paths."""
+    """POST /api/upload — open native file picker and return selected paths.
+
+    The dialog binary is resolved from the fixed system directories rather than
+    PATH. A gateway's PATH can lead with an agent-writable directory (a worktree
+    venv's ``bin``, ``~/.local/bin``), so a bare argv name lets a planted shim
+    run with the gateway's environment and outside the sandbox. ``None`` is a
+    refusal, never a fallback to the bare name — that would reinstate the hazard.
+    """
     if sys.platform != "darwin":
         return web.json_response({"error": "File picker is only available on macOS"}, status=400)
 
+    osascript = platform_compat.trusted_system_bin("osascript")
+    if osascript is None:
+        return web.json_response(
+            {
+                "error": "File picker is unavailable on this system",
+                "code": "file_picker_unavailable",
+            },
+            status=501,
+        )
+
     proc = await asyncio.create_subprocess_exec(
-        "osascript",
+        osascript,
         "-e",
         "set f to choose file with multiple selections allowed\n"
         'set out to ""\n'
@@ -1787,9 +1804,23 @@ async def api_screenshot(request: web.Request) -> web.Response:
 
     macOS only — uses built-in screencapture. Linux cloud desktops
     (AL2, headless) don't have a display server so this is unavailable.
+
+    The capture binary is resolved from the fixed system directories rather than
+    PATH, for the reason :func:`api_upload` states, and an unresolvable one is a
+    refusal rather than a bare-name spawn.
     """
     if sys.platform != "darwin":
         return web.json_response({"error": "Screenshot is only available on macOS"}, status=400)
+
+    screencapture = platform_compat.trusted_system_bin("screencapture")
+    if screencapture is None:
+        return web.json_response(
+            {
+                "error": "Screenshot is unavailable on this system",
+                "code": "screenshot_unavailable",
+            },
+            status=501,
+        )
 
     screenshot_dir = _screenshot_dir()
     screenshot_dir.mkdir(parents=True, exist_ok=True)
@@ -1797,7 +1828,7 @@ async def api_screenshot(request: web.Request) -> web.Response:
     dest = screenshot_dir / f"screenshot_{ts}.png"
 
     proc = await asyncio.create_subprocess_exec(
-        "screencapture",
+        screencapture,
         "-i",
         str(dest),
         stdout=asyncio.subprocess.DEVNULL,
