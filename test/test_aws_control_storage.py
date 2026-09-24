@@ -14,6 +14,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import subprocess
 import tempfile
 from pathlib import Path
 from unittest import mock
@@ -537,8 +538,20 @@ class TestObjectIO:
         # process that replaced the file in between would have had its bytes
         # uploaded instead. The descriptor is handed over as the child's stdin,
         # which is what `/dev/stdin` reads.
-        assert argv[argv.index("--body") + 1] == storage._DESCRIPTOR_BODY
-        assert kwargs["stdin_fd"] is not None
+        #
+        # Both arms are asserted rather than one plus a skip. A skip here would
+        # leave the platform that takes the OTHER arm with no statement about what
+        # its upload sends, and that arm is the one whose body is a name.
+        if storage._CAN_PASS_BODY_DESCRIPTOR:
+            assert argv[argv.index("--body") + 1] == storage._DESCRIPTOR_BODY
+            assert kwargs["stdin_fd"] is not None
+        else:
+            # Windows has no `/dev/stdin`, so the CLI opens the name itself and
+            # nothing is handed to its stdin. What keeps that honest is the
+            # caller's held directory handle, plus `_assert_same_file` after the
+            # transfer -- so the name is expected here, and the descriptor is not.
+            assert argv[argv.index("--body") + 1] == str(local)
+            assert kwargs["stdin_fd"] is None
         assert argv[argv.index("--expected-bucket-owner") + 1] == "111122223333"
         assert kwargs["action"] == "s3:PutObject"
 
@@ -1692,3 +1705,66 @@ class TestGetFileVersionPinning:
                         version="-x",
                     )
         assert not isinstance(caught.value, AWSError)
+
+
+class TestTheDescriptorBodySpellingReachesAChild:
+    """``--body /dev/stdin`` is only sound if the CLI CHILD resolves it to our fd.
+
+    Every POSIX upload uses that spelling, so the whole descriptor binding rests
+    on a claim about a child process rather than about this one. The other tests
+    here stub the subprocess chokepoint and therefore assert the argv only -- they
+    cannot see whether a real child reading ``/dev/stdin`` gets the descriptor it
+    inherited. These two spawn one.
+
+    ``cat`` stands in for the AWS CLI deliberately: the claim under test is the
+    platform's, not that tool's, and a test needing real credentials would not run
+    anywhere. The resolution being exercised is the same one.
+    """
+
+    @pytest.mark.skipif(
+        not storage._CAN_PASS_BODY_DESCRIPTOR,
+        reason="the descriptor body spelling is POSIX-only; this platform passes a name",
+    )
+    def test_an_unconfined_child_reads_our_descriptor(self, tmp_path):
+        payload = b"bytes-only-the-inherited-descriptor-can-reach"
+        path = tmp_path / "body.bin"
+        path.write_bytes(payload)
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            done = subprocess.run(
+                ["cat", storage._DESCRIPTOR_BODY],
+                stdin=fd,
+                capture_output=True,
+                timeout=120,
+            )
+        finally:
+            os.close(fd)
+        assert done.returncode == 0, done.stderr[:400]
+        assert done.stdout == payload
+
+    @pytest.mark.skipif(
+        not storage._CAN_PASS_BODY_DESCRIPTOR,
+        reason="the descriptor body spelling is POSIX-only; this platform passes a name",
+    )
+    @pytest.mark.skipif(
+        not sandbox.userns_available(),
+        reason="no namespace sandbox backend here: unshare(CLONE_NEWUSER) is refused",
+    )
+    def test_a_sandbox_confined_child_still_reads_our_descriptor(self, tmp_path):
+        # The sandbox is a user + mount namespace that binds empty directories
+        # over the trees it hides. It does not remount /proc or /dev, which is
+        # what keeps /dev/stdin meaningful inside it -- but that is a statement
+        # about a namespace, and no in-process assertion can observe one. So a
+        # confined child is spawned and asked the same question.
+        payload = b"bytes-that-must-survive-the-namespace"
+        path = tmp_path / "body.bin"
+        path.write_bytes(payload)
+        argv, backend = sandbox.wrap_argv(["cat", storage._DESCRIPTOR_BODY])
+        assert backend is not None, "userns_available() said a backend exists"
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            done = subprocess.run(argv, stdin=fd, capture_output=True, timeout=180)
+        finally:
+            os.close(fd)
+        assert done.returncode == 0, done.stderr[:400]
+        assert done.stdout == payload

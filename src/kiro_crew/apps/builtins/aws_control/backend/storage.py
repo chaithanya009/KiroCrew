@@ -671,7 +671,7 @@ def _assert_uploadable(fd: int) -> os.stat_result:
             "the upload body has more than one name, so it may be a hard link to another "
             "file; refusing rather than uploading bytes that were never staged here"
         )
-    if platform_compat.IS_POSIX and info.st_uid != os.getuid():
+    if not platform_compat.stat_owned_by_current_user(info):
         raise AWSError(
             "the upload body is owned by another user, so this process did not stage it; "
             "refusing rather than uploading a file it does not own"
@@ -1000,8 +1000,16 @@ _STAGING_READ_CHUNK = 64 * 1024
 _S3_INVALID_RANGE_CODE = "InvalidRange"
 
 
-def _preview_staging_parent() -> Path:
-    """The agent-masked root that preview staging directories are cut under.
+def staging_root() -> Path:
+    """The agent-masked root that every AWS Control staging directory is cut under.
+
+    Shared by the preview staging (:func:`_preview_staging_parent`) and by the
+    backup archive staging, because both need the same property and there should
+    be one place that establishes it: a directory a SIBLING agent cannot reach.
+    The system temp directory is not that place -- it is shared, same-UID
+    writable, and carries no mask -- so an archive staged there can be rewritten
+    in place between being built and being uploaded, and a descriptor pin does not
+    help because pinning fixes which inode a name reaches, not that inode's bytes.
 
     On a sandboxed host the root already exists by the time any agent runs: the
     sandbox materialises it before every namespace spawn
@@ -1035,6 +1043,16 @@ def _preview_staging_parent() -> Path:
     else:
         platform_compat.restrict_dir_to_owner(str(staging))
     return staging
+
+
+def _preview_staging_parent() -> Path:
+    """The root preview staging directories are cut under. See :func:`staging_root`.
+
+    Kept as its own name because the preview path is what the sandbox-mask tests
+    address, and because the two callers are otherwise unrelated -- a change to
+    where previews stage should not silently move where backups stage.
+    """
+    return staging_root()
 
 
 def get_object_head_bytes(

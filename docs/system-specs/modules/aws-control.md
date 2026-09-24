@@ -460,20 +460,37 @@ rather than by a second walk of the source also means it cannot disagree with wh
 actually be sent, and that a redaction switch changes the fingerprint.
 
 **Every read of the archive comes from ONE descriptor, and so does the upload.** The
-archive is staged in a temporary directory, which excludes other USERS and not the
-same-UID agent this module's sandbox notes describe planting links in the shared temp
-root -- so each step that re-resolved the archive's NAME was a step at which a
-substituted file could be measured or sent instead. `backup._pinned_staging` holds the
-staging directory open, `backup._create_pinned_archive_fd` creates the archive relative
+archive is staged under `storage.staging_root()` -- the `aws-control-staging` leaf the
+sandbox masks -- and NOT in the shared temp root, which excludes other USERS and not the
+same-UID agent this module's sandbox notes describe planting links in. Each step that
+re-resolved the archive's NAME was a step at which a substituted file could be measured
+or sent instead. `backup._pinned_staging` cuts its directory inside that masked root and
+holds it open, `backup._create_pinned_archive_fd` creates the archive relative
 to that descriptor with `O_EXCL | O_NOFOLLOW` (an entry already at the name fails the
 create rather than becoming what the tar writes through), and the entry-set digest, the
 recorded size, the body digest and `storage.put_file`'s body all come from that one
-descriptor. The snapshot path takes the same hold through
+descriptor.
+
+The location and the pin answer different threats, and neither covers the other. The pin
+fixes which inode a name reaches, so it defeats a rename, an unlink and a planted link;
+it cannot defeat a WRITE, because a sibling agent that rewrites the staged archive
+changes the very inode the descriptor holds. Every digest and the upload would then read
+the substituted bytes and agree with each other, and the run would record a successful
+backup of a file it never built -- with retention free to prune the valid predecessor,
+and no measurement left that could notice. The masked root removes the writer instead of
+detecting the write: inside another agent's namespace that leaf is an empty bound
+directory, so the archive has no name there to open. `storage.STAGING_DIR_LEAF` being a
+member of `sandbox._CREW_HIDDEN_LEAVES` is what makes that true, and it is pinned as such
+rather than assumed, because no in-process test can observe a mount namespace.
+
+The snapshot path takes the same hold through
 `backup._open_pinned_archive_fd`, which is an `O_NOFOLLOW` open plus an `fstat`
 requiring a singly-named regular file this process owns, because `snapshot_main` and
-`snapshot.prepare_redacted_copy` create their own files. `backup._PreadReader` is what
+`snapshot.prepare_redacted_copy` create their own files. `backup._read_at` is what
 lets two readers share the descriptor: `os.dup` would share the file OFFSET and leave
-the upload positioned at the end, so the archive is read by explicit offset instead.
+the upload positioned at the end, so the archive is read by explicit offset instead --
+`os.pread` where the platform has it, and otherwise a seek that restores the caller's
+position in a `finally`, since Windows provides no `pread`.
 
 `storage.put_file` carries the other half. It takes `body_fd` from a caller that has
 already opened and checked its payload, and otherwise opens `local_path` itself

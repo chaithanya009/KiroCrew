@@ -21,22 +21,71 @@ import io
 import os
 import stat
 import tarfile
+import tempfile
 from pathlib import Path
 from typing import Any
 from unittest import mock
 
 import pytest
 
-from kiro_crew import platform_compat
+from kiro_crew import platform_compat, sandbox
 from kiro_crew.apps.builtins.aws_control.backend import backup, storage
 
 ACCOUNT = "111122223333"
-
 #: What a same-UID process plants over the finished archive. Not a tarball, so a
 #: test that reports these bytes as uploaded is reporting real exposure: they
 #: stand in for any file the owner can read, which is what a hard link to
 #: ``~/.aws/credentials`` would have made the upload carry.
 PLANTED = b"SECRET-CREDENTIAL-BYTES-THAT-WERE-NEVER-CHECKED"
+
+#: The swap these tests perform -- unlink the archive and write a different file at
+#: its name while a descriptor is still open on it -- is one the platform itself
+#: refuses where an open handle blocks a delete. There the substitution cannot
+#: happen at all, which is a stronger outcome than the one being asserted, so the
+#: assertion has nothing left to measure and the setup raises instead.
+needs_unlink_while_open = pytest.mark.skipif(
+    not platform_compat.IS_POSIX,
+    reason="the swap being tested is refused by the platform while the descriptor is open",
+)
+
+
+class _NoPread:
+    """Make :func:`backup._read_at` take its no-``pread`` arm on any platform.
+
+    ``create=True`` is what lets this run where the attribute is ABSENT rather
+    than merely present: on Windows ``os.pread`` does not exist, so patching it
+    without that flag raises before the helper under test is ever reached, which
+    makes the patch itself the thing that fails instead of measuring the arm.
+    """
+
+    def __enter__(self) -> None:
+        self._patch = mock.patch.object(backup.os, "pread", None, create=True)
+        self._patch.start()
+
+    def __exit__(self, *exc: object) -> None:
+        self._patch.stop()
+
+
+def _no_pread() -> _NoPread:
+    return _NoPread()
+
+
+def _reference_pread(path: Path):
+    """A correct ``pread`` that reads through its OWN descriptor.
+
+    The fallback arm is compared against this rather than against the platform's
+    real ``pread``, because on a platform that HAS no ``pread`` the latter
+    comparison is the fallback measured against itself -- it would agree for any
+    implementation, including a broken one. A second descriptor is a genuinely
+    independent reader everywhere.
+    """
+
+    def pread(fd: int, size: int, offset: int) -> bytes:
+        with open(path, "rb") as handle:
+            handle.seek(offset)
+            return handle.read(size)
+
+    return pread
 
 
 def _read_whole(fd: int) -> bytes:
@@ -44,7 +93,7 @@ def _read_whole(fd: int) -> bytes:
     chunks: list[bytes] = []
     offset = 0
     while True:
-        chunk = os.pread(fd, 1024 * 1024, offset)
+        chunk = backup._read_at(fd, 1024 * 1024, offset)
         if not chunk:
             return b"".join(chunks)
         chunks.append(chunk)
@@ -335,6 +384,7 @@ class TestFingerprintsReadTheHeldInode:
             tar.addfile(info, io.BytesIO(payload))
         return path
 
+    @needs_unlink_while_open
     def test_the_entry_set_digest_survives_a_swap_at_the_name(self, tmp_path):
         path = self._archive(tmp_path)
         fd = os.open(path, os.O_RDONLY)
@@ -351,6 +401,7 @@ class TestFingerprintsReadTheHeldInode:
         finally:
             os.close(fd)
 
+    @needs_unlink_while_open
     def test_the_body_digest_survives_a_swap_at_the_name(self, tmp_path):
         path = tmp_path / "payload.bin"
         path.write_bytes(b"real-payload")
@@ -380,6 +431,72 @@ class TestFingerprintsReadTheHeldInode:
             os.close(fd)
 
 
+class TestOffsetReadWhereThereIsNoPread:
+    """The fallback arm of :func:`backup._read_at`, exercised with ``pread`` masked.
+
+    A POSIX runner always takes the ``os.pread`` arm, so the arm Windows actually
+    runs would otherwise reach a user before anything measured it. Deleting the
+    attribute is what makes that arm run here, which is also the only shape the
+    absence takes: on Windows ``os`` has no ``pread`` at all.
+    """
+
+    @staticmethod
+    def _archive(tmp_path: Path) -> Path:
+        path = tmp_path / "sessions.tar.gz"
+        with tarfile.open(path, "w:gz") as tar:
+            info = tarfile.TarInfo("crew/t.jsonl")
+            payload = b"transcript\n"
+            info.size = len(payload)
+            tar.addfile(info, io.BytesIO(payload))
+        return path
+
+    def test_the_fallback_reads_the_same_bytes_at_an_offset(self, tmp_path):
+        path = tmp_path / "payload.bin"
+        path.write_bytes(b"0123456789")
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            with _no_pread():
+                assert backup._read_at(fd, 4, 3) == b"3456"
+        finally:
+            os.close(fd)
+
+    def test_the_fallback_puts_the_callers_position_back(self, tmp_path):
+        # This is the whole reason the helper exists. The push paths hand ONE
+        # descriptor to the entry-set digest, the body digest, the size and the
+        # upload in turn, so a read that left the position moved would give the
+        # next reader a short file and the run record would still call it a
+        # success.
+        path = tmp_path / "payload.bin"
+        path.write_bytes(b"0123456789")
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            os.lseek(fd, 2, os.SEEK_SET)
+            with _no_pread():
+                assert backup._read_at(fd, 3, 6) == b"678"
+            assert os.lseek(fd, 0, os.SEEK_CUR) == 2
+        finally:
+            os.close(fd)
+
+    def test_both_fingerprints_agree_with_an_independent_reader(self, tmp_path):
+        path = self._archive(tmp_path)
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            with mock.patch.object(backup.os, "pread", _reference_pread(path), create=True):
+                reference = (
+                    backup._tree_fingerprint(path, volatile_root=False, fd=fd),
+                    backup._body_fingerprint(fd=fd),
+                )
+            with _no_pread():
+                without_pread = (
+                    backup._tree_fingerprint(path, volatile_root=False, fd=fd),
+                    backup._body_fingerprint(fd=fd),
+                )
+            assert without_pread == reference
+            assert os.lseek(fd, 0, os.SEEK_CUR) == 0
+        finally:
+            os.close(fd)
+
+
 class TestPinnedStagingDirectory:
     """The archive is created relative to a held directory descriptor.
 
@@ -399,7 +516,7 @@ class TestPinnedStagingDirectory:
         dir_fd = platform_compat.pin_directory(directory)
         try:
             with pytest.raises(FileExistsError):
-                backup._create_pinned_archive_fd(dir_fd, "archive.tar.gz")
+                backup._create_pinned_archive_fd(directory, dir_fd, "archive.tar.gz")
             assert (directory / "archive.tar.gz").read_bytes() == b"planted"
         finally:
             os.close(dir_fd)
@@ -413,7 +530,7 @@ class TestPinnedStagingDirectory:
         dir_fd = platform_compat.pin_directory(directory)
         try:
             with pytest.raises(OSError):
-                backup._create_pinned_archive_fd(dir_fd, "archive.tar.gz")
+                backup._create_pinned_archive_fd(directory, dir_fd, "archive.tar.gz")
         finally:
             os.close(dir_fd)
 
@@ -422,13 +539,82 @@ class TestPinnedStagingDirectory:
         directory.mkdir()
         dir_fd = platform_compat.pin_directory(directory)
         try:
-            fd = backup._create_pinned_archive_fd(dir_fd, "archive.tar.gz")
+            fd = backup._create_pinned_archive_fd(directory, dir_fd, "archive.tar.gz")
             try:
                 info = os.fstat(fd)
                 assert stat.S_ISREG(info.st_mode)
                 assert info.st_nlink == 1
-                assert stat.S_IMODE(info.st_mode) == 0o600
+                if platform_compat.IS_POSIX:
+                    # Windows does not carry POSIX permission bits at all: it
+                    # reports 0o666 for any writable file whatever mode the create
+                    # asked for, so asserting 0o600 there measures the platform's
+                    # stat emulation rather than this code. Least privilege on that
+                    # platform comes from the directory's ACL, which the staging
+                    # root inherits.
+                    assert stat.S_IMODE(info.st_mode) == 0o600
             finally:
                 os.close(fd)
         finally:
             os.close(dir_fd)
+
+
+class TestStagingStandsOnTheMaskedRoot:
+    """Where the archive is staged, not just how it is addressed.
+
+    The descriptor pin defeats a rename, an unlink and a planted link at the
+    archive's name. It cannot defeat a WRITE. A sibling agent that opens the
+    staged archive and rewrites it changes the very inode this module holds, so
+    the entry-set digest, the body digest and the upload all read the substituted
+    bytes and AGREE with one another -- the run then records a successful backup
+    of a file it never built, and retention is free to prune the valid
+    predecessor it supersedes. Nothing downstream can notice, because every
+    measurement was taken after the substitution.
+
+    So the writer has to be removed rather than detected, and that is a property
+    of the DIRECTORY: the shared system temp directory is same-UID writable and
+    carries no mask, while the AWS Control staging leaf is bound over with an
+    empty directory inside every agent's namespace. An archive there has no name
+    a sibling agent can open.
+    """
+
+    def test_the_staging_directory_is_cut_under_the_masked_root(self, tmp_path):
+        root = tmp_path / "aws-control-staging"
+        root.mkdir()
+        with mock.patch.object(storage, "staging_root", return_value=root) as consulted:
+            with backup._pinned_staging("kc-backup-") as (directory, dir_fd):
+                assert dir_fd >= 0
+                # The parent is the root, so the archive inside it inherits the
+                # mask. Staging in the shared temp directory would put the parent
+                # somewhere no mask covers, which is the defect this pins.
+                assert directory.parent == root
+                assert directory.is_dir()
+        assert consulted.called
+
+    def test_the_staging_directory_is_removed_with_its_contents(self, tmp_path):
+        # The masked root is long-lived, so a staging directory that outlived its
+        # run would accumulate archives there -- each one a complete copy of the
+        # owner's sessions sitting on disk for no reason.
+        root = tmp_path / "aws-control-staging"
+        root.mkdir()
+        with mock.patch.object(storage, "staging_root", return_value=root):
+            with backup._pinned_staging("kc-backup-") as (directory, _dir_fd):
+                (directory / "archive.tar.gz").write_bytes(b"staged")
+                held = directory
+        assert not held.exists()
+        assert list(root.iterdir()) == []
+
+    def test_the_staging_leaf_is_one_the_sandbox_masks(self):
+        # A SOURCE ratchet, because no behavioural test in this process can see a
+        # mount namespace: the whole argument above rests on that leaf being
+        # masked, and the two facts live in different modules. Renaming the leaf
+        # on one side without the other would leave the archive staged in an
+        # agent-reachable directory while every other test here still passed.
+        assert storage.STAGING_DIR_LEAF in sandbox._CREW_HIDDEN_LEAVES
+
+    def test_the_real_root_is_not_the_shared_temp_directory(self, tmp_path):
+        # The patched-root tests above would also pass if `staging_root` itself
+        # returned the shared temp directory, so the real function is checked once
+        # here against the directory the finding was about.
+        real = storage.staging_root().resolve()
+        assert real.name == storage.STAGING_DIR_LEAF
+        assert real != Path(tempfile.gettempdir()).resolve()
