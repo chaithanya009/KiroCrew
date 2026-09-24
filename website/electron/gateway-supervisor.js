@@ -133,6 +133,7 @@ function createGatewaySupervisor({
   warn,
   error,
   logPath,
+  predictLocalPort = () => port,
   fsMod = defaultFs,
   osMod = defaultOs,
   pathMod = defaultPath,
@@ -180,6 +181,10 @@ function createGatewaySupervisor({
   // changed minutes ago refuse to replace the gateway this session still uses.
   // The error dialog's explicit "Start Local Gateway" action is the exception.
   let runLocalGateway = isLocalGatewayEnabled(store);
+  // A "Start Local Gateway" re-exec was attempted and the successor never
+  // served. Offering the button again would repeat a step this process has
+  // shown it cannot finish, so it is offered once.
+  let localStartRelaunchFailed = false;
   let gatewayProcess = null;
   // Exactly one ownership state is authoritative:
   //   none            external/unknown; never kill or respawn
@@ -225,6 +230,26 @@ function createGatewaySupervisor({
   }
 
   /**
+   * May the failure dialog offer "Start Local Gateway"?
+   *
+   * Reversing the opt-out is reachable only here: the settings page that writes
+   * it is served by the gateway that is not running. On this launch's own port
+   * the action starts a gateway in place. On a crew's port it cannot -- the
+   * spawn binds PORT and would shadow the crew -- so it re-runs port selection
+   * in a fresh process, which needs an executable to re-exec and one attempt
+   * that has not already failed.
+   *
+   * @param {boolean} localGatewayOff  this launch started nothing.
+   * @param {string} remoteTarget      the crew this launch targeted, if any.
+   * @returns {boolean}
+   */
+  function canOfferLocalStart(localGatewayOff, remoteTarget) {
+    if (!localGatewayOff) return false;
+    if (!remoteTarget) return true;
+    return canRelaunchThisApp() && !localStartRelaunchFailed;
+  }
+
+  /**
    * Restart the app by starting a fresh copy of it and exiting only once that
    * copy is demonstrably alive.
    *
@@ -241,6 +266,13 @@ function createGatewaySupervisor({
    * A 503 "starting" counts too: the successor's gateway is bound and only
    * still restoring sessions.
    *
+   * Which port carries that handshake belongs to the caller. A bundle upgrade
+   * re-execs the same configuration, so the successor binds this process's own
+   * port. Turning the local gateway back on does not: the successor re-runs port
+   * selection with the setting now on, and selection refuses a port a configured
+   * crew claims, so it binds a different one. Polling this process's port there
+   * would time out against a healthy successor and then kill it.
+   *
    * Everything short of that is a failure with this instance still alive:
    * a spawn error (ENOENT on a pruned bundle), the successor exiting before
    * its gateway answered, or the bounded wait running out. The failure path
@@ -256,8 +288,11 @@ function createGatewaySupervisor({
    * dialog itself, the way the monitor's recovery would have.
    *
    * @param {() => void} onFailed  the caller's ordinary failure bookkeeping.
+   * @param {object} [options]
+   * @param {number} [options.expectPort]  port the successor will serve on.
    */
-  function relaunchViaConfirmedSuccessor(onFailed) {
+  function relaunchViaConfirmedSuccessor(onFailed, { expectPort = PORT } = {}) {
+    const readyUrl = `http://localhost:${expectPort}${READY_PATH}`;
     const target = processObj.execPath;
     const args = Array.isArray(processObj.argv) ? processObj.argv.slice(1) : [];
     const midSession = livenessMonitor !== null;
@@ -316,7 +351,7 @@ function createGatewaySupervisor({
       settled = true;
       clearTimers();
       successor.unref();
-      glog(`successor app (pid ${successor.pid}) is serving on :${PORT} — exiting this instance`);
+      glog(`successor app (pid ${successor.pid}) is serving on :${expectPort} — exiting this instance`);
       app.exit(0);
     };
     const poll = async () => {
@@ -324,7 +359,7 @@ function createGatewaySupervisor({
       if (settled) return;
       // The splash loads asynchronously and may have missed the first send.
       sendStatus(RESTARTING_STATUS);
-      const readiness = await fetchGatewayReadiness();
+      const readiness = await fetchGatewayReadiness(readyUrl);
       if (settled) return;
       if (readiness === "ready" || readiness === "starting") { confirm(); return; }
       pollTimer = setTimeoutFn(poll, SUCCESSOR_POLL_MS);
@@ -332,9 +367,9 @@ function createGatewaySupervisor({
 
     successor.once("spawn", () => {
       if (settled) return;
-      glog(`successor app started (pid ${successor.pid}) — waiting for its gateway to answer on :${PORT}`);
+      glog(`successor app started (pid ${successor.pid}) — waiting for its gateway to answer on :${expectPort}`);
       deadlineTimer = setTimeoutFn(
-        () => fail(`did not answer on :${PORT} within ${SUCCESSOR_READY_TIMEOUT_MS / 1000}s`),
+        () => fail(`did not answer on :${expectPort} within ${SUCCESSOR_READY_TIMEOUT_MS / 1000}s`),
         SUCCESSOR_READY_TIMEOUT_MS,
       );
       void poll();
@@ -683,11 +718,17 @@ function createGatewaySupervisor({
         // end of the connection -- naming the local one sends the user to check
         // a port nothing was ever expected to serve over there.
         const remoteConfig = getRemoteHostConfig(store, PORT);
+        const remoteHost = remoteConfig?.host || "";
         gatewayStartFailure = {
           disabled: true,
           port: PORT,
-          remoteHost: remoteConfig?.host || "",
+          remoteHost,
           remotePort: remoteConfig?.remotePort || "",
+          // The dialog decides its own button with this same predicate. Carrying
+          // the answer on the record is what keeps the message from describing a
+          // button the dialog does not render: the record is rebuilt on every
+          // wait, so an attempt that has just failed is reflected in both.
+          canStartHere: canOfferLocalStart(true, remoteHost),
         };
         resolve(false);
       };
@@ -1218,11 +1259,11 @@ function createGatewaySupervisor({
         || (noRetry ? "quit" : (portConflict ? "force-retry" : "retry"));
       const primaryLabel = configuredPrimaryLabel
         || (noRetry ? "Quit" : (portConflict ? "Force-stop & Retry" : "Retry"));
-      // Client-only mode cannot reach dashboard Settings to reverse the choice.
-      // Keep the explicit local-gateway escape hatch in this pre-dashboard UI --
-      // but only where starting one here is coherent. The spawn binds THIS
-      // port, so on a remote crew's port the button would stand up a local
-      // gateway shadowing that crew's identity on a port the user never chose.
+      // Client-only mode cannot reach dashboard Settings to reverse the choice,
+      // so this pre-dashboard UI carries the only in-app way back. The spawn
+      // binds THIS port: on a crew's port a gateway started in place would
+      // shadow that crew, so there the action re-runs port selection in a fresh
+      // process instead. The caller decides whether that route is available.
       const enableButton = offerLocalStart && !noRetry
         ? "<button class=\"cancel\" onclick=\"act('enable-retry')\">Start Local Gateway</button>"
         : "";
@@ -1768,7 +1809,7 @@ function createGatewaySupervisor({
           portConflict,
           port: PORT,
           localGatewayOff,
-          offerLocalStart: localGatewayOff && !remoteTarget,
+          offerLocalStart: canOfferLocalStart(localGatewayOff, remoteTarget),
         });
         if (window.isDestroyed()) return;
         if (action === "reveal") {
@@ -1778,8 +1819,28 @@ function createGatewaySupervisor({
         }
         if (action === "enable-retry") {
           setLocalGatewayEnabled(store, true);
-          runLocalGateway = true;
           glog("local gateway turned back on from the error dialog");
+          if (remoteTarget) {
+            // PORT is fixed for this process and is the local end of the link to
+            // the crew, so a gateway started here would bind the crew's port.
+            // Port selection reads the setting once per process, so only a fresh
+            // process can pick a local port. The successor therefore lands on a
+            // port this one never served, and the handshake has to watch that
+            // port: the same pure selection function answers for both, so the
+            // prediction cannot drift from what the successor picks. This process
+            // stays client-only: the setting is persisted either way, so a manual
+            // launch also recovers.
+            const successorPort = predictLocalPort();
+            glog(`re-execing so port selection runs again; expecting the successor on :${successorPort}`);
+            relaunchViaConfirmedSuccessor(() => {
+              localStartRelaunchFailed = true;
+              glog("successor never served; this process stays client-only and the setting is on for the next launch");
+              showLoadingThenConnect(window, targetBackendUrl, { initialPath })
+                .catch((error) => glog(`resurfacing the gateway failure failed: ${error && error.message}`));
+            }, { expectPort: successorPort });
+            return;
+          }
+          runLocalGateway = true;
         }
         if (action === "force-retry") {
           let freed = true;

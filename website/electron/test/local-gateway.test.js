@@ -145,18 +145,55 @@ test("client-only: the failure dialog derives its log pane from that one bit", (
   assert.doesNotMatch(source, /showLog:/);
 });
 
-test("client-only: the local-start offer is withheld on a remote crew's port", () => {
+test("client-only: the local-start offer routes through a re-exec on a crew's port", () => {
   // The spawn binds THIS port (`"--port", String(PORT)`), so on a port that
-  // names a remote crew the escape hatch would stand up a local gateway
-  // shadowing that crew. The button is therefore gated on its own condition,
-  // not on client-only mode -- these are genuinely different questions.
+  // names a remote crew the escape hatch cannot start a gateway in place without
+  // shadowing that crew. Port selection reads the setting once per process, so
+  // the offer there means "restart and choose again". Cases the gate covers:
+  // gateway on -> no offer; client-only on this launch's own port -> offer, start
+  // in place; client-only on a crew's port -> offer only while a re-exec is
+  // possible and has not already failed; noRetry -> no offer.
   const source = fs.readFileSync(
     path.join(__dirname, "..", "gateway-supervisor.js"),
     "utf8",
   );
   assert.match(source, /const enableButton = offerLocalStart && !noRetry/);
-  assert.match(source, /offerLocalStart: localGatewayOff && !remoteTarget/);
+  assert.match(source, /offerLocalStart: canOfferLocalStart\(localGatewayOff, remoteTarget\)/);
+  // One named gate, so the two questions -- may we offer it, and what does it do
+  // -- cannot drift into two spellings of the port condition.
+  assert.match(
+    source,
+    /function canOfferLocalStart\([\s\S]*?return canRelaunchThisApp\(\) && !localStartRelaunchFailed;/,
+  );
+  // A crew's port must not reach the in-place spawn: the action returns after
+  // handing off to the re-exec, and only the own-port path arms runLocalGateway.
+  assert.match(
+    source,
+    /if \(remoteTarget\) \{[\s\S]*?relaunchViaConfirmedSuccessor\([\s\S]*?\n {12}return;\n {10}\}\n {10}runLocalGateway = true;/,
+  );
   assert.match(source, /remotePort: remoteConfig\?\.remotePort \|\| ""/);
+  // The successor re-runs port selection and lands on a port THIS process never
+  // served, so the handshake watches the predicted port. Polling this process's
+  // own port times out against a healthy successor and then kills it.
+  assert.match(source, /function relaunchViaConfirmedSuccessor\(onFailed, \{ expectPort = PORT \} = \{\}\)/);
+  assert.match(source, /const readyUrl = `http:\/\/localhost:\$\{expectPort\}\$\{READY_PATH\}`;/);
+  assert.match(source, /await fetchGatewayReadiness\(readyUrl\)/);
+  assert.match(source, /const successorPort = predictLocalPort\(\);/);
+  assert.match(source, /\}, \{ expectPort: successorPort \}\);/);
+  // The relaunch poll specifically must not be the bare call: that one reads this
+  // process's BACKEND_URL, which is the abandoned crew port on the re-exec path.
+  // Two unrelated call sites legitimately take no argument, so the probe reads
+  // only this function's body. The positive assertion is the control: an empty or
+  // mis-sliced region fails it rather than passing the absence check for free.
+  const relaunchStart = source.indexOf("function relaunchViaConfirmedSuccessor(");
+  const relaunchEnd = source.indexOf("function fetchHealthInfo(");
+  assert.ok(relaunchStart > 0 && relaunchEnd > relaunchStart);
+  const relaunchBody = source.slice(relaunchStart, relaunchEnd);
+  assert.match(relaunchBody, /await fetchGatewayReadiness\(readyUrl\)/);
+  assert.doesNotMatch(relaunchBody, /await fetchGatewayReadiness\(\);/);
+  // One predicate answers for both the button and the sentence, so the dialog
+  // cannot render a button the message says is absent.
+  assert.match(source, /canStartHere: canOfferLocalStart\(true, remoteHost\)/);
   // The title must name the crew's own port, not this end of the link.
   assert.match(source, /nothing answering at \$\{remoteTarget\}:\$\{remoteTargetPort\}/);
 });

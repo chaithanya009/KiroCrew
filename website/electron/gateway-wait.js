@@ -101,7 +101,7 @@ function waitForGateway({
  * carries the Gatekeeper hint because an unsigned/quarantined nested executable
  * being killed on launch is the most common "works for me, not my friend" mode.
  *
- * @param {{code?: number|null, signal?: string|null, error?: string, disabled?: boolean, port?: number, remoteHost?: string, remotePort?: string}|null} failure
+ * @param {{code?: number|null, signal?: string|null, error?: string, disabled?: boolean, port?: number, remoteHost?: string, remotePort?: string, canStartHere?: boolean}|null} failure
  * @returns {string}
  */
 function describeGatewayFailure(failure) {
@@ -112,9 +112,10 @@ function describeGatewayFailure(failure) {
   //
   // Deliberately does NOT send the user to Settings: the page holding that
   // switch is served by a gateway, which is the thing not running. The error
-  // dialog carries a button instead -- except on a remote crew's port, where
-  // starting one here would shadow that crew, so this names the host to check
-  // and withholds the offer the dialog is also hiding.
+  // dialog carries a button instead. On a remote crew's port that button cannot
+  // start a gateway in place, so it restarts the app and lets port selection
+  // pick a local port; this message names the host to check first, because
+  // reaching the crew is what the user asked for.
   if (failure.disabled) {
     if (failure.remoteHost) {
       // The crew binds its own port on its own machine; this app only holds the
@@ -123,19 +124,24 @@ function describeGatewayFailure(failure) {
       const target = failure.remotePort
         ? `${failure.remoteHost}:${failure.remotePort}, reached through local port ${failure.port},`
         : `${failure.remoteHost} on port ${failure.port},`;
-      // The last sentence is the only exit this state has. The dialog withholds
-      // its start-a-gateway button here (that spawn would bind the crew's own
-      // port and shadow it), and the settings page that owns the choice is
-      // served by a gateway -- so without naming this the user is left with a
-      // Retry that cannot succeed. Both steps are named: an explicit port
-      // outranks stored config, but the opt-out is still in force, so that
-      // launch stops at this same state on a port where the button comes back.
-      return `Nothing is answering at ${target} and Kiro Crew is set not to `
+      // One exit per message, not a conditional the reader has to resolve. The
+      // composer knows whether it is rendering the button and says so on the
+      // record, so this names the route that is actually open. The withheld
+      // wording covers both ways it closes -- no executable to re-exec, and an
+      // attempt that already failed -- because either way restarting is not the
+      // route left to the user.
+      const reachTheCrew = `Nothing is answering at ${target} and Kiro Crew is set not to `
         + `start a gateway on this machine. Start the gateway on `
         + `${failure.remoteHost}, or re-establish the tunnel or port-forward that `
-        + "reaches it, and retry. To run one on this machine instead, relaunch "
-        + "with KIROCREW_PORT set to a port that has no remote host configured, "
-        + "then choose Start Local Gateway when prompted.";
+        + "reaches it, and retry.";
+      if (failure.canStartHere) {
+        return `${reachTheCrew} To run one on this machine instead, choose Start `
+          + "Local Gateway: it turns the setting back on and restarts the app so it "
+          + "picks a port it can serve here.";
+      }
+      return `${reachTheCrew} Restarting the app to pick a local port is not `
+        + "available here, so to run one on this machine instead, relaunch with "
+        + "KIROCREW_PORT set to a port that has no remote host configured.";
     }
     return `No gateway is answering on port ${failure.port}, and Kiro Crew is set `
       + "not to start one on this machine. Start the gateway you connect to (or "

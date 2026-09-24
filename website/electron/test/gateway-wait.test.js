@@ -175,7 +175,7 @@ test("describeGatewayFailure: the disabled case names the port and both ways out
 // #6138: with the launch aimed at a configured remote crew, this text must name
 // that target and must NOT offer to start a gateway here -- the spawn binds the
 // crew's own port, so the offer the dialog hides cannot be promised in words.
-test("describeGatewayFailure: a remote target is named and no local start offered", () => {
+test("describeGatewayFailure: a remote target is named, not the generic wording", () => {
   const s = describeGatewayFailure({ disabled: true, port: 7778, remoteHost: "a.example.com" });
   assert.match(s, /a\.example\.com/);
   assert.match(s, /7778/);
@@ -185,18 +185,31 @@ test("describeGatewayFailure: a remote target is named and no local start offere
   assert.doesNotMatch(s, /could not be launched|exited on launch|failed to start/);
 });
 
-// The dialog withholds its start-a-gateway button on a crew's port, and the page
-// that owns the choice is served by a gateway, so this sentence is the only exit
-// the state has. Without it the user is left with a Retry that cannot succeed.
-test("describeGatewayFailure: a remote target names a way to run one here anyway", () => {
-  const s = describeGatewayFailure({ disabled: true, port: 7778, remoteHost: "a.example.com" });
+// The page that owns the choice is served by a gateway, so the dialog's button is
+// the ordinary way back. The message names exactly one exit: the composer already
+// knows which one it is rendering, so making the reader resolve a branch at the
+// moment of failure hands them work the system had already done.
+test("describeGatewayFailure: an offered button is the named exit", () => {
+  const s = describeGatewayFailure({
+    disabled: true, port: 7778, remoteHost: "a.example.com", canStartHere: true,
+  });
+  assert.match(s, /choose Start Local Gateway/);
+  // The button restarts the app rather than binding this port, and a user who is
+  // not told that reads the restart as a crash.
+  assert.match(s, /restarts the app/);
+  // Naming the manual route beside an offered button is what sent users through
+  // it unnecessarily.
+  assert.doesNotMatch(s, /KIROCREW_PORT/);
+});
+
+test("describeGatewayFailure: a withheld button leaves the explicit-port route", () => {
+  const s = describeGatewayFailure({
+    disabled: true, port: 7778, remoteHost: "a.example.com", canStartHere: false,
+  });
   assert.match(s, /KIROCREW_PORT/);
   assert.match(s, /no remote host configured/);
-  // BOTH steps, or the instruction under-promises: an explicit port re-aims the
-  // launch, but the opt-out is still in force, so that launch stops at this same
-  // state -- on a port where the withheld button is offered again. A user told
-  // only the first step reads the second dialog as "it did not work".
-  assert.match(s, /then choose Start Local Gateway when prompted/);
+  // Offering a button this dialog is not rendering sends the user hunting for it.
+  assert.doesNotMatch(s, /Start Local Gateway/);
 });
 
 test("describeGatewayFailure: the remote-side instruction names the tunnel", () => {
@@ -249,7 +262,10 @@ test("describeGatewayFailure: no remotePort falls back to the shared port form",
       disabled: true, port: 7778, remoteHost: "a.example.com", remotePort,
     });
     assert.match(s, /a\.example\.com on port 7778/);
-    assert.doesNotMatch(s, /local port/);
+    // The two-port target form, not the words in isolation: "local port" also
+    // reads naturally in ordinary advice, and a guard that catches that instead
+    // reports a collision with prose as a rendering bug.
+    assert.doesNotMatch(s, /reached through local port/);
     assert.doesNotMatch(s, /:undefined|: ,|::/);
   }
 });

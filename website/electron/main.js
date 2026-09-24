@@ -24,9 +24,7 @@ const {
 const { DEFAULT_REMOTE_BIN } = require("./remote-token");
 const {
   migrateRemoteHostConfig,
-  remoteHostPort,
-  getRemoteHostConfig,
-  isSelectablePort,
+  selectLaunchPort,
 } = require("./host-config");
 const { isLocalGatewayEnabled } = require("./local-gateway");
 const { seedRenamedStore } = require("./store-rename");
@@ -120,37 +118,12 @@ function resolvePort() {
   }
 
   // dashboard.url in the resolved data home is the backend source of truth.
-  const configuredPort = findConfiguredDashboardPort(fs, path, [KIROCREW_HOME]);
-
-  // With "Run a local gateway" off, a dashboard.url naming a port that has no
-  // remote host of its own records a backend which will not run here: nothing
-  // binds it and there is no host to mint a token from. A machine switched from
-  // local to remote-only keeps exactly that record, so honouring it would
-  // rebuild the dead end the opt-out is meant to avoid. A dashboard.url that
-  // DOES name a configured crew still wins -- that is the user choosing between
-  // crews rather than a leftover.
-  if (!isLocalGatewayEnabled(store)) {
-    if (
-      configuredPort
-      && isSelectablePort(configuredPort)
-      && getRemoteHostConfig(store, configuredPort)?.host
-    ) {
-      return configuredPort;
-    }
-    const remotePort = remoteHostPort(store);
-    if (remotePort) {
-      glog(
-        "Local gateway is off; targeting the configured remote crew on port " + remotePort,
-      );
-      return remotePort;
-    }
-    // No crew is configured, so there is no better target than the local
-    // record: naming the port the user configured beats naming the default.
-  }
-
-  if (configuredPort) return configuredPort;
-  glog("No usable dashboard.url port in the data home, falling back to 5476");
-  return 5476;
+  return selectLaunchPort({
+    store,
+    configuredPort: findConfiguredDashboardPort(fs, path, [KIROCREW_HOME]),
+    localGatewayEnabled: isLocalGatewayEnabled(store),
+    log: glog,
+  });
 }
 
 const PORT = resolvePort();
@@ -381,6 +354,17 @@ const gateway = createGatewaySupervisor({
   warn: gwarn,
   error: gerror,
   logPath: gatewayLogPath,
+  // The port a successor re-exec'd from the error dialog will select. That
+  // successor starts with the local-gateway setting on, which is why the
+  // setting is named here rather than read: the store write that turns it on
+  // and this prediction describe the same next process. Running the same pure
+  // function that successor will run is what keeps the two answers identical.
+  predictLocalPort: () => selectLaunchPort({
+    store,
+    configuredPort: findConfiguredDashboardPort(fs, path, [KIROCREW_HOME]),
+    localGatewayEnabled: true,
+    log: glog,
+  }),
 });
 
 windows = createWindowLifecycle({
