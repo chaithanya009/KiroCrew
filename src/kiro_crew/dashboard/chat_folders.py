@@ -629,7 +629,11 @@ def _subtree_holds_foreign_folder(
     would otherwise relocate a folder the person nested inside it, which is the
     same violation as editing that folder directly, reached one level down.
 
-    Used by the reparent path only. Delete asks a stricter question instead --
+    Used by the reparent path. A ``project_dir`` change is not gated by this
+    test: an agent principal may not change an existing folder's binding at
+    all (see ``api_chat_folder_update``), because the sessions that binding
+    reaches live outside the folder store.
+    Delete asks a stricter question instead --
     whether the folder is EMPTY -- because a delete has more kinds of content to
     account for (sessions, and archived sessions a live scan cannot see), and
     emptiness answers all of them without an ownership test per content type.
@@ -1099,7 +1103,48 @@ async def api_chat_folder_update(request: web.Request) -> web.Response:
                 )
         changes["parent_id"] = new_parent
     if "project_dir" in body:
-        pd, err = _validate_project_dir(str(body["project_dir"] or "").strip())
+        if request_app:
+            # An app or crew member may not set or clear the project directory
+            # of an EXISTING folder -- not even one it owns and, by the folder
+            # test, holds only its own folders. A folder's binding is what every
+            # session filed in its subtree picks up on its next agent switch
+            # (``api_chat_slot_agent`` re-resolves the folder chain), and those
+            # sessions live in stores the folder store shares no lock with:
+            # the slot table, where the person may have filed one of their own
+            # chats into the app's folder, and the session archive, whose
+            # index carries no owner and whose sessions revive with their
+            # ``folder_id`` intact. So "every session under this folder is the
+            # caller's own" cannot be established atomically with the write --
+            # the same seam that makes an app's delete refused outright below
+            # (``api_chat_folder_delete``), and every narrower rule (a
+            # subtree-of-own-folders test, a live-slot scan) leaks through it.
+            # Refused before the path is validated: no outcome of validating it
+            # could be used. A binding is set by the person, or by an agent
+            # principal at CREATE, when the folder has no sessions yet.
+            sel().log_api_access(
+                caller=request_app,
+                operation="chat.folder_update",
+                outcome="denied",
+                source="app_isolation",
+                resources=fid,
+                error="app cannot change an existing folder's project directory",
+            )
+            return web.json_response(
+                {
+                    "error": (
+                        "an app or crew member cannot change an existing folder's "
+                        "project directory - bind it when creating the folder, or ask "
+                        "the person"
+                    ),
+                    "code": "folder_project_dir_forbidden",
+                },
+                status=403,
+            )
+        # Off-loop, as create's call is: realpath/isdir on a stalled network
+        # path would otherwise hold every gateway task.
+        pd, err = await asyncio.to_thread(
+            _validate_project_dir, str(body["project_dir"] or "").strip()
+        )
         if err:
             return web.json_response({"error": err}, status=400)
         if pd:
@@ -1254,8 +1299,8 @@ async def api_chat_folder_update(request: web.Request) -> web.Response:
         # Deleted between the validation above and acquiring the store lock.
         return web.json_response({"error": "not found", "code": "folder_not_found"}, status=404)
     if err in ("not_owned", "forbidden_parent", "foreign_descendant"):
-        # Distinguished in the audit, not to the caller: one code for all three
-        # keeps the response from reporting which folder was foreign.
+        # Distinguished in the audit, not to the caller: one code for all of
+        # them keeps the response from reporting which folder was foreign.
         _reason = {
             "not_owned": "app cannot change a folder it does not own",
             "forbidden_parent": "app cannot move a folder into one it does not own",

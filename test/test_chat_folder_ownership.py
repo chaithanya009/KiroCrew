@@ -12,6 +12,7 @@ claim, so an app agent's tool call arrives with ``request["app"]`` empty.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -20,6 +21,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from kiro_crew.dashboard.chat_folders import (
+    _validate_project_dir,
     api_chat_folder_create,
     api_chat_folder_delete,
     api_chat_folder_update,
@@ -449,6 +451,186 @@ class TestRenameAndReparentAreBounded:
             )
         assert resp.status == 200
         assert _by_id(state, PERSON)["parent_id"] == OTHER
+
+
+class TestAnAppCannotChangeAnExistingFoldersProjectDir:
+    """A folder's binding is what every session filed in its subtree picks up
+    on its next agent switch, and those sessions live in stores the folder store
+    shares no lock with (the slot table, the session archive). "Every session
+    under this folder is the caller's own" cannot be established atomically with
+    the write, so the PATCH refuses an agent principal's ``project_dir`` change
+    outright -- the delete route's rule, on the binding axis. An agent principal
+    binds a folder at CREATE, when nothing is filed in it yet; the person keeps
+    the update they always had.
+    """
+
+    @staticmethod
+    def _radar_holding_theirs(bound: str = "") -> list[dict[str, Any]]:
+        folders = _folders()
+        if bound:
+            next(f for f in folders if f["id"] == RADAR)["project_dir"] = bound
+        folders.append({"id": "fldr00000007", "name": "Theirs", "parent_id": RADAR})
+        return folders
+
+    @pytest.mark.asyncio
+    async def test_an_app_cannot_rebind_its_folder_holding_the_persons_chat(self, tmp_path) -> None:
+        """The person filed one of their own chats into the app's folder. That
+        slot re-resolves the folder's binding on its next agent switch
+        (``api_chat_slot_agent``), so an app rebinding the folder would decide
+        the person's project, cwd and steering -- cross-ownership through a
+        session the folder store cannot see atomically."""
+        theirs = _ChatSlot("chat-2-200")
+        theirs.folder_id = RADAR
+        state = _state(_app_slot("chat-1-100", "issue-radar"), theirs)
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.patch(
+                f"/api/chat/folders/{RADAR}",
+                json={"project_dir": str(tmp_path)},
+                headers={"X-Session-Key": "dashboard:chat-1-100"},
+            )
+            body = await resp.json()
+        assert resp.status == 403
+        assert body["code"] == "folder_project_dir_forbidden"
+        assert "project_dir" not in _by_id(state, RADAR)
+
+    @pytest.mark.asyncio
+    async def test_binding_own_folder_that_holds_a_foreign_one_is_refused(self, tmp_path) -> None:
+        """The nested-folder case is one instance of the same rule: a chat the
+        person opens in the nested folder would inherit the app's binding."""
+        state = _state(_app_slot("chat-1-100", "issue-radar"), folders=self._radar_holding_theirs())
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.patch(
+                f"/api/chat/folders/{RADAR}",
+                json={"project_dir": str(tmp_path)},
+                headers={"X-Session-Key": "dashboard:chat-1-100"},
+            )
+            body = await resp.json()
+        assert resp.status == 403
+        assert body["code"] == "folder_project_dir_forbidden"
+        assert "project_dir" not in _by_id(state, RADAR)
+
+    @pytest.mark.asyncio
+    async def test_clearing_is_refused_the_same_way(self, tmp_path) -> None:
+        """Clearing changes what a filed session picks up just as setting does."""
+        state = _state(
+            _app_slot("chat-1-100", "issue-radar"),
+            folders=self._radar_holding_theirs(bound=str(tmp_path)),
+        )
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.patch(
+                f"/api/chat/folders/{RADAR}",
+                json={"project_dir": ""},
+                headers={"X-Session-Key": "dashboard:chat-1-100"},
+            )
+        assert resp.status == 403
+        assert _by_id(state, RADAR)["project_dir"] == str(tmp_path)
+
+    @pytest.mark.asyncio
+    async def test_even_a_subtree_of_only_its_own_folders_and_sessions_is_refused(
+        self, tmp_path
+    ) -> None:
+        """No narrower rule: an own-folders-only subtree with only the app's own
+        live session filed in it is refused too, because the archive (no owner
+        in its index, sessions revive with ``folder_id`` intact) and a filing
+        that lands mid-request are exactly what the folder store cannot see.
+        Nothing is stored and the path is never validated."""
+        folders = _folders()
+        folders.append(
+            {"id": "fldr00000007", "name": "Runs", "parent_id": RADAR, "owner_app": "issue-radar"}
+        )
+        own = _app_slot("chat-1-100", "issue-radar")
+        own.folder_id = RADAR
+        state = _state(own, folders=folders)
+        with patch("kiro_crew.dashboard.chat_folders._validate_project_dir") as validator:
+            async with TestClient(TestServer(_make_app(state))) as client:
+                resp = await client.patch(
+                    f"/api/chat/folders/{RADAR}",
+                    json={"project_dir": str(tmp_path)},
+                    headers={"X-Session-Key": "dashboard:chat-1-100"},
+                )
+                body = await resp.json()
+        assert resp.status == 403
+        assert body["code"] == "folder_project_dir_forbidden"
+        assert "bind it when creating the folder" in body["error"]
+        assert "project_dir" not in _by_id(state, RADAR)
+        validator.assert_not_called()
+        state.mutate_folders.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_the_refusal_is_audited(self, tmp_path) -> None:
+        state = _state(_app_slot("chat-1-100", "issue-radar"))
+        with patch("kiro_crew.dashboard.chat_folders.sel") as sel_fn:
+            async with TestClient(TestServer(_make_app(state))) as client:
+                resp = await client.patch(
+                    f"/api/chat/folders/{RADAR}",
+                    json={"project_dir": str(tmp_path)},
+                    headers={"X-Session-Key": "dashboard:chat-1-100"},
+                )
+        assert resp.status == 403
+        kwargs = sel_fn.return_value.log_api_access.call_args.kwargs
+        assert kwargs["caller"] == "issue-radar"
+        assert kwargs["operation"] == "chat.folder_update"
+        assert kwargs["outcome"] == "denied"
+        assert kwargs["resources"] == RADAR
+        assert "project directory" in kwargs["error"]
+
+    @pytest.mark.asyncio
+    async def test_an_apps_other_fields_on_its_own_folder_still_apply(self, tmp_path) -> None:
+        """The rule is about the binding only: a rename of the same folder by
+        the same app lands as before."""
+        state = _state(_app_slot("chat-1-100", "issue-radar"))
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.patch(
+                f"/api/chat/folders/{RADAR}",
+                json={"name": "Radar runs"},
+                headers={"X-Session-Key": "dashboard:chat-1-100"},
+            )
+        assert resp.status == 200
+        assert _by_id(state, RADAR)["name"] == "Radar runs"
+
+    @pytest.mark.asyncio
+    async def test_the_person_can_bind_a_folder_holding_an_apps(self, tmp_path) -> None:
+        folders = _folders()
+        folders.append(
+            {
+                "id": "fldr00000007",
+                "name": "Radar sub",
+                "parent_id": PERSON,
+                "owner_app": "issue-radar",
+            }
+        )
+        state = _state(_ChatSlot("chat-1-100"), folders=folders)
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.patch(
+                f"/api/chat/folders/{PERSON}",
+                json={"project_dir": str(tmp_path)},
+                headers={"X-Session-Key": "dashboard:chat-1-100"},
+            )
+        assert resp.status == 200
+        assert _by_id(state, PERSON)["project_dir"] == str(tmp_path.resolve())
+
+    @pytest.mark.asyncio
+    async def test_the_path_validator_runs_off_the_event_loop(self, tmp_path) -> None:
+        """realpath/isdir on a stalled network path must not hold the gateway
+        loop: the PATCH route hands the validator to a worker thread, as the
+        create route does."""
+        state = _state(_ChatSlot("chat-1-100"))
+        seen: list[Any] = []
+        real_to_thread = asyncio.to_thread
+
+        async def _spy(fn: Any, *args: Any, **kwargs: Any) -> Any:
+            seen.append(fn)
+            return await real_to_thread(fn, *args, **kwargs)
+
+        with patch("kiro_crew.dashboard.chat_folders.asyncio.to_thread", side_effect=_spy):
+            async with TestClient(TestServer(_make_app(state))) as client:
+                resp = await client.patch(
+                    f"/api/chat/folders/{PERSON}",
+                    json={"project_dir": str(tmp_path)},
+                    headers={"X-Session-Key": "dashboard:chat-1-100"},
+                )
+        assert resp.status == 200
+        assert _validate_project_dir in seen
 
 
 class TestAnAppCannotDeleteFolders:
