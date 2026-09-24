@@ -3093,9 +3093,8 @@ class TestSelRootIsolation(unittest.IsolatedAsyncioTestCase):
         # setUp already skipped when the isolation seam is absent, so this is
         # the displaced session directory, never the operator's data home.
         shared = sel_mod._default_dir()
-        lock_dir = shared / sel_mod._TRUST_SUBDIR
-        lock_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-        lock_file = lock_dir / sel_mod._SEL_LOCK_FILE
+        shared.mkdir(parents=True, exist_ok=True)
+        lock_file = shared / sel_mod._SEL_LOCK_FILE
         # Same flags the code under test opens the sidecar with (sel.py), so
         # the staged holder is byte-faithful on Windows too.
         fd = os.open(

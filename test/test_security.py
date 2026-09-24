@@ -5196,6 +5196,14 @@ class TestIsSensitivePath:
         assert is_sensitive_path("~/.kiro/crew/security_events.jsonl") is True
         assert is_sensitive_path("~/.kirocrew/security_events.jsonl") is True
 
+    def test_security_events_chain_lock(self) -> None:
+        # The sidecar whose advisory lock serializes chain appends. Unlinking it
+        # lets the next two writers create separate inodes and fork the hash
+        # chain; holding it stalls or denies every audited action. Its integrity
+        # is the fence's point, so it sits beside the log it serializes.
+        assert is_sensitive_path("~/.kiro/crew/security_events.lock") is True
+        assert is_sensitive_path("~/.kirocrew/security_events.lock") is True
+
     def test_rotated_security_event_segments(self) -> None:
         # A rotated segment holds exactly the same audit records the live log
         # does (sel.py closes the log at a size cap and renames it into this
@@ -5220,9 +5228,11 @@ class TestIsSensitivePath:
         assert is_sensitive_path(f"{home}/.kiro/crew/sel_hmac.key") is True
         assert is_sensitive_path(f"{home}/.kiro/crew/trust/sel_hmac.key") is True
         assert is_sensitive_path(f"{home}/.kiro/crew/security_events.jsonl") is True
+        assert is_sensitive_path(f"{home}/.kiro/crew/security_events.lock") is True
         assert is_sensitive_path(f"{home}/.kirocrew/sel_hmac.key") is True
         assert is_sensitive_path(f"{home}/.kirocrew/trust/sel_hmac.key") is True
         assert is_sensitive_path(f"{home}/.kirocrew/security_events.jsonl") is True
+        assert is_sensitive_path(f"{home}/.kirocrew/security_events.lock") is True
 
     def test_app_admission_policy(self) -> None:
         # Keystone invariant: app_admission.json is the sole fleet-controlled

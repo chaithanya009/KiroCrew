@@ -111,12 +111,16 @@ class _ChainTipBeyondBound(OSError):
 
 
 _SEL_FILE = "security_events.jsonl"
-# Sidecar whose advisory lock serializes chain writes ACROSS PROCESSES. It lives
-# in _TRUST_SUBDIR, not beside the log: that directory is owner-only and inside
-# the sensitive-path floor, so the audited agent cannot unlink or hold the lock
-# out from under the writers. It is also deliberately not the log file itself —
-# msvcrt.locking() locks a byte range at offset 0 and so needs an fd whose offset
-# the caller may move freely, which the O_APPEND log fd is not.
+# Sidecar whose advisory lock serializes chain writes ACROSS PROCESSES. It sits
+# beside the log, and its leaf is on the sensitive-path deny list exactly as the
+# log's is, so the audited agent can neither unlink it mid-hold nor hold it out
+# from under the writers. Anchoring it on the log's own directory is what makes
+# the path identical in every process: a path read off the resolved HMAC key
+# varies with that key's migration state, and two processes reading different
+# states lock different inodes and fork the chain. It is also deliberately not
+# the log file itself — msvcrt.locking() locks a byte range at offset 0 and so
+# needs an fd whose offset the caller may move freely, which the O_APPEND log fd
+# is not.
 _SEL_LOCK_FILE = "security_events.lock"
 
 
@@ -716,11 +720,13 @@ class SecurityEventLog:
             finally:
                 _chain_hold_release(key)
             return
-        if lock_path != self._hmac_key_file:
-            # 0o700 to match how the trust dir is created for the HMAC key:
-            # the sidecar's protection is the directory's, so a laxer mode
-            # here would quietly undo it.
-            lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        # The sidecar's directory is the log's own. ``_flush_batch`` recreates it
+        # too, but only after this lock is held, so an externally removed SEL dir
+        # has to be recreated here or the open below fails and the batch is
+        # dropped. Default mode, the one both init and the flush path use for
+        # this directory -- forcing a stricter one here would silently change the
+        # mode of the directory that holds the log.
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
         # A sidecar that is a LINK is not a lock. If the path resolves elsewhere,
         # replacing its target hands two writers locks on different inodes — the
         # exact fork this serialization exists to prevent — so a link planted
@@ -733,9 +739,9 @@ class SecurityEventLog:
             raise OSError(
                 f"SEL chain-lock sidecar {lock_path} is a link; refusing to lock it"
             )
-        # Windows' CRT text mode strips a trailing 0x1A while opening a file
-        # for update. The fallback lock path can be the raw HMAC key, so this
-        # descriptor must be binary even though the lock code never writes it.
+        # Windows' CRT text mode strips a trailing 0x1A while opening a file for
+        # update. Nothing writes through this descriptor, but a text-mode open is
+        # itself the mutation, so the flag stays.
         fd = os.open(
             lock_path,
             os.O_CREAT
@@ -759,8 +765,7 @@ class SecurityEventLog:
             # process, and it makes byte 0 unwritable while it is held: a write
             # here races a sibling's acquire and fails with EACCES, which
             # ``_flush_batch`` reports as an unavailable chain lock and drops the
-            # batch for. The legacy-key fallback path must not be written
-            # through either -- its bytes are the HMAC key.
+            # batch for.
             if _on_event_loop():
                 if _acquire_chain_lock_on_loop(fd):
                     unlock = functools.partial(platform_compat.release_lock, fd)
@@ -820,21 +825,29 @@ class SecurityEventLog:
     def _chain_lock_path(self) -> Path:
         """The file the cross-process chain lock is taken on.
 
-        Normally the sidecar in the trust subdirectory. When
-        ``_load_or_create_hmac_key`` fell back to the legacy key location
-        (uncreatable trust dir, or a planted link on it that could not be
-        removed), the LEGACY KEY FILE itself: retrying the mkdir on every
-        append would fail the same way — dropping every best-effort audit and
-        denying every critical action on an install that is otherwise signing
-        fine — and the legacy key is the one sibling of the log the
-        sensitive-path deny list has protected all along. The lock is advisory
-        and the fd is never written, so locking the key file cannot disturb
-        its bytes.
+        A pure function of the log directory: the sidecar beside the log, and
+        nothing derived from where the HMAC key resolved to. Those two have no
+        reason to be coupled, and coupling them forks the chain. The key's
+        location differs BETWEEN PROCESSES on the same directory -- an install
+        whose migration fails keeps signing from the legacy location while a
+        sibling that completes it reads the relocated one -- so a lock path read
+        off the key hands those two writers locks on DIFFERENT inodes, and both
+        then append to one log unserialized, which is what the hash chain's
+        tamper-evidence rests on not happening. Anchoring on the log directory
+        makes the path identical in every process whatever the key's state: no
+        attribute test for whether a directory is usable, no candidate key to
+        read, and no in-process transition to serialize -- the value cannot vary
+        within a process, so the ``_CHAIN_HOLDS`` registry keyed on it cannot
+        hand two threads different gates.
+
+        The sidecar is creatable exactly when the log itself is writable, so an
+        install with an unusable trust directory keeps auditing instead of
+        dropping every best-effort event and denying every critical action.
+        ``security_events.lock`` sits on the sensitive-path deny list beside
+        ``security_events.jsonl``, so the audited agent can neither unlink it nor
+        hold it out from under the writers.
         """
-        lock_dir = self._dir / _TRUST_SUBDIR
-        if self._hmac_key_file.parent != lock_dir:
-            return self._hmac_key_file
-        return lock_dir / _SEL_LOCK_FILE
+        return self._dir / _SEL_LOCK_FILE
 
     @contextlib.contextmanager
     def _chain_hold_relabel(self, kind: str) -> Iterator[None]:
@@ -1297,61 +1310,83 @@ class SecurityEventLog:
         # pre-existing one at the new path. Skipped when trust-dir creation
         # above already fell back to the legacy location.
         if key_path != legacy_path and legacy_path.exists():
-            # The legacy key WINS over any pre-existing destination file.
-            # ``trust/`` was not deny-listed before this release, so a file
-            # already at the destination on a legacy install is untrustworthy
-            # (an agent could have planted bytes it knows and then forged SEL
-            # and session-identity MACs); the legacy key is the only anchor
-            # that was deny-list-protected all along. os.replace overwrites
-            # the destination atomically. Benign overlap (a backup restore
-            # resurrecting the legacy file after a real migration) is
-            # unaffected: the key never rotates, so the bytes are identical.
-            if key_path.exists():
-                logger.warning(
-                    "pre-existing file at %s is being replaced by the legacy SEL "
-                    "HMAC key %s (the legacy key is the deny-list-protected "
-                    "trust anchor)",
-                    key_path,
+            # A legacy file too short to BE a key never wins over a destination
+            # that holds a usable one. The unconditional rule below rests on the
+            # two files carrying the same bytes, and a file that cannot load as a
+            # key carries none: promoting it destroys the only copy of the key
+            # that signed every existing record, and the >= length check further
+            # down then fails init on every boot after that, so the loss is
+            # unrecoverable rather than merely wrong. A mixed-binary window is
+            # enough to produce such a file -- a writer that derives its chain
+            # lock from the key location opens it with ``O_CREAT`` and leaves a
+            # 0-byte one behind once a sibling has relocated the real key. The
+            # narrow shape is deliberate: only this one pairing is skipped, so a
+            # genuine legacy key still wins over a pre-existing destination file,
+            # and a short legacy file with no usable destination still reaches
+            # the length check exactly as it does without this guard.
+            if not _trust_root_key_loads(legacy_path) and _trust_root_key_loads(key_path):
+                logger.warning(  # nosemgrep: python-logger-credential-disclosure
+                    "legacy SEL HMAC key %s is too short to be a key; keeping the "
+                    "usable key at %s instead of promoting it",
                     legacy_path,
+                    key_path,
                 )
-            try:
-                os.replace(legacy_path, key_path)
-                logger.info("migrated SEL HMAC key %s -> %s", legacy_path, key_path)
-            except OSError:
-                # Ordering is security-relevant: while the legacy source STILL
-                # EXISTS it stays the only deny-list-protected trust anchor, so
-                # a failed replace must fall back to it — never to a
-                # destination file that could have been pre-planted (an
-                # attacker able to make os.replace fail must not get their
-                # planted key adopted). The destination is trusted only after
-                # the legacy source is gone, which on a failed replace can only
-                # mean a sibling process completed the same migration (its
-                # os.replace moved the SAME legacy bytes there).
-                if legacy_path.exists():
-                    # Chain continuity beats relocation: if the move fails
-                    # (read-only FS, permissions), keep signing with the
-                    # legacy file rather than minting a fresh key that would
-                    # orphan every already-chained record. Path stays legacy
-                    # for this process so sel_hmac_key_path() reports the
-                    # file in use.
+            else:
+                # The legacy key WINS over any pre-existing destination file.
+                # ``trust/`` was not deny-listed before this release, so a file
+                # already at the destination on a legacy install is untrustworthy
+                # (an agent could have planted bytes it knows and then forged SEL
+                # and session-identity MACs); the legacy key is the only anchor
+                # that was deny-list-protected all along. os.replace overwrites
+                # the destination atomically. Benign overlap (a backup restore
+                # resurrecting the legacy file after a real migration) is
+                # unaffected: the key never rotates, so the bytes are identical.
+                if key_path.exists():
                     logger.warning(
-                        "failed to migrate SEL HMAC key %s -> %s; continuing with "
-                        "the legacy location",
+                        "pre-existing file at %s is being replaced by the legacy SEL "
+                        "HMAC key %s (the legacy key is the deny-list-protected "
+                        "trust anchor)",
+                        key_path,
                         legacy_path,
-                        key_path,
-                        exc_info=True,
                     )
-                    key_path = legacy_path
-                elif key_path.exists():
-                    # Lost the migration race to a sibling process: the key
-                    # is already at the new path, and its bytes are the same
-                    # legacy bytes — proceed with it.
-                    logger.debug(
-                        "SEL HMAC key migration raced; using already-migrated %s",
-                        key_path,
-                    )
-                # else: both paths vanished mid-init (external deletion) —
-                # fall through to fresh-key creation at the NEW path.
+                try:
+                    os.replace(legacy_path, key_path)
+                    logger.info("migrated SEL HMAC key %s -> %s", legacy_path, key_path)
+                except OSError:
+                    # Ordering is security-relevant: while the legacy source STILL
+                    # EXISTS it stays the only deny-list-protected trust anchor, so
+                    # a failed replace must fall back to it, never to a
+                    # destination file that could have been pre-planted (an
+                    # attacker able to make os.replace fail must not get their
+                    # planted key adopted). The destination is trusted only after
+                    # the legacy source is gone, which on a failed replace can only
+                    # mean a sibling process completed the same migration (its
+                    # os.replace moved the SAME legacy bytes there).
+                    if legacy_path.exists():
+                        # Chain continuity beats relocation: if the move fails
+                        # (read-only FS, permissions), keep signing with the
+                        # legacy file rather than minting a fresh key that would
+                        # orphan every already-chained record. Path stays legacy
+                        # for this process so sel_hmac_key_path() reports the
+                        # file in use.
+                        logger.warning(
+                            "failed to migrate SEL HMAC key %s -> %s; continuing with "
+                            "the legacy location",
+                            legacy_path,
+                            key_path,
+                            exc_info=True,
+                        )
+                        key_path = legacy_path
+                    elif key_path.exists():
+                        # Lost the migration race to a sibling process: the key
+                        # is already at the new path, and its bytes are the same
+                        # legacy bytes, so proceed with it.
+                        logger.debug(
+                            "SEL HMAC key migration raced; using already-migrated %s",
+                            key_path,
+                        )
+                    # else: both paths vanished mid-init (external deletion):
+                    # fall through to fresh-key creation at the NEW path.
         # Single source of truth for dependent protocols: sel_hmac_key_path()
         # reports THIS resolved path (normally trust/sel_hmac.key; the legacy
         # path only on a failed migration above).

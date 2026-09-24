@@ -436,6 +436,16 @@ _CREW_SECRET_LEAVES: list[str] = [
     # segment is covered without a per-name matcher. sel.py opens segments
     # directly, not through this gate.
     "security_events.d",
+    # The SEL cross-process chain lock. Serialization is what keeps two writers
+    # from chaining off one ``prev_hash``, so the audited agent must not be able
+    # to unlink the sidecar (the next two writers then create separate inodes and
+    # fork the chain) nor hold it (every audited action either stalls behind it or
+    # is denied). Its bytes carry nothing -- no writer ever writes through the
+    # descriptor -- so this entry buys the lock's INTEGRITY, not secrecy, which is
+    # why it sits beside the log rather than under a trust root: sel.py derives it
+    # from the log's own directory so that every process on one log agrees on it.
+    # sel.py opens it directly, not through this gate.
+    "security_events.lock",
     "app_admission.json",
     "security_policy.json",
     "profiles",

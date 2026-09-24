@@ -646,11 +646,14 @@ _CREW_SANDBOX_VISIBLE_LEAVES: tuple[str, ...] = (
     # ``trust/sel_hmac.key`` inside the sandbox to resolve the strict session identity,
     # ``skill_search`` reads ``trust/project-skills.json``, and the in-sandbox MCP
     # servers append to the log directly — a masked log turns an audit-or-deny write
-    # into a denial of the action it was auditing.
+    # into a denial of the action it was auditing. The chain lock carries the same
+    # obligation for the same reason: an append takes it first, and a masked sidecar
+    # is a separate inode, which is how two writers chain off one ``prev_hash``.
     "trust",
     "sel_hmac.key",
     "security_events.jsonl",
     "security_events.d",
+    "security_events.lock",
     # How an in-sandbox MCP server authenticates back to the dashboard. Masking it
     # breaks cron triggering, screencast, and the Sage review driver.
     ".local_secret",
@@ -731,14 +734,19 @@ _CREW_CHILD_WITHHELD_LEAVES: tuple[str, ...] = (
     # ``sessions/<digest>/`` and ``pids/``. So reading the directory hands over every
     # member's key, not a digest of one, and a leaked session key stays usable.
     "member-memory-bindings",
-    # The SEL audit log and its rotation directory. Withheld for the WRITE side above
+    # The SEL audit log, its rotation directory and the chain lock that serializes
+    # appends to them. Withheld for the WRITE side above
     # all: ``_CREW_SANDBOX_VISIBLE_LEAVES`` keeps these read-write precisely so an
     # in-sandbox MCP server can append, and a foreign harness with the same access can
     # rewrite or truncate the record of its own actions. Losing the append makes an
     # audit-or-deny write fail, which DENIES the action it was auditing -- the safe
-    # direction, and the reason this is a withhold rather than a carve-out.
+    # direction, and the reason this is a withhold rather than a carve-out. The lock
+    # takes the log's disposition at every layer on purpose: a child that may not
+    # append has no use for it, and one that could unlink or hold it could fork the
+    # chain or stall every audited action without writing a byte of the log.
     "security_events.jsonl",
     "security_events.d",
+    "security_events.lock",
     # Both admission stores hold ``trust_keys``: signer -> SHARED SECRET, verified with
     # ``hmac.new`` plus ``compare_digest`` (``apps/admission.py``). A child that reads
     # one can sign a manifest or a policy that admission then accepts, so these are

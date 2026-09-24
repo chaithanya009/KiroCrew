@@ -20,7 +20,7 @@ import pytest
 
 import kiro_crew.sel as sel_mod
 from conftest import requires_symlinks
-from kiro_crew import platform_compat
+from kiro_crew import platform_compat, security
 from kiro_crew import sel as kiro_crew_sel
 from kiro_crew.sel import SecurityEvent, SecurityEventLog, _infer_source, sel, sel_hmac_key_path
 
@@ -566,37 +566,64 @@ log.flush()
         # the breaks: valid < total.
         assert valid == total, f"HMAC chain broken: only {valid}/{total} entries verify"
 
-    def test_lock_sidecar_lives_in_the_protected_trust_dir(self, tmp_path):
+    def test_lock_sidecar_lives_beside_the_log_and_is_deny_listed(self, tmp_path):
         """The sidecar must sit where the agent cannot reach it.
 
-        A sibling of security_events.jsonl is NOT covered: the sensitive-path
-        floor lists that log by exact leaf name. An agent able to unlink the
-        sidecar mid-hold leaves two writers holding locks on different inodes —
-        the fork this serialization prevents — and one able to hold it wedges
-        every writer.
+        Beside the log, and covered the same way the log is: the sensitive-path
+        floor lists both by exact leaf name. An agent able to unlink the sidecar
+        mid-hold leaves two writers holding locks on different inodes -- the fork
+        this serialization prevents -- and one able to hold it wedges every
+        writer.
         """
         log = SecurityEventLog(base_dir=tmp_path, sync=True)
         log.log(_make_event(event_id="lockloc-1"))
 
-        expected = tmp_path / kiro_crew_sel._TRUST_SUBDIR / kiro_crew_sel._SEL_LOCK_FILE
-        assert expected.exists(), "lock sidecar was not created under the trust dir"
-        assert not list(tmp_path.glob("*.lock")), "a lock file sits beside the log"
+        expected = tmp_path / kiro_crew_sel._SEL_LOCK_FILE
+        assert expected.exists(), "lock sidecar was not created beside the log"
+        assert expected.parent == log._path.parent, "sidecar is not the log's sibling"
+        assert (
+            kiro_crew_sel._SEL_LOCK_FILE in security._CREW_SECRET_LEAVES
+        ), "the sidecar's leaf is not on the sensitive-path deny list"
+
+    def test_lock_path_does_not_vary_with_the_keys_migration_state(self, tmp_path):
+        """Two processes on one log directory must lock the SAME inode.
+
+        The key's location differs BETWEEN processes mid-migration: one whose
+        migration failed keeps signing from the legacy path while a sibling that
+        completed it reads the relocated one. A lock path derived from the key
+        hands those two writers locks on different inodes, and both then append
+        to one log unserialized -- the chain fork this serialization exists to
+        prevent. The path must be a function of the log directory alone, so both
+        states yield one value.
+        """
+        log = SecurityEventLog(base_dir=tmp_path, sync=True)
+        migrated = tmp_path / kiro_crew_sel._TRUST_SUBDIR / kiro_crew_sel._HMAC_KEY_FILE
+        legacy = tmp_path / kiro_crew_sel._HMAC_KEY_FILE
+
+        log._hmac_key_file = migrated
+        as_migrated = log._chain_lock_path()
+        log._hmac_key_file = legacy
+        as_legacy = log._chain_lock_path()
+
+        assert (
+            as_migrated == as_legacy
+        ), "the chain lock path diverges between two processes on one log dir"
+        assert as_legacy == tmp_path / kiro_crew_sel._SEL_LOCK_FILE
+        assert as_legacy != legacy, "the lock is taken on the HMAC key itself"
 
     def test_appends_survive_when_the_trust_dir_is_uncreatable(self, tmp_path):
         """A legacy install that cannot create trust/ must keep auditing.
 
-        When the key loader falls back to the deny-list-protected legacy key
-        (read-only config dir, uncreatable trust dir), the chain lock must
-        follow it there — locking the legacy key file itself — instead of
-        retrying the mkdir on every append, which would drop every best-effort
-        audit and deny every critical action on an install that is otherwise
-        signing fine.
+        The key loader falls back to the legacy key location (read-only config
+        dir, uncreatable trust dir), and the chain lock does NOT follow it there.
+        The sidecar is a pure function of the log directory, which is writable
+        whenever the log itself is, so nothing on the append path retries the
+        failing mkdir and no best-effort audit is dropped. The key file is also
+        never opened as a lock, which is what keeps a writer from leaving a
+        0-byte artifact at the legacy path.
         """
         legacy = tmp_path / kiro_crew_sel._HMAC_KEY_FILE
-        # Windows' CRT text mode treats a trailing 0x1A as DOS EOF. Keep this
-        # input deterministic so opening the binary key as a lock can never
-        # regress to text mode and silently truncate its final byte.
-        legacy.write_bytes(b"k" * 63 + b"\x1a")
+        legacy.write_bytes(b"k" * 64)
         trust = tmp_path / kiro_crew_sel._TRUST_SUBDIR
 
         real_mkdir = Path.mkdir
@@ -609,6 +636,9 @@ log.flush()
         with patch.object(Path, "mkdir", uncreatable_trust):
             log = SecurityEventLog(base_dir=tmp_path, sync=True)
             assert log._hmac_key_file == legacy, "precondition: fallback not taken"
+            assert log._chain_lock_path() == tmp_path / kiro_crew_sel._SEL_LOCK_FILE, (
+                "the chain lock followed the key instead of the log directory"
+            )
             log.log(_make_event(event_id="legacy-lock-crit"), critical=True)
             log.log(_make_event(event_id="legacy-lock-soft"))
 
@@ -616,7 +646,7 @@ log.flush()
         assert "legacy-lock-crit" in body and "legacy-lock-soft" in body
         total, valid = log.verify_integrity()
         assert (total, valid) == (2, 2)
-        # The key bytes are untouched: the lock fd is never written through.
+        # The key bytes are untouched: it is never opened as a lock at all.
         assert legacy.read_bytes() == log._hmac_key
 
     def test_a_byte_range_lock_excludes_on_a_zero_length_file(self, tmp_path):
@@ -651,7 +681,7 @@ log.flush()
         log = SecurityEventLog(base_dir=tmp_path, sync=True)
         log.log(_make_event(event_id="sidecar-1"))
         log.log(_make_event(event_id="sidecar-2"))
-        sidecar = tmp_path / kiro_crew_sel._TRUST_SUBDIR / kiro_crew_sel._SEL_LOCK_FILE
+        sidecar = tmp_path / kiro_crew_sel._SEL_LOCK_FILE
         assert sidecar.exists(), "precondition: the chain lock was taken on the sidecar"
         assert sidecar.stat().st_size == 0, "a byte was written on the way to the lock"
 
@@ -663,8 +693,7 @@ log.flush()
         now must wait for the lock and then append, not fail on the way to it.
         """
         log = SecurityEventLog(base_dir=tmp_path, sync=True)
-        sidecar = tmp_path / kiro_crew_sel._TRUST_SUBDIR / kiro_crew_sel._SEL_LOCK_FILE
-        sidecar.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        sidecar = tmp_path / kiro_crew_sel._SEL_LOCK_FILE
         holder = os.open(sidecar, os.O_CREAT | os.O_RDWR | getattr(os, "O_BINARY", 0), 0o600)
         release = threading.Event()
         logged = threading.Event()
@@ -715,8 +744,7 @@ log.flush()
         log = SecurityEventLog()  # async writer in the session-scoped dir
         log.log(_make_event(event_id="drain-preheat"))
         log.flush()
-        lock_path = log._dir / kiro_crew_sel._TRUST_SUBDIR / kiro_crew_sel._SEL_LOCK_FILE
-        lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        lock_path = log._dir / kiro_crew_sel._SEL_LOCK_FILE
 
         # Stand in for another process holding the chain lock (e.g. prune).
         holder = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
@@ -979,7 +1007,7 @@ log.flush()
         """
         log = SecurityEventLog(base_dir=tmp_path, sync=True)
         log.log(_make_event(event_id="preheat-1"))  # materialize dir + sidecar
-        lock_path = tmp_path / kiro_crew_sel._TRUST_SUBDIR / kiro_crew_sel._SEL_LOCK_FILE
+        lock_path = tmp_path / kiro_crew_sel._SEL_LOCK_FILE
 
         # A second open file description contends with the writer's own, so this
         # stands in for another process holding the lock.
@@ -1006,11 +1034,9 @@ log.flush()
         locks on different inodes, which is the fork this serialization prevents.
         """
         log = SecurityEventLog(base_dir=tmp_path, sync=True)
-        trust = tmp_path / kiro_crew_sel._TRUST_SUBDIR
-        trust.mkdir(mode=0o700, parents=True, exist_ok=True)
         elsewhere = tmp_path / "planted-target"
         elsewhere.write_text("", encoding="utf-8")
-        (trust / kiro_crew_sel._SEL_LOCK_FILE).symlink_to(elsewhere)
+        (tmp_path / kiro_crew_sel._SEL_LOCK_FILE).symlink_to(elsewhere)
 
         with pytest.raises(OSError):
             log.log(_make_event(event_id="symlink-1"), critical=True)
@@ -1021,9 +1047,7 @@ log.flush()
     def test_hard_linked_sidecar_is_refused(self, tmp_path):
         """A second name for the same inode is outside the deny-list's reach."""
         log = SecurityEventLog(base_dir=tmp_path, sync=True)
-        trust = tmp_path / kiro_crew_sel._TRUST_SUBDIR
-        trust.mkdir(mode=0o700, parents=True, exist_ok=True)
-        sidecar = trust / kiro_crew_sel._SEL_LOCK_FILE
+        sidecar = tmp_path / kiro_crew_sel._SEL_LOCK_FILE
         sidecar.write_text("", encoding="utf-8")
         os.link(sidecar, tmp_path / "second-name")
 
@@ -1064,7 +1088,7 @@ log.flush()
         """
         log = SecurityEventLog(base_dir=tmp_path, sync=True)
         log.log(_make_event(event_id="order-preheat"))
-        lock_path = tmp_path / kiro_crew_sel._TRUST_SUBDIR / kiro_crew_sel._SEL_LOCK_FILE
+        lock_path = tmp_path / kiro_crew_sel._SEL_LOCK_FILE
 
         # Stand in for another process holding the sidecar (e.g. tail recovery).
         holder = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
@@ -1134,7 +1158,7 @@ log.flush()
         """
         log = SecurityEventLog(base_dir=tmp_path, sync=True)
         log.log(_make_event(event_id="single-shot-preheat"))
-        lock_path = tmp_path / kiro_crew_sel._TRUST_SUBDIR / kiro_crew_sel._SEL_LOCK_FILE
+        lock_path = tmp_path / kiro_crew_sel._SEL_LOCK_FILE
 
         # Stand in for a sibling process holding the sidecar.
         holder = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
@@ -2265,6 +2289,42 @@ class TestHmacKeyTrustDirMigration:
         assert not (tmp_path / "sel_hmac.key").exists()
         assert any("replaced by the legacy" in r.message for r in caplog.records)
 
+    def test_short_legacy_file_does_not_destroy_a_usable_migrated_key(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A 0-byte legacy file must not replace the key that signed the chain.
+
+        A mixed-binary upgrade window produces exactly this pair: a writer that
+        derives its chain lock from the key location opens the legacy path with
+        ``O_CREAT`` and leaves a 0-byte file behind once a sibling has relocated
+        the real key. Promoting that file destroys the only copy of the signing
+        key, and the minimum-length check then fails init on every later boot, so
+        the loss is unrecoverable rather than merely wrong.
+        """
+        log1 = SecurityEventLog(base_dir=tmp_path, sync=True)
+        log1.log_tool_invocation(session_key="s1", tool_name="t1", tool_kind="tool", outcome="ok")
+        real_key = log1._hmac_key
+        assert len(real_key) >= 32, "precondition: the migrated key is usable"
+        # The artifact an old writer leaves at the legacy path: created, never written.
+        (tmp_path / "sel_hmac.key").write_bytes(b"")
+        self._reset()
+
+        with caplog.at_level("WARNING", logger="kiro_crew.sel"):
+            log2 = SecurityEventLog(base_dir=tmp_path, sync=True)
+
+        assert (
+            tmp_path / "trust" / "sel_hmac.key"
+        ).read_bytes() == real_key, "the 0-byte legacy file was promoted over the real key"
+        assert log2._hmac_key == real_key
+        total, valid = log2.verify_integrity()
+        assert (total, valid) == (1, 1), "the pre-existing chain no longer verifies"
+        assert any("too short to be a key" in r.message for r in caplog.records)
+
+        # The next boot still initializes, because the key was never lost.
+        self._reset()
+        log3 = SecurityEventLog(base_dir=tmp_path, sync=True)
+        assert log3._hmac_key == real_key
+
     @pytest.mark.skipif(os.name == "nt", reason="POSIX symlink semantics")
     def test_linked_trust_dir_is_removed_not_followed(self, tmp_path: Path) -> None:
         """A ``trust`` symlink planted before the upgrade must be removed
@@ -2882,7 +2942,7 @@ class TestRotationIsSerializedAcrossProcesses:
         the chain-lock sidecar's fd and nothing else.
         """
         log = SecurityEventLog(base_dir=sel_dir, sync=True)
-        sidecar = sel_dir / kiro_crew_sel._TRUST_SUBDIR / kiro_crew_sel._SEL_LOCK_FILE
+        sidecar = sel_dir / kiro_crew_sel._SEL_LOCK_FILE
         real_file_lock = platform_compat.file_lock
 
         def rotation_must_not_block(fd, *, exclusive):
