@@ -173,13 +173,25 @@ test("client-only: the local-start offer routes through a re-exec on a crew's po
   );
   assert.match(source, /remotePort: remoteConfig\?\.remotePort \|\| ""/);
   // The successor re-runs port selection and lands on a port THIS process never
-  // served, so the handshake watches the predicted port. Polling this process's
-  // own port times out against a healthy successor and then kills it.
-  assert.match(source, /function relaunchViaConfirmedSuccessor\(onFailed, \{ expectPort = PORT \} = \{\}\)/);
+  // served, so the handshake watches the port this process chose and pinned.
+  // Polling this process's own port times out against a healthy successor and
+  // then kills it.
+  assert.match(source, /async function relaunchViaConfirmedSuccessor\(onFailed, \{ expectPort = PORT, pinPort = false \} = \{\}\)/);
   assert.match(source, /const readyUrl = `http:\/\/localhost:\$\{expectPort\}\$\{READY_PATH\}`;/);
   assert.match(source, /await fetchGatewayReadiness\(readyUrl\)/);
   assert.match(source, /const successorPort = predictLocalPort\(\);/);
-  assert.match(source, /\}, \{ expectPort: successorPort \}\);/);
+  assert.match(source, /\}, \{ expectPort: successorPort, pinPort: true \}\);/);
+  // Pinning the port is what makes the watched port and the bound port one
+  // value: the successor reads KIROCREW_PORT ahead of its own selection.
+  assert.match(
+    source,
+    /if \(pinPort\) \{\n {6}spawnOptions\.env = \{ \.\.\.processObj\.env, KIROCREW_PORT: String\(expectPort\) \};/,
+  );
+  // A port that already answers cannot distinguish a successor from a gateway
+  // some other install or terminal started, so confirming there would exit this
+  // instance on a stranger's liveness. Only "unknown" is silence: a bound legacy
+  // gateway still answers, and a draining one is a gateway too.
+  assert.match(source, /const occupant = await fetchGatewayReadiness\(readyUrl\);\n {4}if \(occupant !== "unknown"\) \{/);
   // The relaunch poll specifically must not be the bare call: that one reads this
   // process's BACKEND_URL, which is the abandoned crew port on the re-exec path.
   // Two unrelated call sites legitimately take no argument, so the probe reads
@@ -191,6 +203,27 @@ test("client-only: the local-start offer routes through a re-exec on a crew's po
   const relaunchBody = source.slice(relaunchStart, relaunchEnd);
   assert.match(relaunchBody, /await fetchGatewayReadiness\(readyUrl\)/);
   assert.doesNotMatch(relaunchBody, /await fetchGatewayReadiness\(\);/);
+  // Order is the whole point of the check: refusing after the spawn, the lock
+  // release or the splash swap would already have torn this instance down. So
+  // the occupancy read must sit ahead of the spawn and of every teardown step,
+  // and the refusal must hand back to the caller instead of continuing.
+  const occupantAt = relaunchBody.indexOf("const occupant = await fetchGatewayReadiness(readyUrl);");
+  const refusalAt = relaunchBody.indexOf("onFailed();\n      return;");
+  const spawnAt = relaunchBody.indexOf("spawn(target, args, spawnOptions)");
+  const releaseAt = relaunchBody.indexOf("app.releaseSingleInstanceLock()");
+  const splashAt = relaunchBody.indexOf("livenessMonitor.stop()");
+  assert.ok(occupantAt > 0, "the occupancy read must be inside this function");
+  assert.ok(refusalAt > occupantAt, "the refusal must follow the occupancy read");
+  for (const [name, at] of [["spawn", spawnAt], ["lock release", releaseAt], ["monitor stop", splashAt]]) {
+    assert.ok(at > 0, `${name} must be inside this function`);
+    assert.ok(occupantAt < at, `the occupancy read must precede the ${name}`);
+  }
+  // A failed handoff withholds the button, so the record the reopened dialog
+  // reads must not still advertise it.
+  assert.match(
+    source,
+    /localStartRelaunchFailed = true;[\s\S]*?if \(gatewayStartFailure\) gatewayStartFailure\.canStartHere = false;/,
+  );
   // One predicate answers for both the button and the sentence, so the dialog
   // cannot render a button the message says is absent.
   assert.match(source, /canStartHere: canOfferLocalStart\(true, remoteHost\)/);

@@ -260,18 +260,31 @@ function createGatewaySupervisor({
    * Node's "spawn" event only proves the exec succeeded: a bundle intact
    * enough to exec and broken enough to crash during initialization would
    * still take the app down. The handshake is therefore the successor's own
-   * gateway answering on the port: it was silent when this handoff began (the
-   * child that owned it exited or never started), so an answer there means
-   * the successor booted, ran its supervisor, and started a serving backend.
-   * A 503 "starting" counts too: the successor's gateway is bound and only
-   * still restoring sessions.
+   * gateway answering on the port, and it carries that meaning only while the
+   * port is silent to begin with. Silence is checked here rather than assumed:
+   * a gateway a separate install or a terminal launched answers exactly like a
+   * successor would, and confirming on it would exit this instance on a
+   * stranger's liveness. So an occupied port abandons the handoff with this
+   * instance untouched, and only a port that answered nothing before the spawn
+   * can confirm one. An answer on a port that was silent means the successor
+   * booted, ran its supervisor, and started a serving backend. A 503 "starting"
+   * counts too: the successor's gateway is bound and only still restoring
+   * sessions.
+   *
+   * What remains is a bind between the check and the successor's own bind. That
+   * window is the spawn itself, and losing it costs a killed successor and a
+   * surfaced failure rather than an app that exits into nothing, because the
+   * check is what stands between a foreign gateway and `app.exit`.
    *
    * Which port carries that handshake belongs to the caller. A bundle upgrade
    * re-execs the same configuration, so the successor binds this process's own
-   * port. Turning the local gateway back on does not: the successor re-runs port
-   * selection with the setting now on, and selection refuses a port a configured
-   * crew claims, so it binds a different one. Polling this process's port there
-   * would time out against a healthy successor and then kill it.
+   * port and inherits the environment that chose it. Turning the local gateway
+   * back on does not: the successor would re-run port selection with the setting
+   * now on, and an inherited `KIROCREW_PORT` outranks that selection, so the
+   * successor could bind a port this process is not watching and be killed while
+   * healthy. That caller therefore pins its chosen port into the successor's
+   * environment, which makes the watched port and the bound port one value
+   * instead of two answers that have to agree.
    *
    * Everything short of that is a failure with this instance still alive:
    * a spawn error (ENOENT on a pruned bundle), the successor exiting before
@@ -290,11 +303,24 @@ function createGatewaySupervisor({
    * @param {() => void} onFailed  the caller's ordinary failure bookkeeping.
    * @param {object} [options]
    * @param {number} [options.expectPort]  port the successor will serve on.
+   * @param {boolean} [options.pinPort]  put expectPort in the successor's
+   *        environment, for a caller choosing a port rather than predicting the
+   *        one the successor would select for itself.
    */
-  function relaunchViaConfirmedSuccessor(onFailed, { expectPort = PORT } = {}) {
+  async function relaunchViaConfirmedSuccessor(onFailed, { expectPort = PORT, pinPort = false } = {}) {
     const readyUrl = `http://localhost:${expectPort}${READY_PATH}`;
     const target = processObj.execPath;
     const args = Array.isArray(processObj.argv) ? processObj.argv.slice(1) : [];
+    // Before anything is torn down, since abandoning the handoff has to leave
+    // this instance exactly as it stands. Only "unknown" is silence: a legacy
+    // gateway with no readiness endpoint still answers 404 on a bound port, and
+    // a draining one is a gateway too.
+    const occupant = await fetchGatewayReadiness(readyUrl);
+    if (occupant !== "unknown") {
+      glog(`:${expectPort} already answers (${occupant}) — cannot tell a successor from that gateway, so surfacing the failure instead of handing off`);
+      onFailed();
+      return;
+    }
     const midSession = livenessMonitor !== null;
     if (livenessMonitor) {
       livenessMonitor.stop();
@@ -323,7 +349,11 @@ function createGatewaySupervisor({
       if (pollTimer) { clearTimeoutFn(pollTimer); pollTimer = null; }
       if (deadlineTimer) { clearTimeoutFn(deadlineTimer); deadlineTimer = null; }
     };
-    const successor = spawn(target, args, { detached: true, stdio: "ignore" });
+    const spawnOptions = { detached: true, stdio: "ignore" };
+    if (pinPort) {
+      spawnOptions.env = { ...processObj.env, KIROCREW_PORT: String(expectPort) };
+    }
+    const successor = spawn(target, args, spawnOptions);
 
     const fail = (reason) => {
       if (settled) return;
@@ -972,9 +1002,8 @@ function createGatewaySupervisor({
         return true;
       }
       glog(`stale bundle persists after re-resolve (${cause} on bin=${bin}) — starting a fresh copy of the app from ${processObj.execPath}`);
-      relaunchViaConfirmedSuccessor(giveUp);
-      return true;
-    };
+      void relaunchViaConfirmedSuccessor(giveUp);
+      return true;    };
 
     child.on("error", (error) => {
       userError(`spawn ERROR code=${error.code || "?"} msg=${error.message}`);
@@ -1825,19 +1854,23 @@ function createGatewaySupervisor({
             // the crew, so a gateway started here would bind the crew's port.
             // Port selection reads the setting once per process, so only a fresh
             // process can pick a local port. The successor therefore lands on a
-            // port this one never served, and the handshake has to watch that
-            // port: the same pure selection function answers for both, so the
-            // prediction cannot drift from what the successor picks. This process
-            // stays client-only: the setting is persisted either way, so a manual
-            // launch also recovers.
+            // port this one never served, and this process chooses that port and
+            // pins it into the successor's environment, so the port it watches is
+            // the port the successor binds. This process stays client-only: the
+            // setting is persisted either way, so a manual launch also recovers.
             const successorPort = predictLocalPort();
             glog(`re-execing so port selection runs again; expecting the successor on :${successorPort}`);
-            relaunchViaConfirmedSuccessor(() => {
+            void relaunchViaConfirmedSuccessor(() => {
               localStartRelaunchFailed = true;
+              // canOfferLocalStart withholds the button once this flag is set, so
+              // the failure record must stop offering it too: the dialog reads
+              // this record when it reopens, and a record that still claims the
+              // button is available describes a control the user cannot see.
+              if (gatewayStartFailure) gatewayStartFailure.canStartHere = false;
               glog("successor never served; this process stays client-only and the setting is on for the next launch");
               showLoadingThenConnect(window, targetBackendUrl, { initialPath })
                 .catch((error) => glog(`resurfacing the gateway failure failed: ${error && error.message}`));
-            }, { expectPort: successorPort });
+            }, { expectPort: successorPort, pinPort: true });
             return;
           }
           runLocalGateway = true;
