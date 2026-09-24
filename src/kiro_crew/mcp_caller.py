@@ -123,6 +123,29 @@ TENANT_SCHEMA_VERSION = 1
 #: 64 bits does that for any number of connections a gateway will ever hold.
 _TENANT_NONCE_BYTES = 8
 
+#: Servers whose POOLED separation rests on the nonce above, by name.
+#:
+#: Membership is a statement about the BACKEND: for a caller the gateway cannot
+#: name, this server keeps per-tenant state and separates it by the nonce, so one
+#: pooled process serving N unnamed connections is separated only while a nonce
+#: keeps arriving. ``kirocrew-computer`` is the case — its
+#: ``_unresolved_session_key`` composes ``unresolved:<pid>#<nonce>`` and hands
+#: that to ``SnapshotIndex``, so without the nonce half every unnamed co-tenant
+#: of one pooled process holds a single namespace.
+#:
+#: The stub reads this to refuse the one combination nothing downstream can
+#: detect: pooling asked for, and a serving daemon that mints no nonce (see
+#: ``mcp_gateway.stub.must_degrade_nonce_blind``). Absence of the tenant block is
+#: ambiguous at the backend by construction — for an unnamed caller it is also
+#: what a 1:1 topology with no gateway at all looks like, and there the
+#: per-process fallback is correct — so the judgement has to be made on the
+#: handshake, where the daemon's own attestation is readable.
+#:
+#: A NAME set, like the discovery classification: the stub decides before any
+#: backend module has been imported, and importing one to ask would put package
+#: code on the handshake path.
+POOLING_REQUIRES_TENANT_NONCE: frozenset[str] = frozenset({"kirocrew-computer"})
+
 #: Process-lifetime cache of a RESOLVED ``from_env()`` identity. The env var
 #: and ancestor pidfile chain are immutable once present, so the walk need run
 #: at most once. The walk does not fork ``ps`` per ancestor (``_parent_pid``
