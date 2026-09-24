@@ -6068,12 +6068,17 @@ class TestAdaptiveHomeTargetsExpiry:
     ) -> None:
         """The other half: without a symlink there is nothing a repoint can stale.
 
-        This is what keeps the fix above from being a blanket revert. When no
-        target's canonical form differs from its lexical one, the set holds no
-        resolution-derived entry, so reaching the stale-credential case requires
+        This is what keeps the fix above from being a blanket revert. When none of
+        the paths the build RESOLVED came back spelled differently, the set holds
+        no resolution-derived entry, so reaching the stale-credential case requires
         first CREATING a symlink inside the crew home -- a write
         ``is_sensitive_write_path`` refuses. The adaptive expiry therefore applies
         in full, which is the availability this PR is for.
+
+        The population that can report a difference is the narrow one
+        ``_BuiltTargets`` enumerates, not the built target set: this host sets
+        ``KIROCREW_HOME`` and nothing else, so an ordinary symlinked dotfile under
+        ``$HOME`` would not report one either.
         """
         from kiro_crew import security
 
@@ -6099,6 +6104,84 @@ class TestAdaptiveHomeTargetsExpiry:
         clock["now"] += security._home_targets_ttl(0.4, resolution_differed=False)
         security._home_dir_targets(security._SENSITIVE_HOME_DIRS)
         assert len(calls) == 2
+
+    def test_only_the_enumerated_classes_of_path_are_resolved_by_a_build(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """Pin the resolve memo's population, which four prose sites enumerate.
+
+        ``resolution_differed`` is read off the memo the build fills, so WHICH
+        paths reach that memo is the flag's whole scope -- and the ``differed``
+        comment, the :class:`_BuiltTargets` and :func:`_home_targets_ttl`
+        docstrings and the security spec all state that scope as a closed list.
+        Prose cannot hold a closed list shut. A future ``resolve_target`` call on a
+        sixth kind of path would widen what the flag reports while all four sites
+        went on describing the old set, which is exactly the documentation defect
+        this change exists to remove, reintroduced one call site later.
+
+        The expectation is DERIVED from the same constants the build reads rather
+        than spelled out here, so adding a sensitive LEAF keeps this passing and
+        adding a resolve CALL SITE fails it.
+        """
+        from kiro_crew.security import paths as gate
+
+        crew_home = tmp_path / "crew"
+        crew_home.mkdir()
+        kiro_home = tmp_path / "kiro"
+        kiro_home.mkdir()
+        os_home = tmp_path / "oshome"
+        os_home.mkdir()
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("KIROCREW_HOME", str(crew_home))
+        monkeypatch.setenv("KIRO_HOME", str(kiro_home))
+        monkeypatch.setenv("KIROCREW_OS_HOME", str(os_home))
+        self._clear()
+
+        # Resolve the roots BEFORE recording and pass them in, so the recorder
+        # sees the BUILD's own resolutions and not the root anchoring ahead of it.
+        roots = gate._resolved_root_key()
+        tier = gate._WRITE_PROTECTED_HOME_PATHS
+
+        asked: list[str] = []
+        real = gate._realpath_or_none
+
+        def recording(path: str) -> str | None:
+            asked.append(path)
+            return real(path)
+
+        monkeypatch.setattr(gate, "_realpath_or_none", recording)
+        gate._home_dir_targets_uncached(tier, roots)
+
+        expected = {roots.home}
+        if roots.os_home:
+            expected.add(roots.os_home)
+        if roots.crew_home:
+            for entry in tier:
+                for prefix in gate._CREW_HOME_PREFIXES:
+                    if entry == prefix or entry.startswith(prefix + "/"):
+                        leaf = entry[len(prefix) :].lstrip("/")
+                        expected.add(
+                            os.path.join(roots.crew_home, *gate._leaf_segments(leaf))
+                            if leaf
+                            else roots.crew_home
+                        )
+                        break
+        if roots.kiro_home and gate._KIRO_AGENTS_DIR in tier:
+            expected.add(os.path.join(roots.kiro_home, "agents"))
+        adapter_roots = dict(roots.adapter_roots)
+        for leaf, root_envs, under_root in gate._OVERRIDE_ANCHORED_LEAVES:
+            if leaf not in tier:
+                continue
+            for env_name in root_envs:
+                root = adapter_roots.get(env_name)
+                if root:
+                    expected.add(os.path.join(root, *gate._leaf_segments(under_root)))
+
+        assert set(asked) == expected, (
+            "this build resolved a path outside the classes the prose enumerates, so "
+            "the flag's scope changed: update the differed comment, _BuiltTargets, "
+            "_home_targets_ttl, _report_expiry_pin and the security spec together"
+        )
 
     def test_a_builder_that_reports_nothing_gets_the_floor(self, monkeypatch, tmp_path) -> None:
         """An unknown build is treated as having traversed a symlink.
@@ -6190,9 +6273,10 @@ class TestAdaptiveHomeTargetsExpiry:
     def test_the_pin_is_reported_once_per_transition(self, caplog) -> None:
         """The diagnostic exists so the fix cannot self-disable in silence.
 
-        One line per TRANSITION, not per rebuild: a stow or chezmoi home pins the
-        floor on every build, and a per-build line would be noise that gets
-        filtered, which is the same as having none.
+        One line per TRANSITION, not per rebuild: an install whose resolved leaf
+        under a home-override root is a symlink pins the floor on every build, and
+        a per-build line would be noise that gets filtered, which is the same as
+        having none.
         """
         from kiro_crew.security import paths as gate
 
