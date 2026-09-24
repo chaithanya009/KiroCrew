@@ -2535,6 +2535,77 @@ def _first_linked_component_below(root: str, leaf: str) -> str | None:
     return None
 
 
+def _masked_crew_home_roots() -> list[str]:
+    """Every crew data home the masks cover, de-duplicated, live one first.
+
+    The mask lists are NOT scoped to the live home, and that is the whole reason this
+    helper exists. :func:`_crew_home_entries` expands each hidden leaf across both
+    :data:`_CREW_HOME_PREFIXES`, so ``~/.kiro/crew/.env`` and ``~/.kirocrew/.env`` are
+    both masked whichever one ``config_dir()`` resolves to, and
+    :func:`_relocated_crew_targets` adds the resolved home on top when ``KIROCREW_HOME``
+    moves it out from under ``$HOME``. A check that resolves ``config_dir()`` alone
+    therefore judges one of the homes the launcher masks and none of the others.
+
+    Ordered live-home-first so a refusal names the home the operator is most likely
+    looking at, and de-duplicated so a relocation that happens to coincide with a prefix
+    is visited once.
+
+    Never raises. A home that cannot be resolved contributes nothing and the remaining
+    roots still apply, because every caller here is a read that reports what it finds --
+    a probe that cannot resolve a path must not turn that into a verdict about the host.
+    """
+    roots: list[str] = []
+    try:
+        roots.append(str(config_dir()))
+    except Exception:  # pragma: no cover - defensive; a spawn must not fail on this
+        logger.debug("could not resolve the crew data home for the masked-leaf pass", exc_info=True)
+    try:
+        home = Path.home()
+        roots.extend(str(home / Path(prefix)) for prefix in _CREW_HOME_PREFIXES)
+    except Exception:  # pragma: no cover - defensive
+        logger.debug("could not resolve $HOME for the masked-leaf pass", exc_info=True)
+    return list(dict.fromkeys(roots))
+
+
+def _refuse_multilinked_credential_leaves() -> None:
+    """Refuse the spawn when a masked CREDENTIAL leaf has a second hard link, in ANY home.
+
+    Owns that refusal for every masked home rather than for the live one, because the masks
+    cover every home (see :func:`_masked_crew_home_roots`) while ``config_dir()`` names one.
+    A ``.env`` under an un-migrated ``~/.kirocrew``, or one sitting in the default home
+    under a ``KIROCREW_HOME`` relocation, holds live channel tokens and is masked; a second
+    hard link on it reaches those bytes through a name no mask covers, which is exactly the
+    condition this refusal exists to stop. Scoping the check to the live home would leave
+    the ordinary layouts this codebase provides for unchecked, so the leaf would be
+    masked-but-unjudged and the spawn would proceed.
+
+    Only the HARD-LINK condition, and only the credential leaves. The symlink and
+    linked-component refusals in :func:`_refuse_aliased_masked_leaves` stay live-home-only
+    deliberately: a host part-way through a migration legitimately points the legacy home
+    AT the live one, and refusing every spawn for that layout would break working hosts
+    while closing nothing -- the two names then share a single inode, which the live home's
+    own pass already judges.
+
+    A leaf that is absent, is a link, or is not a regular file is skipped: only a regular
+    file can carry a second hard link, and ``lstat`` never follows a link, so the symlink
+    case belongs to the pass that has a sentence for it.
+    """
+    for root in _masked_crew_home_roots():
+        for leaf in sorted(_CREW_HARDLINK_REFUSED_LEAVES):
+            target = os.path.join(root, leaf)
+            try:
+                info = os.lstat(target)
+            except FileNotFoundError:
+                continue
+            except OSError:
+                # A path this process cannot classify is judged by the live home's pass,
+                # which has the fail-closed sentence for it. Escalating here would refuse
+                # every spawn for an unreadable path in a home nothing is using.
+                continue
+            if stat.S_ISREG(info.st_mode) and info.st_nlink > 1:
+                raise SandboxCeilingUnsealable(_masked_leaf_multilink_detail(target, info.st_nlink))
+
+
 def _refuse_aliased_masked_leaves() -> None:
     """Refuse the spawn when a MASKED leaf is reachable under a second name.
 
@@ -2577,6 +2648,11 @@ def _refuse_aliased_masked_leaves() -> None:
     a leaf masked only so an agent cannot WRITE it, the reader re-validates the content and
     a spawn-wide outage is not proportionate. Either way the warning is emitted HERE rather
     than left to :func:`_warn_if_alias_backed`, which never runs over these leaves.
+
+    The credential refusal itself is issued by :func:`_refuse_multilinked_credential_leaves`,
+    called at the end of this pass, because it has to cover EVERY masked home while this
+    loop covers ``config_dir()``. The symlink and linked-component refusals stay scoped to
+    this one home on purpose; that function's docstring gives the reason.
 
     A TOLERATED leaf is VISITED and WARNED, never skipped. Excluding it from the walk is the
     same silence one level along: a symlinked ``.env`` carries live channel tokens and is
@@ -2668,7 +2744,9 @@ def _refuse_aliased_masked_leaves() -> None:
             )
         if stat.S_ISREG(info.st_mode) and info.st_nlink > 1:
             if leaf in _CREW_HARDLINK_REFUSED_LEAVES:
-                raise SandboxCeilingUnsealable(_masked_leaf_multilink_detail(target, info.st_nlink))
+                # Refused by _refuse_multilinked_credential_leaves, which owns this
+                # condition across EVERY masked home rather than this loop's single one.
+                continue
             logger.warning(
                 "sandbox: the masked path %s has %d hardlinks. The mask covers this path "
                 "only, so a read or write through another name reaches the same inode. "
@@ -2678,6 +2756,10 @@ def _refuse_aliased_masked_leaves() -> None:
                 target,
                 info.st_nlink,
             )
+    # Every masked home, not just this loop's. The credential leaves are masked under each
+    # crew-home spelling and under a relocated home, so the refusal has to cover the same
+    # set the masks do.
+    _refuse_multilinked_credential_leaves()
 
 
 def _masked_leaf_multilink_detail(target: str, links: int) -> str:
@@ -2725,22 +2807,24 @@ def masked_credential_leaf_aliases() -> list[tuple[str, int]]:
     fault, because doctor must not turn its own probe failure into a verdict about the host.
     An absent leaf has no second name by construction.
 
+    Covers EVERY masked home (:func:`_masked_crew_home_roots`), the same set
+    :func:`_refuse_multilinked_credential_leaves` judges. A probe narrower than the refusal
+    is worse than no probe: it reports a clean host and the next spawn refuses anyway, which
+    is the failure this read exists to prevent.
+
     Returns the leaf path and its link count, so the caller renders the same sentence the
     spawn would refuse with instead of paraphrasing it.
     """
-    try:
-        root = str(config_dir())
-    except Exception:
-        return []
     found: list[tuple[str, int]] = []
-    for leaf in sorted(_CREW_HARDLINK_REFUSED_LEAVES):
-        target = os.path.join(root, leaf)
-        try:
-            info = os.lstat(target)
-        except OSError:
-            continue
-        if stat.S_ISREG(info.st_mode) and info.st_nlink > 1:
-            found.append((target, info.st_nlink))
+    for root in _masked_crew_home_roots():
+        for leaf in sorted(_CREW_HARDLINK_REFUSED_LEAVES):
+            target = os.path.join(root, leaf)
+            try:
+                info = os.lstat(target)
+            except OSError:
+                continue
+            if stat.S_ISREG(info.st_mode) and info.st_nlink > 1:
+                found.append((target, info.st_nlink))
     return found
 
 
@@ -3228,17 +3312,7 @@ def _sweep_legacy_auth_store_temps() -> list[str]:
     refuse the spawn, naming the path -- launching would hand the agent the signing key.
     """
     removed: list[str] = []
-    roots: list[str] = []
-    try:
-        roots.append(str(config_dir()))
-    except Exception:  # pragma: no cover - defensive; a spawn must not fail on this
-        logger.debug("could not resolve the crew data home for the auth-store sweep", exc_info=True)
-    try:
-        home = Path.home()
-        roots.extend(str(home / Path(prefix)) for prefix in _CREW_HOME_PREFIXES)
-    except Exception:  # pragma: no cover - defensive
-        logger.debug("could not resolve $HOME for the auth-store sweep", exc_info=True)
-    for root in dict.fromkeys(roots):
+    for root in _masked_crew_home_roots():
         dir_fd = _open_dir_anchored(root, ())
         if dir_fd is None:
             continue

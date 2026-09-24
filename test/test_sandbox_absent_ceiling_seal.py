@@ -68,10 +68,21 @@ def _no_host_ssh_probe(monkeypatch):
 
 @pytest.fixture()
 def crew_home(tmp_path, monkeypatch):
-    """Point ``config_dir()`` — the live data home — at a scratch tree."""
+    """Point ``config_dir()`` — the live data home — at a scratch tree.
+
+    ``Path.home`` is pinned at the same scratch root, and that half is load-bearing rather
+    than tidiness. The masked-leaf passes resolve EVERY crew-home spelling
+    (:func:`sandbox._masked_crew_home_roots`), because the masks cover every spelling and a
+    check scoped to the live home alone would judge one of them. Under a bare
+    ``config_dir()`` patch those passes would read ``$HOME/.kiro/crew`` and
+    ``$HOME/.kirocrew`` on the machine running the suite, so a developer whose real data
+    home happens to hold a hard-linked credential leaf would see refusals from tests that
+    never created one.
+    """
     home = tmp_path / ".kiro" / "crew"
     home.mkdir(parents=True)
     monkeypatch.setattr(sandbox, "config_dir", lambda: home)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
     return home
 
 
@@ -671,6 +682,90 @@ class TestAMaskedCredentialLeafRefusesASecondHardLink:
         with pytest.raises(OSError):
             os.link(target, crew_home / "diag-alias")
 
+    def test_a_credential_leaf_in_the_LEGACY_home_spelling_refuses(self, crew_home, tmp_path):
+        """The masks cover both spellings, so a check on the live one alone judges half.
+
+        ``_crew_home_entries`` expands every hidden leaf across both
+        ``_CREW_HOME_PREFIXES``, so ``~/.kirocrew/.env`` is masked and holds live channel
+        tokens whichever spelling ``config_dir()`` resolves to. A second hard link on it
+        reaches those bytes under a name no mask covers.
+        """
+        legacy = tmp_path / ".kirocrew"
+        legacy.mkdir()
+        target = legacy / ".env"
+        target.write_text("SLACK_BOT_TOKEN=x\n", encoding="utf-8")
+        os.link(target, legacy / "env-alias")
+        assert target.stat().st_nlink == 2
+
+        with pytest.raises(sandbox.SandboxCeilingUnsealable) as caught:
+            sandbox._refuse_aliased_masked_leaves()
+        assert ".env" in str(caught.value)
+        assert "hard links" in str(caught.value)
+
+    def test_a_credential_leaf_left_in_the_DEFAULT_home_by_a_relocation_refuses(
+        self, tmp_path, monkeypatch
+    ):
+        """A relocated ``KIROCREW_HOME`` needs no migration history to reach this.
+
+        ``_relocated_crew_targets`` masks the resolved home ON TOP of the ``$HOME``-relative
+        spellings, so both the relocated home AND the default one are masked at once. A
+        signing key left in the default home is then masked, unread by a live-home-only
+        check, and readable through a second name.
+        """
+        relocated = tmp_path / "srv" / "crew"
+        relocated.mkdir(parents=True)
+        monkeypatch.setattr(sandbox, "config_dir", lambda: relocated)
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+        default = tmp_path / ".kiro" / "crew"
+        default.mkdir(parents=True)
+        stranded = default / "token_signing.key"
+        stranded.write_bytes(b"k" * 32)
+        os.link(stranded, default / "key-alias")
+
+        with pytest.raises(sandbox.SandboxCeilingUnsealable) as caught:
+            sandbox._refuse_aliased_masked_leaves()
+        assert "token_signing.key" in str(caught.value)
+
+    def test_an_integrity_leaf_in_a_NON_LIVE_home_still_does_not_refuse(
+        self, crew_home, tmp_path, caplog
+    ):
+        """The widening carries the credential/integrity split with it, not past it.
+
+        Without this the cross-home pass could quietly refuse on every masked leaf in a
+        second home while the live home still warns for the same shape, which is a
+        different rule in each home.
+        """
+        leaf = _HARDLINK_TOLERATED_FILE_LEAVES[0]
+        legacy = tmp_path / ".kirocrew"
+        target = legacy / leaf
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("{}\n", encoding="utf-8")
+        os.link(target, legacy / f"alias-{leaf.replace('/', '-')}")
+
+        with caplog.at_level("WARNING"):
+            sandbox._refuse_aliased_masked_leaves()  # does not raise
+
+    def test_a_symlinked_legacy_home_does_not_refuse_the_spawn(self, crew_home, tmp_path):
+        """The layout a part-migrated host actually has must keep starting agents.
+
+        Pointing the legacy home AT the live one is the ordinary migration shape. Both names
+        then reach ONE inode, whose link count the live home's own pass already judges, so
+        refusing here would break a working host to close nothing.
+        """
+        (tmp_path / ".kirocrew").symlink_to(crew_home, target_is_directory=True)
+        target = crew_home / ".env"
+        target.write_text("SLACK_BOT_TOKEN=x\n", encoding="utf-8")
+        assert target.stat().st_nlink == 1
+
+        sandbox._refuse_aliased_masked_leaves()  # does not raise
+
+    def test_the_roots_cover_every_spelling_the_masks_do(self, crew_home, tmp_path):
+        """The refusal's root set and the mask's prefix set must not drift apart."""
+        roots = sandbox._masked_crew_home_roots()
+        for prefix in sandbox._CREW_HOME_PREFIXES:
+            assert str(tmp_path / Path(prefix)) in roots, f"{prefix} is masked but unchecked"
+        assert len(roots) == len(set(roots)), "a root repeated means one leaf is stat-ed twice"
+
     def test_the_refused_set_names_only_masked_leaves(self):
         """An entry outside ``_CREW_HIDDEN_LEAVES`` would refuse over a path nothing masks.
 
@@ -737,6 +832,54 @@ class TestTheDoctorReadOfMaskedCredentialAliases:
         (crew_home / "token_signing.key").write_bytes(b"key")
 
         assert sandbox.masked_credential_leaf_aliases() == []
+
+    def test_it_reports_an_aliased_leaf_in_a_NON_LIVE_masked_home(self, crew_home, tmp_path):
+        """A probe narrower than the refusal is worse than none at all.
+
+        It would report a clean host and the next spawn would refuse anyway, which is the
+        outage this read exists to pre-empt. So the probe walks the same homes the refusal
+        does.
+        """
+        legacy = tmp_path / ".kirocrew"
+        legacy.mkdir()
+        stranded = legacy / "token_signing.key"
+        stranded.write_bytes(b"k" * 32)
+        os.link(stranded, legacy / "alias")
+
+        found = sandbox.masked_credential_leaf_aliases()
+
+        assert (str(stranded), 2) in found
+
+    def test_the_probe_and_the_refusal_read_the_same_homes(self):
+        """Pinned as one source, because two lists that must agree are a list that drifts.
+
+        Judged on the executable body with the docstring dropped: both functions DISCUSS
+        ``config_dir()`` in prose, which is exactly the gap they explain, so scanning raw
+        source would fail on the explanation instead of on the code.
+        """
+        import ast
+
+        def code_only(func) -> str:
+            tree = ast.parse(textwrap.dedent(inspect.getsource(func)))
+            body = tree.body[0].body
+            if (
+                body
+                and isinstance(body[0], ast.Expr)
+                and isinstance(body[0].value, ast.Constant)
+                and isinstance(body[0].value.value, str)
+            ):
+                body = body[1:]
+            return "\n".join(ast.unparse(node) for node in body)
+
+        for func in (
+            sandbox.masked_credential_leaf_aliases,
+            sandbox._refuse_multilinked_credential_leaves,
+        ):
+            body = code_only(func)
+            assert "_masked_crew_home_roots()" in body, f"{func.__name__} does not read every home"
+            assert (
+                "config_dir()" not in body
+            ), f"{func.__name__} resolves the live home alone, which is the gap itself"
 
     def test_it_creates_nothing(self, crew_home):
         before = sorted(p.name for p in crew_home.iterdir())
@@ -1610,6 +1753,7 @@ class TestTheAuthStoreStagingLeafIsSpelledOnceInEffect:
         assert sandbox._AUTH_STORE_STAGING_LEAF in sandbox._CREW_PRECREATE_HIDDEN_DIR_LEAVES
 
 
+@_POSIX_ONLY
 class TestTheLegacyAuthStoreTempSweep:
     """Pre-upgrade signing-key temps in the data-home root are removed on spawn.
 
@@ -1618,6 +1762,16 @@ class TestTheLegacyAuthStoreTempSweep:
     ``atomic_write`` stages ``tmp<random>.tmp`` in it for unrelated stores. So the control
     test below -- an unrelated temp SURVIVES -- is what proves this sweep cannot unlink
     another component's in-flight write between its ``mkstemp`` and its rename.
+
+    POSIX-only for a reason that is a property of the code under test, not of the test.
+    The sweep lists and unlinks through a PINNED DIRECTORY DESCRIPTOR -- ``os.listdir(fd)``
+    and ``os.unlink(..., dir_fd=fd)`` from :func:`_open_dir_anchored` -- which is how it
+    refuses to delete through a component swapped under it. Windows offers none of that
+    family, so the descriptor open fails, the sweep skips every root and removes nothing.
+    That is correct rather than broken: its only callers are the Linux namespace launcher
+    and the macOS Seatbelt builder, and Windows has no sandbox launcher to call it. Running
+    these assertions there would measure the absence of a code path instead of its
+    behaviour, and the bound control would pass while discriminating nothing.
     """
 
     @pytest.fixture
