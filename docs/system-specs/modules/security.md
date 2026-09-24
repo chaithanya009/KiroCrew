@@ -1459,6 +1459,69 @@ injected agent and a click. Pinned by
 behaviourally AND asserts over the AST that `on_tool_call` references no
 mutating-kind denylist.
 
+### Sanctioned read channels over fenced data
+
+The identity-store fence (`identity_stores.py::IDENTITY_STORE_ROOTS`, spliced into
+`security/paths.py::_SENSITIVE_HOME_DIRS`) is a coarse, verb-independent path matcher, and
+that coarseness is deliberate. Some legitimate work still needs data it covers or guards:
+an agent diagnosing the runtime it drives needs that runtime's protocol logs. The answer is
+a **channel** — one reviewed code path with its own declared source list — never a
+carve-out on the matcher. `kiro_cli_logs` (`mcp_tools/logs.py`, backed by
+`diagnostics.read_kiro_cli_logs`) is the worked example. Any further channel, including a
+read-only inventory of the governance trust root, is held to the same three clauses.
+
+**1. Scope is a declared source list, and the test is conversation content.** A channel
+enumerates its own sources and never widens `security/paths.py::is_sensitive_path`. Sharing
+alone is not the disqualifier, and that is this clause's sharpest edge: `mcp.log` and
+`lsp.log` have the same single-fixed-path, all-sessions-interleaved shape as
+`kiro-chat.log`, so payload content is the only thing separating them. What disqualifies a
+source is carrying **conversation content** not attributable to the calling session.
+`kiro-chat.log` and the `sessions/cli/<sid>.jsonl` transcripts both do, and clause 2's
+redaction is a credential pass that does not narrow prose, so no amount of scrubbing makes
+them readable here. The protocol logs explain a rejected turn without carrying the
+conversation, so `read_kiro_cli_logs` reads those and names neither of the other two.
+
+That content property belongs to a component this repository neither builds nor pins, so a
+channel carries a **fail-closed tripwire** rather than a standing assumption.
+`diagnostics._looks_like_protocol_frames` refuses a source WHOLE and visibly once its text
+reads as serialized frames, so a kiro-cli that starts logging bodies produces a refusal
+instead of a silent widening, and `_begin_at_event_boundary` closes the matching bypass
+where a truncated window strands a frame's argument lines after its envelope was cut away.
+Neither tries to separate one session's frames from another's, deliberately: a per-line
+filter over interleaved sessions would look scoped without being scoped, which is worse
+than nothing.
+
+**2. Redaction is reuse of one entry point, and its order is load-bearing.** A channel calls
+`diagnostics._scrub` rather than assembling the passes itself, because the assembly carries
+a constraint that is easy to lose: `validation.strip_hidden_unicode` runs FIRST, then
+`security/exfil.py::redact_exfiltration_urls`, then
+`security/redaction.py::redact_credentials`, then the collector's `_EXTRA_REDACTIONS` for
+the bearer / `Authorization` / `mc_token` shapes those miss. Stripping hidden characters
+afterwards is worse than not stripping at all: `redact_credentials` matches a secret's
+literal shape, so an invisible planted inside one defeats it, and a later strip — every MCP
+response leaves through `validation.build_tool_response` and its `sanitize_response` —
+rejoins it into a live credential that redaction has already been asked about and declined.
+The guarantee is what those passes cover: credential and exfiltration-URL **shapes**. It
+does not narrow prose and cannot say whose data a line is, so it cannot satisfy clause 1.
+
+**3. Ownership splits along that seam.** The redaction guarantee belongs to the shared
+redaction modules and their tests, not to the channel calling them — a channel inherits
+their coverage, and inherits every later improvement to it. The source list and the
+tripwire belong to the channel module, where they are read together with the tool's
+advertised description, and are signed off on the pull request that introduces the channel.
+Caller identity is the third piece: an operator-triggered diagnostics bundle may read wider
+than an agent-callable tool, because the human who runs it is the caller and is entitled to
+that gateway's data. `diagnostics.collect_bundle` does read `kiro-chat.log`; the
+agent-callable tool does not. That asymmetry is the rule holding, not an inconsistency to
+reconcile, and it also decides where a control lives: the orphaned-line discard sits in the
+agent-facing reader rather than in the byte-tailing helper the bundle shares, because it
+discards data and only the cross-session boundary justifies that loss.
+
+So a new channel arrives with four things stated: its source list, the content property
+that keeps those sources in scope, the tripwire that fails closed when the property drifts,
+and who its caller is. A channel whose source carries conversation content it cannot
+attribute to the caller does not ship narrower — it does not ship.
+
 ### Computer use: a pixel/AX surface the path matchers cannot see
 
 Native desktop GUI automation ([computer-use.md](computer-use.md)) is a security
