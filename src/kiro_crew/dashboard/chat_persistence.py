@@ -42,6 +42,7 @@ from kiro_crew.dashboard.chat_utils import (
     session_key_for,
     slot_history_key,
     slot_transcript_key,
+    with_bounded_blocked_links,
 )
 from kiro_crew.dashboard.slot_buffers import (
     committed_filtered_note_ids,
@@ -78,7 +79,12 @@ from kiro_crew.history import (
 )
 from kiro_crew.memory_stores import UnknownMemoryStore, named_store_or_empty
 from kiro_crew.messaging.link import is_channel_session_key
-from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+from kiro_crew.security import (
+    EXFILTRATION_REDACTION_TAG_PREFIX,
+    bounded_blocked_links,
+    redact_credentials,
+    redact_exfiltration_urls,
+)
 from kiro_crew.sel import sel
 from kiro_crew.session_agent_selection import session_agent_selection_name
 from kiro_crew.validation import ARTIFACT_SLUG_RE
@@ -1014,10 +1020,14 @@ def _attach_variants(slot: _ChatSlot, m: dict) -> None:
     """Copy variant history from a persisted message onto the slot's last message, with redaction."""
     if m.get("variants"):
         slot.messages[-1]["variants"] = [  # type: ignore[assignment]
-            {
-                **v,
-                "content": redact_credentials(redact_exfiltration_urls(v.get("content", ""))[0])[0],
-            }
+            with_bounded_blocked_links(
+                {
+                    **v,
+                    "content": redact_credentials(
+                        redact_exfiltration_urls(v.get("content", ""))[0]
+                    )[0],
+                }
+            )
             for v in m["variants"]
             if isinstance(v, dict)
         ]
@@ -1782,8 +1792,14 @@ def _rehydrate_slot_from_history(
                 # the large payloads, so meta redaction was ~5.5s of a ~7s restore
                 # while content redaction was only ~0.4s. Redacted at emit instead
                 # (chat_utils._prepare_messages), which is the only path that returns
-                # meta to a client.
-                meta=(m["meta"] if isinstance(m.get("meta"), dict) else None),
+                # meta to a client. Blocked-link records are the exception: they are
+                # BOUNDED here because this is where the slot retains them, and the
+                # bound is a no-op for a row that carries none.
+                meta=(
+                    with_bounded_blocked_links(m["meta"])
+                    if isinstance(m.get("meta"), dict)
+                    else None
+                ),
                 mint_mid=False,
             )
             # Provenance is not a slot.append() argument, so carry it onto the
@@ -2310,7 +2326,11 @@ def _apply_recent_session(
             cls,
             ts=m.get("ts", ""),
             broadcast=False,
-            meta=(m["meta"] if isinstance(m.get("meta"), dict) else None),
+            # Blocked-link records bounded where the slot retains them; see the
+            # equivalent append in _rehydrate_slot_from_history.
+            meta=(
+                with_bounded_blocked_links(m["meta"]) if isinstance(m.get("meta"), dict) else None
+            ),
             mint_mid=False,
         )
         # See the equivalent call in _rehydrate_slot_from_history.
@@ -2910,14 +2930,37 @@ def _build_message_entry_uncached(
                     vc = rewritten
             vc, _ = redact_exfiltration_urls(vc)
             vc, _ = redact_credentials(vc)
-            redacted_variants.append({**v, "content": vc})
+            v_entry = {**v, "content": vc}
+            # A variant's records are ITS OWN, under the same rule the row obeys:
+            # they describe this variant's text, so they ride with it, they go
+            # through the one bounded constructor, and they are dropped when that
+            # text holds no placeholder to explain.
+            if EXFILTRATION_REDACTION_TAG_PREFIX in vc:
+                kept = bounded_blocked_links(v_entry.get("blocked_links"))
+                if kept:
+                    v_entry["blocked_links"] = kept
+                else:
+                    v_entry.pop("blocked_links", None)
+            else:
+                v_entry.pop("blocked_links", None)
+            redacted_variants.append(v_entry)
         entry["variants"] = redacted_variants
         entry["variant_idx"] = m.get("variant_idx", 0)
     cls_val = m.get("cls", "")
     if role == "system" and cls_val:
         entry["cls"] = cls_val
-    if isinstance(m.get("meta"), dict):
-        entry["meta"] = _redact_meta_for_role(role, m["meta"])
+    meta_src = m.get("meta") if isinstance(m.get("meta"), dict) else None
+    if meta_src is not None:
+        meta_in = dict(meta_src)
+        # Records are CARRIED, never re-derived here. They are born at the one
+        # moment the URL exists -- the redaction that produces this row's text --
+        # so by the time this function sees the content it holds the placeholder
+        # and a scan of it would describe nothing. The records still have to
+        # DESCRIBE this text, so a row whose content shows no placeholder does not
+        # keep them; `_redact_meta_for_role` re-validates whatever survives.
+        if "blocked_links" in meta_in and EXFILTRATION_REDACTION_TAG_PREFIX not in content:
+            meta_in.pop("blocked_links", None)
+        entry["meta"] = _redact_meta_for_role(role, meta_in)
     return entry
 
 

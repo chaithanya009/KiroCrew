@@ -49,6 +49,7 @@ from kiro_crew.hooks import _HOST_READ_ONLY_BUILTIN_TOOLS, safe_read_file
 from kiro_crew.messaging.link import canonical_key, is_channel_session_key
 from kiro_crew.quick_prompts import QUICK_PROMPTS
 from kiro_crew.security import (
+    bounded_blocked_links,
     oauth_url_contains_credential,
     redact_credentials,
     redact_exfiltration_urls,
@@ -1722,6 +1723,82 @@ def _redact_value(v):  # type: ignore[no-untyped-def]
     return v
 
 
+def variant_from_row(row: dict) -> dict:
+    """Stash a row as a variant, taking its blocked-link records with it.
+
+    The mirror of ``adopt_variant_text``: that one moves a variant onto the row,
+    this one moves the row into the variant list. Both directions carry the
+    records because the records cannot be recovered from the text -- the stashed
+    content is already redacted, so the URL they describe is gone and a rescan
+    finds nothing to describe. A stash that dropped them would destroy the
+    explanation for good, and the reader switching back would be handed a bare
+    placeholder with no way to learn what was removed.
+    """
+    entry = {"content": row.get("content", ""), "ts": row.get("ts", "")}
+    meta = row.get("meta")
+    if isinstance(meta, dict):
+        # Bounded here, at retention: the row's meta was read off a transcript
+        # line, and a variant list outlives the render that would bound it later.
+        records = bounded_blocked_links(meta.get("blocked_links"))
+        if records:
+            entry["blocked_links"] = records
+    return entry
+
+
+def with_bounded_blocked_links(container: dict) -> dict:
+    """``container`` with its ``blocked_links`` rebuilt through the one bounded
+    constructor, or removed when nothing valid is left.
+
+    Every place that RETAINS a row's meta or a variant read off a transcript line
+    goes through this, not only the places that display it: a bound applied at
+    render leaves the slot holding whatever the line carried. Returns the same
+    object when there is no such key, so the common row costs nothing.
+    """
+    if "blocked_links" not in container:
+        return container
+    out = dict(container)
+    records = bounded_blocked_links(out["blocked_links"])
+    if records:
+        out["blocked_links"] = records
+    else:
+        del out["blocked_links"]
+    return out
+
+
+def _variant_for_emit(variant: dict) -> dict:
+    """A regenerate variant as the client receives it: display-redacted text and
+    its blocked-link records rebuilt through the one bounded constructor."""
+    return with_bounded_blocked_links(
+        {**variant, "content": redact_display_content(variant.get("content", ""))}
+    )
+
+
+def adopt_variant_text(row: dict, variant: dict) -> None:
+    """Move a row onto one of its variants, text and blocked-link records together.
+
+    A record describes ONE text: it names the domain and the reason for a
+    placeholder standing in that text. A caller that takes a variant's content
+    without its records leaves the row explaining a link that is absent from the
+    text on screen, and the chip then states a host that text never held. The pair
+    moves through this one function so no site can take half of it -- the records
+    are replaced when the variant carries them and REMOVED when it does not,
+    because a variant with no records has nothing to explain.
+    """
+    row["content"] = variant.get("content", "")
+    row["ts"] = variant.get("ts", row.get("ts", ""))
+    meta = row.get("meta")
+    records = bounded_blocked_links(variant.get("blocked_links"))
+    if records:
+        if not isinstance(meta, dict):
+            meta = {}
+            row["meta"] = meta
+        meta["blocked_links"] = records
+    elif isinstance(meta, dict):
+        meta.pop("blocked_links", None)
+        if not meta:
+            row.pop("meta", None)
+
+
 def _redact_meta(meta: dict) -> dict:
     """Recursively redact string values in meta dict.
 
@@ -1747,9 +1824,21 @@ def _redact_meta_for_role(role: str, meta: dict) -> dict:
     dependency runs chat_persistence -> chat_utils, so keeping it here lets both
     the save path and the emit path share one implementation without a cycle.
     """
+    # blocked_links is the record set born at the redaction that removed each
+    # link (chat_runner._flush_segment) and carried with its text; the generic string
+    # redaction below would blank it. Preserve it across every role, but the
+    # transcript line is attacker-writable, so the records are rebuilt through the
+    # one bounded constructor: it re-validates each against the collector's shape,
+    # drops any that fails on its own -- never the message -- and bounds the count,
+    # because this is the second RETENTION point and the only one that reads the
+    # line, and it runs on every render of the message that holds it.
+    validated_blocked_links = bounded_blocked_links(meta.get("blocked_links"))
+
     if role == "mcp_oauth":
         out: dict = {}
         for k, v in list(meta.items()):
+            if k == "blocked_links":
+                continue
             if k == "oauth_url" and isinstance(v, str):
                 # Two gates, and deliberately NOT a third:
                 #   1. http(s)-only — a tampered history line can't smuggle a
@@ -1776,8 +1865,13 @@ def _redact_meta_for_role(role: str, meta: dict) -> dict:
                 out[k] = v if (safe_scheme and not oauth_url_contains_credential(v)) else ""
             else:
                 out[k] = _redact_value(v)
+        if validated_blocked_links:
+            out["blocked_links"] = validated_blocked_links
         return out
-    return _redact_meta(meta)
+    out = {k: _redact_value(v) for k, v in list(meta.items()) if k != "blocked_links"}
+    if validated_blocked_links:
+        out["blocked_links"] = validated_blocked_links
+    return out
 
 
 def _redact_for_display(text: str) -> str:
@@ -3636,11 +3730,13 @@ def _prepare_messages(messages: list[dict], running: bool, *, live_child: str) -
         if msg_out.get("variants"):
             # Snapshot for the same reason as _redact_meta — this runs in a
             # worker thread (slot-detail render offload) while the event
-            # loop may still be appending variants to the live list.
+            # loop may still be appending variants to the live list. A variant's
+            # records are re-validated here exactly as a row's are in
+            # _redact_meta_for_role: they can hold a full address a reader may
+            # open, and a transcript line is attacker-writable, so no record
+            # reaches a client without the serve-time check.
             msg_out["variants"] = [
-                {**v, "content": redact_display_content(v.get("content", ""))}
-                for v in list(msg_out["variants"])
-                if isinstance(v, dict)
+                _variant_for_emit(v) for v in list(msg_out["variants"]) if isinstance(v, dict)
             ]
         meta = parse_cls_meta(m.get("cls", ""))
         if meta is not None:
