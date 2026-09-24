@@ -494,6 +494,23 @@ def read_run_execution(agent_id: str, *, state=...) -> "ExecutionContext":
 
 
 def update_execution_context(agent_id: str, execution, *, expected=...) -> None:
+    """Bind *execution* onto a run, rewriting ``state.json`` whole.
+
+    The SECOND whole-file rewrite path for this file, and it does NOT share
+    :func:`update_state`'s on-loop/off-loop asymmetry: the per-agent lock is held
+    UNCONDITIONALLY, across the admission checks, the read and the write. That is
+    affordable because this sits on the run-creation and session-binding paths
+    rather than on a per-turn one, so the fsync it can park on the event loop is
+    not on a hot path. Its write model is the one :func:`update_state` records.
+
+    A non-persistent owner keeps this turn's body out of the durable file: only
+    retained identity and mode metadata are tightened on disk, and the live record
+    carries the merged state.
+
+    Raises ValueError with a ``memory_unavailable:`` reason when the run changed
+    during admission, when the run's memory store would change (a run's store is
+    immutable), or when its state record cannot be read.
+    """
     holder = _lock_for_agent(agent_id)
     with holder.lock:
         current = read_run_execution(agent_id)
@@ -735,6 +752,18 @@ def update_state(agent_id: str, **fields: object) -> bool:
     The read / merge / rewrite is serialized per agent for OFF-LOOP callers (see
     :data:`_STATE_LOCKS`), so two pool writers cannot rewrite a snapshot
     that predates the other's write.
+
+    WRITE MODEL: the whole-file rewrite is the recorded choice for this file, not a
+    way station toward a revision counter or a compare-and-swap retry loop.
+    ``state.json`` is a run's artifact and evidence record, while scheduling's
+    source of truth is the durable task queue with its own generation fencing, so a
+    second coordination protocol here would order writes this file does not need at
+    the price of a format every reader must agree on. The invariant that keeps the
+    rewrite safe instead: every whole-file write happens at a KNOWN site, and each
+    site reachable from the event loop carries its own fence.
+    ``test_subagent_state_write_model`` holds that census and fails a new site.
+    The asymmetry below therefore closes by moving a site OFF the loop, where it
+    inherits the lock -- never by changing the on-disk format.
 
     KNOWN LIMITATION: ordinary ON-LOOP callers do not take the lock, because waiting
     on a pool thread's fsync from the event loop is exactly the blocking call the
