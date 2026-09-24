@@ -8869,7 +8869,14 @@ class GatewayOrchestrator:
             # every consumer below must branch on ``user_stopped`` explicitly
             # rather than inferring success from an empty error.
             if info.user_stopped:
-                status, emoji, single_outcome = "stopped by user", "⏹", OUTCOME_STOPPED
+                # The stop's own origin when the record carries one (a
+                # parent-end verb, a stage cancel), so the announce does not
+                # credit the user with a stop they never pressed.
+                status, emoji, single_outcome = (
+                    getattr(info, "_stop_origin", "") or "stopped by user",
+                    "⏹",
+                    OUTCOME_STOPPED,
+                )
             elif info.error:
                 status, emoji, single_outcome = "failed", "❌", OUTCOME_FAILED
             else:
@@ -8964,8 +8971,16 @@ class GatewayOrchestrator:
             result_path = info.result_path or ""
             if info.user_stopped:
                 _partial = info.result or ""
+                # Same origin as the status line above: a parent end or a stage
+                # cancel must not read as the user's own Stop in the digest text.
+                _origin = getattr(info, "_stop_origin", "") or "stopped by user"
+                _who = (
+                    "Stopped by the user"
+                    if _origin == "stopped by user"
+                    else f"Stopped ({_origin})"
+                )
                 detail = (
-                    "Stopped by the user before completing. Do NOT treat this as "
+                    f"{_who} before completing. Do NOT treat this as "
                     "a finished result or retry it unprompted."
                     + (f"\n\nPartial output:\n{_partial}" if _partial else "")
                 )

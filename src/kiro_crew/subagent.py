@@ -38,6 +38,7 @@ from kiro_crew.agent_sdk.drivers.acp_vocab import (  # noqa: F401 - STOP_* resol
     STOP_CLASS_SUCCEEDED,
     STOP_RECOVERY_MAX_RETRIES,
     classify_stop_reason,
+    is_runtime_death,
 )
 from kiro_crew.executors import run_in_embed_pool
 
@@ -1441,6 +1442,12 @@ def stage_boundary_owner_for_run(info: object) -> str:
     return owner if isinstance(owner, str) else ""
 
 
+#: Reap reasons that end a run on purpose. A tombstone written with one of these
+#: is a neutral "stopped", never a failure, and the same set decides whether the
+#: reap-echo arm in ``_run`` and ``_force_reap``'s own record synthesize an error.
+_NEUTRAL_REAP_REASONS = frozenset({"user_stop", "parent_end", "stage_cancel"})
+
+
 @dataclass
 class SubagentInfo:
     """Metadata for a running subagent."""
@@ -1578,6 +1585,34 @@ class SubagentInfo:
     # SUCCESS). One flag cannot be both early and late; this one is the early
     # half — "do not respawn, a reap is in flight".
     _reap_started: bool = False
+    # WHY the reap in flight is happening, written next to ``_reap_started`` and
+    # read by the run loop when its stream dies UNDER that reap. ``_force_reap``
+    # tears the run's session down before it cancels the task, so the in-flight
+    # turn observes its own runtime being killed first and raises
+    # ``AcpProcessDied`` -- "killed (provider shutdown)". Without these two fields
+    # that echo was recorded as the run's failure: a ``cause="error"`` tombstone
+    # carrying the death text and an ERROR log, for a run a user had just pressed
+    # Stop on (or a parent end had cancelled). ``_reap_reason`` is the tombstone
+    # cause the reap itself would write (``user_stop`` / ``parent_end`` /
+    # ``reaped`` / ``startup_timeout``); ``_stop_origin`` is the one-line WHO/WHY
+    # for the record and the log ("stopped by user", "parent conversation ended
+    # (retire_kiro_identity_sessions)", "reaped after 900s (reaped)").
+    _reap_reason: str = ""
+    _stop_origin: str = ""
+
+    @property
+    def stop_is_neutral(self) -> bool:
+        """Whether the reap that owns this run is a deliberate stop, not a failure.
+
+        Decided by the FIRST stopper (``_reap_reason``), never by
+        ``user_stopped`` alone: a Stop that lands while a deadline reap is already
+        tearing the run down sets ``user_stopped`` too, and reading that flag would
+        let the late Stop convert a claimed deadline failure into a neutral stop.
+        A user Stop, a parent end and a stage cancel are neutral; a deadline or
+        startup reap is the run's own failure.
+        """
+        return self._reap_reason in _NEUTRAL_REAP_REASONS
+
     # Set by the gateway on the wave's FINAL member only: the held OK member
     # ids whose delivery tombstones must be settled once the digest has been
     # successfully handed off (i.e. after _on_done returns without raising —
@@ -1904,6 +1939,7 @@ class _ReportFailureSnapshot:
     error: str
     elapsed: float
     user_stopped: bool
+    _stop_origin: str
     outcome: str
     partial: bool
     agent: str
@@ -1937,6 +1973,7 @@ class _ReportFailureSnapshot:
             error=bounded(info.error),
             elapsed=float(info.elapsed),
             user_stopped=bool(info.user_stopped),
+            _stop_origin=bounded(info._stop_origin),
             outcome=info.outcome,
             partial=bool(info.partial),
             agent=bounded(info.agent),
@@ -1966,6 +2003,7 @@ class _ReportFailureSnapshot:
             self.result,
             self.result_path,
             self.error,
+            self._stop_origin,
             self.outcome,
             self.agent,
             self.conversation_key,
@@ -2006,6 +2044,7 @@ class _ReportFailureSnapshot:
             requested_model=self.requested_model,
             conversation_key=self.conversation_key,
             user_stopped=self.user_stopped,
+            _stop_origin=self._stop_origin,
             stop_reason=self.stop_reason,
             stop_class=self.stop_class,
             partial=self.partial,
@@ -2120,9 +2159,11 @@ DELIVERY_ROUTING_FIELDS: "dict[str, str]" = {
     "_digest_flush_only": NOT_DELIVERY_STATE,
     # Run bookkeeping these modules also write. None of them says where an outcome is.
     "_finalized": NOT_DELIVERY_STATE,
+    "_reap_reason": NOT_DELIVERY_STATE,
     "_reap_started": NOT_DELIVERY_STATE,
     "_recovering": NOT_DELIVERY_STATE,
     "_slot_released": NOT_DELIVERY_STATE,
+    "_stop_origin": NOT_DELIVERY_STATE,
     "done": NOT_DELIVERY_STATE,
     "elapsed": NOT_DELIVERY_STATE,
     "error": NOT_DELIVERY_STATE,
