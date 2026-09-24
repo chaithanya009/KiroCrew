@@ -509,45 +509,51 @@ describe('focus mode — shell layout', () => {
       fireEvent.mouseEnter(screen.getByTestId('focus-peek-rail'))
       act(() => { vi.advanceTimersByTime(150) })
       expect(document.body.classList.contains('mc-focus-rail')).toBe(true)
+      // One overlay at a time: the rail opened last, so the header is put away.
+      expect(document.body.classList.contains('mc-focus-chrome')).toBe(false)
+
+      // ...and the other way round: re-summoning the header puts the rail away.
+      fireEvent.mouseEnter(screen.getByTestId('focus-peek-top'))
+      act(() => { vi.advanceTimersByTime(150) })
+      expect(document.body.classList.contains('mc-focus-chrome')).toBe(true)
+      expect(document.body.classList.contains('mc-focus-rail')).toBe(false)
     } finally {
       vi.useRealTimers()
     }
   })
 
-  it('shows the rail at full width even when the user had it collapsed', async () => {
-    // A collapsed rail is 74px. As a hover-held overlay that is a hard target to
-    // keep the pointer inside, so it puts itself away the moment you drift off it —
-    // focus mode therefore forces it expanded. 220 is the 236px track minus the
-    // rail's own 16px of horizontal margin.
+  it('honours the collapse preference and toggles it from the collapse control', async () => {
+    // The overlay rail is as wide as the docked rail would be, and the brand row's
+    // collapse control flips the preference exactly as it does outside focus mode.
     localStorage.setItem('mc-nav', '1')
     renderWithProviders(<App />, { route: '/chat' })
     const toggle = await screen.findByTestId('focus-mode-toggle')
 
     const rail = screen.getByRole('navigation', { name: 'Main navigation' })
-    // Docked first: the preference is respected, so this is not vacuous.
-    expect(rail.style.width).toBe('auto')
     const shell = screen.getByTestId('dashboard-shell')
     expect(shell.style.gridTemplateColumns).toMatch(/^74px /)
 
     await act(async () => { fireEvent.click(toggle) })
-    expect(rail.style.width).toBe('220px')
-    // ...and the preference itself is untouched, so leaving focus mode restores it.
-    expect(localStorage.getItem('mc-nav')).toBe('1')
+    // Collapsed overlay: 74px track minus the rail's 16px of margin.
+    expect(rail.style.width).toBe('58px')
 
-    // With no collapsed state to toggle into, the brand row's collapse control puts
-    // the floating rail AWAY instead of writing the preference — otherwise it would
-    // be a control that visibly does nothing while focus mode is on.
     vi.useFakeTimers()
     try {
       fireEvent.mouseEnter(screen.getByTestId('focus-peek-rail'))
       act(() => { vi.advanceTimersByTime(150) })
       expect(rail.style.transform).toBe('translateX(0)')
+      act(() => { fireEvent.click(screen.getByLabelText('Expand sidebar')) })
+      // Expanded, still shown, and the preference written.
+      expect(rail.style.width).toBe('220px')
+      expect(rail.style.transform).toBe('translateX(0)')
+      expect(localStorage.getItem('mc-nav')).toBe('0')
+
       act(() => { fireEvent.click(screen.getByLabelText('Collapse sidebar')) })
-      expect(rail.style.transform).toBe('translateX(calc(-100% - 12px))')
+      expect(rail.style.width).toBe('58px')
+      expect(localStorage.getItem('mc-nav')).toBe('1')
     } finally {
       vi.useRealTimers()
     }
-    expect(localStorage.getItem('mc-nav')).toBe('1')
   })
 
   it('relays its chrome visibility to the host when embedded', async () => {

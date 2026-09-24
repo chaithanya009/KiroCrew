@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback, useRef, useMemo, useSyncExternalStore, createContext, lazy, Suspense, type HTMLAttributes, type ReactNode } from 'react'
+import { useEffect, useLayoutEffect, useState, useCallback, useRef, useMemo, useSyncExternalStore, createContext, lazy, Suspense, type HTMLAttributes, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
 import { Routes, Route, Navigate, useLocation, useNavigate, useParams } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
@@ -1823,9 +1823,9 @@ export default function App() {
     // Positional close, same contract as the top peek: only a mousemove observed
     // to the RIGHT of the rail band closes it. Needed once edge-slam opening
     // exists — an overlay opened with the pointer OFF-window has no
-    // enter/leave history for the event-based close to work from. 236 is the
-    // rail track width; +12 slack.
-    departWhen: e => e.clientX > 248,
+    // enter/leave history for the event-based close to work from. The band is
+    // the rail track at the user's collapse state; +12 slack.
+    departWhen: e => e.clientX > railWidthFor({ isMobile: false, collapsed: navCollapsed }) + 12,
     dismissOnWindowExit: true,
   })
   // Edge-slam reveal: overshooting a trigger straight OUT of the window must
@@ -1865,6 +1865,24 @@ export default function App() {
     document.addEventListener('mouseout', onOut)
     return () => document.removeEventListener('mouseout', onOut)
   }, [focusActive, openTopPeek, openRailPeek])
+  // One overlay at a time. The top-left corner sits on both trigger strips, so
+  // hovering or slamming there can open the header and the rail together. The
+  // one that opened LAST is the one the user just asked for, so it wins and the
+  // other is put away at once. A layout effect so the pair is never painted.
+  const { close: closeTopPeek } = topPeek
+  const { close: closeRailPeek } = railPeek
+  const prevPeekOpen = useRef({ top: false, rail: false })
+  useLayoutEffect(() => {
+    const prev = prevPeekOpen.current
+    const topRose = topPeek.open && !prev.top
+    const railRose = railPeek.open && !prev.rail
+    prevPeekOpen.current = { top: topPeek.open, rail: railPeek.open }
+    if (!(topPeek.open && railPeek.open)) return
+    // Both rising in one commit has no "latest"; prefer the header, the same
+    // tie-break the corner slam uses.
+    if (topRose) closeRailPeek()
+    else if (railRose) closeTopPeek()
+  }, [topPeek.open, railPeek.open, closeTopPeek, closeRailPeek])
   // A header-owned popover keeps the header on screen.
   //
   // The instance switcher's menu is portaled to document.body (Radix), so moving
@@ -3294,13 +3312,7 @@ export default function App() {
 
   const toggleNav = () => {
     if (isMobile) { if (mobileNavPhaseRef.current === 'open') closeMobileNavDrawer(); else openMobileNav() }
-    else if (focusActive) {
-      // The rail is a hover-held overlay in focus mode and always full width, so
-      // there is no collapsed state to toggle into. The same control puts it away
-      // instead — which is what its left-pointing chevron already reads as, and it
-      // leaves the user's collapse preference untouched for when focus mode is off.
-      railPeek.close()
-    } else {
+    else {
       // The user has taken ownership of the rail: leaving preview expand mode
       // must not overwrite this with the pre-expand state.
       navAutoCollapsed.current = null
@@ -3321,12 +3333,9 @@ export default function App() {
   // Reset mobile nav state when leaving mobile viewport
   // Leaving mobile: drop the panel with no slide (no drawer exists on desktop).
   useEffect(() => { if (!isMobile) { setMobileNavPhase('closed'); takeOverDrawer(mobileNavX) } }, [isMobile, mobileNavX])
-  // Focus mode forces the rail EXPANDED regardless of the user's collapse
-  // preference. A collapsed rail is 74px, and as a hover-held overlay that is a
-  // hard target to keep the pointer inside — it puts itself away the moment you
-  // drift off it. `navCollapsed` still holds the preference, so leaving focus mode
-  // restores whatever the user had.
-  const effectiveCollapsed = navCollapsed && !isMobile && !focusActive
+  // Focus mode honours the collapse preference too: the overlay rail is as wide
+  // as the docked rail would be, and the collapse control toggles it the same way.
+  const effectiveCollapsed = navCollapsed && !isMobile
   // Publish the rail track so consumers outside the shell can size against the
   // space actually left for content — ChatPage's activity panel decides
   // beside-vs-fill from it. Kept in sync with the gridTemplateColumns value
