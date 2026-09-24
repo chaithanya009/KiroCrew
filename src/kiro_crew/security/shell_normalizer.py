@@ -490,6 +490,9 @@ _DATA_CONSUMER_PROGRAMS = frozenset(
 
 # program in a run that ``shlex`` handed over as a single word.
 _CONTROL_OPERATOR_RE = re.compile(r"[;&|\n]+")
+# The whitespace ``shlex`` splits on.  One of these INSIDE a token is proof the
+# token was quoted.
+_SHLEX_WHITESPACE_RE = re.compile(r"[ \t\r\n]")
 # A word that OPENS with a command substitution, past any quote or paren the shell
 # strips first: its basename reading is the substitution body's program
 # (``$(kirocrew`` reads as ``kirocrew``), which is what runs.  A BRACE before it is
@@ -576,6 +579,24 @@ def _split_glued_operators(tokens: "list[str]") -> "list[str]":
     ``shlex`` splits on whitespace only, so ``X=<name>;$X`` arrives as one token and an
     assignment glued to the command that uses it is invisible to both.  Splitting keeps
     the operator itself as a token so argv-boundary logic still sees it.
+
+    A token that CONTAINS one of ``shlex``'s whitespace characters is yielded WHOLE
+    as well, ahead of its pieces.  ``shlex`` never hands over unquoted whitespace, so
+    such a token was quoted, and a quoted word is ONE argument to its program however
+    many ``;`` it carries: ``bash -c '<name>=<cli>; $<name> <verb>'`` passes the whole
+    script as the one operand of ``-c``.  Splitting it into pieces ALONE invented a
+    top-level ``;`` the shell never runs, and the payload walk -- which finds a
+    carrier's script as the ONE token after the carrier -- then descended only the
+    first piece (``<name>=<cli>``), so the script's own command line, where the ``;``
+    IS an operator and the assignment resolves, was never examined: the mint hid
+    behind a spaced ``-c``, ``eval``, ``<<<`` or ``env -S`` carrier (measured ALLOWED
+    for all four while the shell ran it).  Whole, the token reaches the walk, which
+    re-tokenizes it as its own command line and splits the assignment there.  The
+    pieces are still yielded after it, because the whitespace may sit inside a quoted
+    VALUE of a top-level glued run (``X="a b";Y=<cli>;$Y <verb>`` is one token whose
+    ``$Y`` resolves only through the pieces).  Both readings over-approximate in the
+    safe direction: the whole token is a carrier's operand or an extra argument, the
+    pieces are what the splitter always yielded.
     """
     out: list[str] = []
     for token in tokens:
@@ -588,6 +609,10 @@ def _split_glued_operators(tokens: "list[str]") -> "list[str]":
         if not _LOCAL_ASSIGN_RE.match(token) or not _CONTROL_OPERATOR_RE.search(token):
             out.append(token)
             continue
+        if _SHLEX_WHITESPACE_RE.search(token):
+            # Quoted whole (see above): the carrier's operand comes first, so the
+            # payload walk's "one token after the carrier" is the whole script.
+            out.append(token)
         for piece in _CONTROL_OPERATOR_RE.split(token):
             if piece:
                 out.append(piece)
@@ -3173,11 +3198,23 @@ def _resolve_local_assignments(tokens: "list[str]") -> "list[str]":
             values[name] = values.get(name, "") + piece
             out.append(token)
             continue
-        if assign and values and "$" in (assign.group(2) or ""):
+        if (
+            assign
+            and values
+            and "$" in (assign.group(2) or "")
+            and not _CONTROL_OPERATOR_RE.search(assign.group(2))
+        ):
             # A new value may be built FROM a variable already tracked
             # (``x=p; x=${x}kill``).  Expanding before classifying is what makes the
             # result a literal at all: left unexpanded it looks computed, the earlier
             # binding stays in place, and the reassignment is silently ignored.
+            # Not when the "value" runs past a control operator: that token is a
+            # whole quoted script kept for the payload walk (see
+            # :func:`_split_glued_operators`), and its ``$name`` uses read the
+            # bindings the SCRIPT makes, not this frame's -- ``x=foo; bash -c
+            # 'x=<cli>; $x <verb>'`` mints with the inner ``x``.  The walk's own
+            # frame resolves them; expanding here would overwrite them with the
+            # outer value first.
             expanded = _VAR_USE_RE.sub(
                 lambda m: values.get(m.group(1) or m.group(2), m.group(0)),
                 assign.group(2),

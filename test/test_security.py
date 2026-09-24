@@ -9263,6 +9263,82 @@ class TestGluedShellCommandPayloadExtraction:
         assert is_denied(f"bash -Cc'{long_name}=ls; ${long_name} -la'") is None
         assert is_denied(f"bash -C{padding}c'{long_name}=ls; ${long_name} -la'") is None
 
+    def test_a_spaced_carrier_payload_is_walked_whole(self) -> None:
+        """A quoted script is ONE operand; its inner ``;`` is not a top-level operator.
+
+        ``bash -c '<name>=<cli>; $<name> <verb>'`` hands the whole script to
+        ``-c`` as one token, but the outer frame's assignment resolver split
+        that token at its inner ``;`` -- it begins with an assignment and
+        carries an operator -- so the payload walk, which takes the ONE token
+        after the carrier, descended only ``<name>=<cli>`` and the script's
+        own command line was never examined.  Measured ALLOWED for the spaced
+        ``-c``, ``eval``, herestring and ``env -S`` carriers at every name
+        length while the shell ran the mint (the glued ``-c'…'`` spelling was
+        denied, because a ``-``-led token is never split).  A token holding
+        whitespace was quoted -- shlex splits on every unquoted whitespace --
+        so it is yielded whole AHEAD of its pieces: the whole reaches the walk,
+        which re-tokenizes it as its own command line, and the pieces keep
+        resolving a top-level glued run whose quoted VALUE holds the space.
+        """
+        from kiro_crew.security import (
+            _CARRIER_SPLIT_WINDOW,
+            _is_credential_mint,
+            _split_glued_operators,
+            is_denied,
+        )
+
+        long_name = "a" * (_CARRIER_SPLIT_WINDOW + 14)
+        for name in ("x", long_name):
+            script = f"{name}=kirocrew; ${name} token"
+            for cmd in (
+                *(f"{shell} -Cc '{script}'" for shell in ("zsh", "bash", "sh")),
+                *(f"{shell} -c '{script}'" for shell in ("zsh", "bash", "sh")),
+                f"bash -x -c '{script}'",
+                f"bash -c -- '{script}'",
+                f'bash -c "{script}"',
+                f"eval '{script}'",
+                f"bash <<< '{script}'",
+                f"env -S '{script}'",
+                f"bash -c '{name}=kirocrew;${name} token'",
+                f"bash -c '{name}=kirocrew && ${name} token'",
+                # The script's own binding wins over an outer one of the same name.
+                f"{name}=foo; bash -c '{script}'",
+            ):
+                assert _is_credential_mint(cmd.lower(), raw_text=cmd), cmd
+                assert is_denied(cmd) is not None, cmd
+        # The unit: a whitespace-bearing token yields the whole first, then the
+        # pieces; the glued evasion this splitter exists for has no whitespace
+        # and is split exactly as before.
+        assert _split_glued_operators(["x=kirocrew; $x token"]) == [
+            "x=kirocrew; $x token",
+            "x=kirocrew",
+            ";",
+            " $x token",
+        ]
+        assert _split_glued_operators(["x=kirocrew\t$x"]) == ["x=kirocrew\t$x"]
+        assert _split_glued_operators(["x=kirocrew;$x", "token"]) == [
+            "x=kirocrew",
+            ";",
+            "$x",
+            "token",
+        ]
+        assert is_denied("x=kirocrew;$x token") is not None
+        # A top-level glued run whose quoted value carries a space still
+        # resolves through the pieces -- and so does one whose unquoted
+        # non-breaking space shlex never split on.
+        assert is_denied('X="a b";Y=kirocrew;$Y token') is not None
+        assert is_denied("X=a\u00a0b;Y=kirocrew;$Y token") is not None
+        # A quoted kill target reaches the kill check whole, not as a shredded pair.
+        assert is_denied("pkill -f 'x=pkill; $x -f kirocrew'") is not None
+        # A protected-branch push behind the same indirection is refused like its
+        # top-level spelling is (the publish gate cannot see through ``$b``).
+        assert is_denied("b=main; git push origin $b") is not None
+        assert is_denied("bash -c 'b=main; git push origin $b'") is not None
+        # Benign scripts stay allowed.
+        assert is_denied(f"bash -c '{long_name}=ls; ${long_name} -la'") is None
+        assert is_denied("bash -c 'x=echo; $x hello'") is None
+        assert is_denied('X="a b";Y=kirocrew;$Y doctor') is None
+
     def test_referenced_splits_keep_the_candidate_set_bounded(self) -> None:
         """Finding splits by reference is bounded by the references, not the ``c`` count.
 
