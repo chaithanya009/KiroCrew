@@ -1411,7 +1411,7 @@ def _runtime_display_name(session_key: str, runtime_source: str | None = None) -
 
     Display mapping over :func:`_resolve_runtime_source` — resolution
     semantics live there so the [RUNTIME] line and every source-keyed
-    decision (e.g. the diff-block rule selection) can never disagree.
+    decision (e.g. the file-change guidance selection) can never disagree.
     """
     return _RUNTIME_DISPLAY.get(
         _resolve_runtime_source(session_key, runtime_source),
@@ -1862,7 +1862,7 @@ def _reply_style_rules(level: str) -> str:
             "full implementation), ignore these constraints and deliver "
             "what was asked.\n"
             "- Required output formats are sacred and never cut: "
-            "[OPTIONS:] lines, diff blocks for file changes, full PR/MR "
+            "[OPTIONS:] lines, explicitly requested diff blocks, full PR/MR "
             "URLs, and any format the rendering surface "
             "needs. These go in their required position regardless of "
             "brevity.\n"
@@ -2069,7 +2069,7 @@ def _load_steering_resources() -> str:
 
 
 # Critical rules reinforced every session (supplements the system prompt).
-# The diff-block rule is RUNTIME-SELECTED server-side (_critical_rules_for):
+# The file-change guidance is RUNTIME-SELECTED server-side (_critical_rules_for):
 # the trusted runtime resolution already exists for the [RUNTIME] line, so
 # whether tool cards render is decided at injection time instead of asking the
 # model to evaluate a runtime clause every turn — a misjudged clause on a
@@ -2077,15 +2077,10 @@ def _load_steering_resources() -> str:
 # changed. Only the tool-vs-shell distinction stays with the model (clause (a)
 # below): the runtime cannot see HOW a file was changed.
 _DIFF_RULE_DASHBOARD = (
-    "File changes and diff blocks: edits made through the BUILT-IN "
-    "file-editing tools already render as structured diff cards in this "
-    "dashboard's transcript — do NOT repeat them as ```diff code blocks. For "
-    "a file changed any OTHER way — shell commands like sed, scripted bulk "
-    "edits, git apply, or an MCP tool that writes files — emit a ```diff "
-    "code block (standard unified diff format with `--- old_path` / "
-    "`+++ new_path` headers and an `@@` hunk line; use /dev/null for new "
-    "files / deletions — the headers let the dashboard's diff viewer link to "
-    "the file), because no card is rendered for those.\n"
+    "After a file change, explain the resulting behavior in plain language. "
+    "The dashboard already shows structured diff cards for edits made through "
+    "built-in file tools. Show a diff for other edits only when the user asks "
+    "for it or the patch itself is the requested deliverable.\n"
     "When a substantive report, synthesis, or results table is NOT your turn's "
     "final message (more tool calls or messages follow it), end that message "
     "with <!-- keep-visible --> as its final line. The dashboard transcript's "
@@ -2098,19 +2093,19 @@ _DIFF_RULE_DASHBOARD = (
     "the marker only when that is not possible.\n"
 )
 _DIFF_RULE_CHANNEL = (
-    "After ANY file change (create, edit, append, delete), you MUST show a "
-    "```diff code block with the change using standard unified diff format "
-    "including `--- old_path` / `+++ new_path` headers and an `@@` hunk line "
-    "(use /dev/null for new files / deletions). This surface renders no tool "
-    "cards, so your message text is the only place the user can see what "
-    "changed. No exceptions — even single-line changes MUST get a diff "
-    "block.\n"
+    "After a file change, explain the resulting behavior in plain language. "
+    "This surface renders no file-edit cards, so include a diff only when "
+    "the user asks for it or the patch itself is the requested deliverable.\n"
 )
 _CRITICAL_RULES_HEAD = "[CRITICAL RULES — always follow these]\n"
 _CRITICAL_RULES_TAIL = (
-    "When referencing file paths in your response, ALWAYS use the absolute path "
-    "inside inline `code` backticks (e.g. `/home/user/project/src/main.py`). "
-    "Never use relative paths or bare filenames. This enables the UI file viewer panel.\n"
+    "Write for the person asking: lead with the answer, the behavior they will "
+    "see, and why it matters. Use plain, literal language and helpful paragraph "
+    "breaks. Do not name files, functions, classes, or internal tools unless "
+    "the user asks for implementation details or needs an exact name to act. "
+    "This applies to progress updates and final replies.\n"
+    "When the user does need a file path, use its absolute path inside inline "
+    "code backticks so the UI file viewer can open it.\n"
     "Backtick file PATHS only -- NEVER a URL. A backticked URL renders as a "
     "click-to-copy chip, not a link, so the user cannot click through to it. "
     "Write every URL as [text](url) instead.\n"
@@ -2214,10 +2209,8 @@ _MEMBER_BRIEFING_ITEM_UNAVAILABLE = """
 # platform injects, and the one the behaviour-layer tests pin.
 _MEMBER_HOW_YOU_WORK = _MEMBER_HOW_YOU_WORK_COMMON + _MEMBER_BRIEFING_ITEM
 
-# Runtime sources whose transcript renders tool-call cards (and therefore the
-# inline diff card). Everything else — messaging channels, cron, subagent,
-# background, CLI — gets the hard diff-block mandate: their only file-change
-# display is the message text itself.
+# The dashboard renders file-edit cards; other surfaces need a plain-language
+# description of the resulting behavior in the reply.
 
 
 def _critical_rules_for(session_key: str | None, runtime_source: str | None) -> str:
@@ -2225,11 +2218,9 @@ def _critical_rules_for(session_key: str | None, runtime_source: str | None) -> 
 
     Compares the RAW source key from the same trusted resolution that
     produces the [RUNTIME] line — never the localized display string — so the
-    diff-block contract and the runtime the model is told about can never
+    file-change guidance and the runtime the model is told about can never
     disagree, and a display-name change cannot flip the rule. Unknown or
-    unresolvable runtimes get the channel variant: the hard mandate is the
-    safe default (worst case a dashboard user sees a duplicate diff; the
-    inverse failure leaves a channel user with no record at all).
+    unresolvable runtimes get the channel variant.
     """
     source = _resolve_runtime_source(session_key or "", runtime_source)
     return _CRITICAL_RULES if source == "dashboard" else _CRITICAL_RULES_CHANNEL
@@ -4505,7 +4496,7 @@ class ContextBuilder:
                 agent_prompt = ""
             elif is_cc and (not is_custom or not _private_owner):
                 # CC gets the SAME KiroCrew persona prompt as kiro — including
-                # the Output Format rules (diff blocks, image embeds, OPTIONS)
+                # the Output Format rules (image embeds and OPTIONS)
                 # which are dashboard UI contracts, not kiro-specific. Only the
                 # kiro-cli *branding* references are rewritten to claude code.
                 try:
@@ -4585,8 +4576,8 @@ class ContextBuilder:
                     session_ctx = _neutralize_structural_markers(session_ctx)
                 if slim_resume:
                     # Re-anchor the critical rules (dashboard/Slack UI
-                    # contracts: diff blocks, [OPTIONS:] buttons, absolute
-                    # paths). They were injected at the original session start
+                    # contracts: [OPTIONS:] buttons and file links). They were
+                    # injected at the original session start
                     # but sit deep in — and may be compacted out of — the
                     # restored transcript; at ~1.5K chars they are cheap
                     # insurance against output-format drift. Same variant
@@ -4666,22 +4657,12 @@ class ContextBuilder:
                 "authoritative for this turn, even if the session originated on "
                 "another interface.\n\n"
             )
-            # A session that started on the dashboard carries the relaxed
-            # diff-block rule from session start, but this turn may arrive
-            # from a surface that renders no tool cards. Re-assert the hard
-            # mandate for THIS turn. Deliberately asymmetric: only the
-            # channel mandate is ever injected mid-session (a dashboard turn
-            # in a channel-started session at worst duplicates a diff, which
-            # is cosmetic; the inverse — a channel turn under the relaxed
-            # rule — leaves the user with no record of what changed).
-            if _resolve_runtime_source(session_key or "", runtime_source) != "dashboard":
-                parts.append(
-                    "For THIS turn: this surface renders no tool cards, so "
-                    "after ANY file change you MUST include a ```diff code "
-                    "block in your message text — it is the only place the "
-                    "user can see what changed.\n\n"
-                )
-
+            parts.append(
+                "For this turn, explain behavior and impact in plain language. "
+                "Leave out file and function names unless the user asks for "
+                "implementation details. Describe file changes by their result; "
+                "show a diff only if requested.\n\n"
+            )
         # Post-compaction re-injection: the skills index was lost when the
         # session-start context was compacted. Re-inject it so the model can
         # still discover skills by name/$token/skill_search.
