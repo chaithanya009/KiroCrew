@@ -40,6 +40,42 @@ _MAX_A2A_EXCHANGES = 3
 # guaranteeing subscribe() can never park indefinitely.
 _INBOX_POLL_SECS = 1.0
 
+# The dispatch verbs: a channel agent may not START work that outlives its own
+# confined turn.  Every verb here creates or drives an execution context the
+# channel agent does not itself occupy, and that context is NOT confined -- a
+# spawned descendant's session key is ``subagent:<id>``, so a containment check
+# keyed on a ``channel:`` identity does not recognise the descendant, and the
+# descendant holds the full default toolset including every name in the list
+# below.  The verbs are therefore refused at the channel agent's OWN hop, where
+# its ``channel:`` identity is the one thing already verified.
+#
+# Per verb: ``spawn_run`` and ``spawn_sub_agents`` create a descendant outright;
+# ``spawn_continue`` dispatches a fresh task into an existing run's
+# conversation; ``spawn_steer`` injects text a running descendant executes as
+# part of its turn; ``workflow_run`` and ``workflow_rerun_subtree`` run an
+# orchestration of agents, and ``workflow_author`` exists only to feed them;
+# ``task_run`` starts the autonomous task runner; ``register_hook`` opens a
+# dedicated agent session an external POST drives later.
+#
+# The observe-and-tear-down verbs are deliberately ABSENT, and their absence is
+# the qualifier this invariant needs rather than an omission: ``spawn_list``,
+# ``spawn_status``, ``spawn_release``, ``workflow_status``, ``workflow_result``,
+# ``workflow_list``, ``workflow_cancel`` and ``workflow_library_list`` read or
+# end a context that already exists and start no turn.  ``spawn_status`` returns
+# a retained transcript, so how widely that read is scoped is a question about
+# read scope and not about this boundary.
+CHANNEL_AGENT_BLOCKED_DISPATCH_TOOLS: tuple[str, ...] = (
+    "spawn_run",
+    "spawn_sub_agents",
+    "spawn_continue",
+    "spawn_steer",
+    "workflow_run",
+    "workflow_author",
+    "workflow_rerun_subtree",
+    "task_run",
+    "register_hook",
+)
+
 # Direct-to-user messaging tools a channel agent may never invoke — channel
 # agents communicate exclusively through channel posts.  send_notification
 # reaches the user like send_message does (notification feed publish, badge,
@@ -57,6 +93,8 @@ _INBOX_POLL_SECS = 1.0
 # only cancels and read only exfiltrates, but send delivers text that the target
 # session RUNS as a turn — so external channel content would execute inside a
 # private dashboard conversation.
+# The dispatch verbs above are appended rather than respelled here, so the
+# interactive guard and the MCP-dispatch guard read ONE list.
 # Matched against the rendered
 # permission-request text/title via _blocked_tool_named() (boundary-aware,
 # not naive substring — "Editing send_notification.py" must NOT match).
@@ -86,7 +124,7 @@ CHANNEL_AGENT_BLOCKED_TOOLS: tuple[str, ...] = (
     "work_ledger_read",
     "work_ledger_record",
     "work_ledger_rebuild",
-)
+) + CHANNEL_AGENT_BLOCKED_DISPATCH_TOOLS
 
 # Boundary-aware matcher: the tool name must stand alone in the rendered
 # title — not embedded in a filename/path/identifier ("send_notification.py",
