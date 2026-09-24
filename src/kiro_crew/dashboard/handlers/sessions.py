@@ -3359,9 +3359,14 @@ async def api_session_keepalive(request: web.Request) -> web.Response:
         return web.json_response({"error": "touch failed"}, status=500)
     # Also advance the session's own last_used clock. touch_activity() only
     # refreshes the ACP runtime's activity timestamp, which feeds
-    # is_responsive()/the stall watchdog — the periodic idle sweep reads
-    # ``last_used`` instead, so without this a session blocking in a long
-    # `wait` still ages toward being reaped for idleness.
+    # is_responsive()/the stall watchdog, while the periodic idle sweep reads
+    # ``last_used`` instead. The sweep skips any session whose turn permit is
+    # held, and a tool reaching this route runs inside such a turn, so the idle
+    # verdict for a session blocking in a long `wait` is settled by that guard
+    # rather than by this touch. What the touch buys is the boundary: it leaves
+    # ``last_used`` pointing at the end of the turn's work instead of its start,
+    # so once the permit drops the sweep measures idleness from when the session
+    # went quiet.
     try:
         touched = getattr(state.sessions, "touch", None)
         if callable(touched):

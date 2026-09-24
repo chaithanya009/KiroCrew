@@ -86,11 +86,15 @@ Four mechanisms clean up processes. They are complementary — not redundant.
    runtime and its per-session MCP servers for the whole timeout, so the live
    process count is the number of unreaped sessions times the servers each one
    spawns.
-   **Known limitation**: ``last_used`` is only bumped on ``get_or_create()``,
-   not on every LLM round-trip. A task runner step doing continuous work for
-   >60 min without a new ``get_or_create()`` call could be swept. This is
-   accepted for now to prevent runaway tasks, but may need a heartbeat or
-   persistent-key mechanism if longer steps become common.
+   Both axes also refuse a session whose turn permit is held: ``_expire_idle``
+   tests ``session.semaphore.locked()`` and skips before it reads the clock at
+   all, and each reset it does elect is asked to skip a busy session again. That
+   guard is what bounds how coarse ``last_used`` is allowed to be. The clock is
+   advanced by the allocation paths and by ``touch()``, not on every LLM
+   round-trip, so a task runner step working continuously for longer than
+   ``timeout_secs`` does carry a stale timestamp; it survives regardless,
+   because it holds its permit for the whole step. The clock therefore measures
+   one thing: how long a session with no turn in flight has been quiet.
 
 """
 
