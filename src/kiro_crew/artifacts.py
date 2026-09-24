@@ -4177,6 +4177,7 @@ class ArtifactFolderStore:
         *,
         delete_contents: bool,
         artifact_store: "ArtifactStore",
+        destroyable_slugs: "set[str] | None" = None,
     ) -> dict[str, Any]:
         """Delete a folder. ``delete_contents`` picks the semantics:
 
@@ -4186,6 +4187,19 @@ class ArtifactFolderStore:
         * **True (cascade)** — permanently delete the whole subtree: every
           descendant artifact (via the guarded :meth:`ArtifactStore.delete`)
           and every descendant folder.
+
+        ``destroyable_slugs`` confines the cascade to artifacts the CALLER has
+        made safe to destroy, and a descendant outside it is left in place and
+        reported under ``unguarded_artifact_slugs``. The caller holding each
+        listed artifact's publication guard is what makes the set meaningful: a
+        first publish uploads its object before writing the record naming it, so
+        ``refuse_if_published`` below cannot see one that is in flight, and an
+        artifact filed into this subtree after the caller drew up its list is
+        exactly the artifact whose publish this store cannot observe. Leaving it
+        alone costs a folder that does not fully empty, which the owner deletes
+        again; destroying it can strand a world-readable copy whose only handle
+        goes with it. ``None`` destroys every descendant, for a caller that owns
+        no publication guard at all.
 
         Returns a summary dict describing what changed.
         """
@@ -4259,11 +4273,26 @@ class ArtifactFolderStore:
         deleted_slugs: _List[str] = []
         reparented_slugs: _List[str] = []
         kept_published_slugs: _List[str] = []
+        unguarded_slugs: _List[str] = []
         for art in artifact_store.list():
             fid = getattr(art, "folder_id", "") or ""
             if fid not in affected_ids:
                 continue
             if delete_contents:
+                if destroyable_slugs is not None and art.slug not in destroyable_slugs:
+                    # Filed into this subtree after the caller drew up its guarded set, so
+                    # its publication state is the one thing this store cannot read: a
+                    # first publish in flight has uploaded its object and not yet written
+                    # the record, and `refuse_if_published` sees only the record. Left in
+                    # place, which degrades it to Unfiled exactly as a kept artifact does.
+                    unguarded_slugs.append(art.slug)
+                    logger.warning(
+                        "cascade left %s alone: it joined the subtree outside the "
+                        "caller's guarded set, so a publish in flight for it cannot be "
+                        "ruled out",
+                        art.slug,
+                    )
+                    continue
                 try:
                     artifact_store.delete(art.slug, refuse_if_published=True)
                     deleted_slugs.append(art.slug)
@@ -4290,6 +4319,7 @@ class ArtifactFolderStore:
             "deleted_folder_ids": sorted(affected_ids),
             "deleted_artifact_slugs": deleted_slugs,
             "kept_published_artifact_slugs": kept_published_slugs,
+            "unguarded_artifact_slugs": unguarded_slugs,
             "reparented_artifact_slugs": reparented_slugs,
             "reparented_to": parent,
             "delete_contents": delete_contents,

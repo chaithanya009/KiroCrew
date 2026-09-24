@@ -443,12 +443,32 @@ def _publication_summary(pub: ArtifactPublication) -> dict[str, object]:
 #: Per slug rather than global so unrelated artifacts never wait on each other. Entries
 #: are not evicted -- one small lock per artifact published in this process is cheaper
 #: than freeing a lock another task may be about to take.
+#:
+#: Taken by ``publication_guard``, whose docstring carries the contract: the publish path
+#: is one taker among several, and a path that destroys an artifact takes it too.
 _publish_locks: dict[str, LoopBoundLock] = {}
 _publish_locks_guard = threading.Lock()
 
 
-def _publish_lock(slug: str) -> LoopBoundLock:
-    """The lock guarding one artifact's publish path."""
+def publication_guard(slug: str) -> LoopBoundLock:
+    """The lock one artifact's publication state is decided under.
+
+    Every path that reads whether this artifact has a live publication and then ACTS on
+    that reading holds this, not only the publish path. A first publish uploads the
+    object before the record naming it exists, so during that upload the store answers
+    "not published" about content that is already public. A destroy that trusts that
+    answer erases the artifact and leaves the copy served with nothing able to withdraw
+    it, and no later action reaches it.
+
+    Holding this across the destroy is what makes the store's own
+    ``delete(refuse_if_published=True)`` re-read decisive: the record is then either
+    absent because no publish is running, or present because the publish finished, and
+    never absent merely because a publish is halfway through.
+
+    Process-local, and per running loop within the process (see :class:`LoopBoundLock`):
+    it excludes concurrent tasks in this gateway, which is where both the publish and the
+    destroy paths run. A publish issued by a separate process is not excluded.
+    """
     with _publish_locks_guard:
         return _publish_locks.setdefault(slug, LoopBoundLock())
 
@@ -475,7 +495,7 @@ async def publish(
     ``push_version`` and ``update_sharing`` are the two functions this path calls and
     neither publishes.
     """
-    async with _publish_lock(slug):
+    async with publication_guard(slug):
         return await _publish_unlocked(
             slug,
             visibility=visibility,

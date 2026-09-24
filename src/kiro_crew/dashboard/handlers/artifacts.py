@@ -35,6 +35,7 @@ import threading
 import time
 import uuid
 from collections import OrderedDict
+from contextlib import AsyncExitStack
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -2122,7 +2123,16 @@ async def api_artifact_delete(request: web.Request) -> web.Response:
         # `refuse_if_published=True` is safe for an artifact that was never published
         # (its record is None and nothing above touched it) and is the whole guard for
         # one that was: see the clear directly above.
-        get_default_store().delete(slug, refuse_if_published=True)
+        #
+        # Under the publication guard, because that re-read is only decisive while no
+        # first publish is halfway through. A first publish uploads the object BEFORE it
+        # writes the record, so a destroy landing in that window finds no record, destroys
+        # the artifact, and leaves a world-readable copy whose only handle went with it.
+        # The guard makes the two orders the only ones reachable: the publish has not
+        # started, so there is genuinely nothing published, or it has finished, so the
+        # re-read finds the record and refuses below.
+        async with publish_sync.publication_guard(slug):
+            get_default_store().delete(slug, refuse_if_published=True)
     except ArtifactStillPublishedError as exc:
         # A publish landed between the withdrawal and the removal. Refusing is the same
         # rule the withdrawal outcomes follow -- a refused delete is recoverable, an
@@ -3255,12 +3265,18 @@ async def api_artifact_folder_update(request: web.Request) -> web.Response:
     return _json_response(_serialize_folder(updated, path=fstore.breadcrumb(fid)))
 
 
-async def _withdraw_subtree_publications(folder_id: str, fstore: Any) -> str:
+async def _withdraw_subtree_publications(folder_id: str, fstore: Any) -> tuple[str, list[str]]:
     """Withdraw every published copy in a folder subtree BEFORE it is cascaded away.
 
-    Returns ``""`` when every copy is withdrawn (or there were none), otherwise the slug
-    of the FIRST artifact whose copy could not be withdrawn -- the caller then refuses the
-    whole cascade and destroys nothing.
+    Returns ``("", slugs)`` when every copy is withdrawn (or there were none), otherwise
+    ``(slug, slugs)`` naming the FIRST artifact whose copy could not be withdrawn -- the
+    caller then refuses the whole cascade and destroys nothing.
+
+    ``slugs`` is every artifact this found in the subtree, withdrawn or not, and the caller
+    needs it for a second reason: it holds each one's publication guard across the destroy,
+    so a first publish cannot be halfway through on an artifact about to be destroyed.
+    Returning the list rather than letting the caller re-derive it keeps the two from
+    disagreeing, and keeps the listing to one pass over the store.
 
     Stops at the first failure rather than collecting them all: the question the caller is
     asking is "may I destroy this subtree", and one un-withdrawable copy settles it. A copy
@@ -3269,7 +3285,7 @@ async def _withdraw_subtree_publications(folder_id: str, fstore: Any) -> str:
     """
     ids = await _run_off_loop(lambda: fstore.subtree_ids(folder_id))
     if not ids:
-        return ""
+        return "", []
     store = get_default_store()
     slugs = await _run_off_loop(
         lambda: [a.slug for a in store.list() if (getattr(a, "folder_id", "") or "") in ids]
@@ -3286,12 +3302,12 @@ async def _withdraw_subtree_publications(folder_id: str, fstore: Any) -> str:
             publish_sync.DeleteWithdrawal.FAILED,
             publish_sync.DeleteWithdrawal.UNREACHABLE,
         ):
-            return slug
+            return slug, slugs
         # Withdrawn, or nothing was there: the destination no longer serves this copy, so
         # the record must stop claiming it. The cascade deletes the artifact moments later;
         # clearing here keeps the state honest if the cascade itself then fails.
         await _run_off_loop(lambda s=slug: store.clear_publication(s))
-    return ""
+    return "", slugs
 
 
 async def api_artifact_folder_delete(request: web.Request) -> web.Response:
@@ -3318,6 +3334,10 @@ async def api_artifact_folder_delete(request: web.Request) -> web.Response:
         return _err("folder not found", status=404)
     raw = (request.query.get("delete_contents") or "").strip().lower()
     delete_contents = raw in ("1", "true", "yes")
+    # The artifacts whose publication guard the destroy below holds. Empty on the safe
+    # path, which destroys no artifact at all -- it re-parents the children and removes
+    # one folder, so no publication record is at risk there.
+    subtree_slugs: list[str] = []
     if delete_contents:
         # The cascade destroys artifacts through `ArtifactStore.delete`, which knows
         # nothing about publications -- so before this fix a cascade over a folder holding
@@ -3330,7 +3350,7 @@ async def api_artifact_folder_delete(request: web.Request) -> web.Response:
         # refused: a folder that refuses to delete is recoverable, an orphaned public copy
         # is not. A withdrawal that DID succeed has its record cleared so the artifact
         # stops claiming a destination that no longer holds it.
-        blocked = await _withdraw_subtree_publications(fid, fstore)
+        blocked, subtree_slugs = await _withdraw_subtree_publications(fid, fstore)
         if blocked:
             msg = (
                 "This folder was not deleted: the published copy of "
@@ -3350,13 +3370,38 @@ async def api_artifact_folder_delete(request: web.Request) -> web.Response:
     try:
         # delete() scans every artifact (O(N)) and, in cascade mode, recursively
         # removes directories — offload off the event loop.
+        #
+        # Under the publication guard of every artifact the withdrawal pass found, for the
+        # reason the single-artifact delete takes it: a first publish uploads its object
+        # before it writes the record, so the store's own `refuse_if_published` re-read
+        # inside the cascade cannot see a publish that is halfway through, and the artifact
+        # is destroyed with its copy already served. Holding the guards here means each of
+        # those artifacts is either not being published at all or already recorded, in
+        # which case the cascade keeps it instead of destroying it.
+        #
+        # Acquired in slug order so two cascades over overlapping subtrees take them in the
+        # same order and cannot each hold what the other waits for. A publish holds exactly
+        # one of these at a time, so it can never be the second party in a cycle.
+        #
+        # An artifact filed INTO the subtree after that pass is not among them, so the
+        # cascade is told to leave anything outside the guarded set alone rather than
+        # destroy it: a publish in flight for it is invisible to the store's own record
+        # check, and the withdrawal pass never saw it either. It survives, unfiled, and is
+        # reported below.
         loop = asyncio.get_running_loop()
-        summary = await loop.run_in_executor(
-            subprocess_executor(),
-            lambda: fstore.delete(
-                fid, delete_contents=delete_contents, artifact_store=get_default_store()
-            ),
-        )
+        async with AsyncExitStack() as guards:
+            guarded = sorted(subtree_slugs)
+            for slug in guarded:
+                await guards.enter_async_context(publish_sync.publication_guard(slug))
+            summary = await loop.run_in_executor(
+                subprocess_executor(),
+                lambda: fstore.delete(
+                    fid,
+                    delete_contents=delete_contents,
+                    artifact_store=get_default_store(),
+                    destroyable_slugs=set(guarded) if delete_contents else None,
+                ),
+            )
     except ArtifactNotFoundError as exc:
         return _err(str(exc), status=404)
     except ArtifactError as exc:
@@ -3378,6 +3423,7 @@ async def api_artifact_folder_delete(request: web.Request) -> web.Response:
             "delete_contents": delete_contents,
             "deleted_artifacts": len(summary.get("deleted_artifact_slugs", [])),
             "kept_published_artifacts": len(kept),
+            "unguarded_artifacts": len(summary.get("unguarded_artifact_slugs", [])),
         },
     )
     payload: dict[str, Any] = {"ok": True, **summary}
@@ -3393,6 +3439,25 @@ async def api_artifact_folder_delete(request: web.Request) -> web.Response:
             "them would have left a public copy with nothing able to take it down. "
             "They are now unfiled. Unpublish them first, then delete them."
         )
+    unguarded = list(summary.get("unguarded_artifact_slugs", []))
+    if unguarded:
+        # Moved into the subtree while the withdrawal pass was running, so nothing here
+        # can rule out a publish in flight for them and the cascade left them alone.
+        # Saying so is the point: a surviving artifact nobody mentions reads as a bug.
+        joined = ", ".join(unguarded)
+        notice = (
+            f"The folder was deleted, but {joined} "
+            + ("was" if len(unguarded) == 1 else "were")
+            + " moved into it while the delete was running, so "
+            + ("it was" if len(unguarded) == 1 else "they were")
+            + " left alone rather than destroyed -- a copy being published at that "
+            "moment could not be taken down afterwards. "
+            + ("It is" if len(unguarded) == 1 else "They are")
+            + " now unfiled. Delete "
+            + ("it" if len(unguarded) == 1 else "them")
+            + " again if that is what you meant."
+        )
+        payload["notice"] = f"{payload['notice']} {notice}" if payload.get("notice") else notice
     return _json_response(payload)
 
 
