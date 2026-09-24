@@ -8535,7 +8535,10 @@
       "ask_agent_history": "Chiedi all'agente della cronologia"
     },
     "workspaceTree": {
-      "status_failed": "Impossibile leggere lo stato del repository."
+      "status_failed": "Impossibile leggere lo stato del repository.",
+      "row_empty": "Cartella vuota",
+      "row_hidden_only": "Nessun file visibile",
+      "row_truncated": "File non mostrati: limite di file raggiunto"
     },
     "skillsMultiSelect": {
       "add_skill": "Add skill",

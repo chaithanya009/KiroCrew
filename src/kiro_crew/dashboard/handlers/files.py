@@ -7922,6 +7922,7 @@ async def api_project_tree(request: web.Request) -> web.Response:
                 "directories": [],
                 "repo": False,
                 "truncatedDirectories": [],
+                "hiddenOnlyDirectories": [],
             }
         )
 
@@ -7965,14 +7966,30 @@ async def api_project_tree(request: web.Request) -> web.Response:
                     "repo": True,
                     "truncated": bool(truncated_directories),
                     "truncatedDirectories": truncated_directories,
+                    # A directory row exists here only as the parent of a listed
+                    # file, so an ignored-only folder is absent rather than
+                    # childless; the only childless directory this branch can
+                    # produce is a truncated one, reported above.
+                    "hiddenOnlyDirectories": [],
                 }
 
         # Fallback: walk twice so the first pass can compute fair per-directory
         # quotas without retaining every filename in memory. The complete walk
         # is required to return the directory skeleton past the file cap.
         directories: list[str] = []
+        # Directories the walk leaves CHILDLESS although they are not empty on
+        # disk: every entry is a directory this filter drops (a dot-directory
+        # or a tooling cache) or a symlink to a directory the walk does not
+        # follow, and there is no file. The dashboard renders a childless folder
+        # with a state row beneath it, and the row must not call such a folder
+        # empty -- `_bg/` holding only `.kiro/` is the reported case. Reported
+        # separately from `directories` so the tree can tell the two apart; a
+        # directory with a listed file or a kept subfolder is never in this list
+        # even when it also holds hidden entries.
+        hidden_only_directories: list[str] = []
         file_counts: dict[str, int] = {}
         for dirpath, dirnames, filenames in os.walk(base):
+            had_subdirectories = bool(dirnames)
             dirnames[:] = sorted(
                 d for d in dirnames if d not in _PROJECT_TREE_SKIP_DIRS and not d.startswith(".")
             )
@@ -7980,6 +7997,15 @@ async def api_project_tree(request: web.Request) -> web.Response:
             directory = "" if rel_dir == "." else rel_dir.replace(os.sep, "/")
             if directory:
                 directories.append(directory)
+                # A symlink to a directory stays in ``dirnames`` but the walk
+                # never descends it (``followlinks`` is off), so it becomes
+                # neither a row nor a parent: one more entry the listing hides.
+                if (
+                    had_subdirectories
+                    and not filenames
+                    and all(os.path.islink(os.path.join(dirpath, d)) for d in dirnames)
+                ):
+                    hidden_only_directories.append(directory)
             file_counts[directory] = len(filenames)
 
         quotas = _project_tree_file_quotas(file_counts, _PROJECT_TREE_MAX_ENTRIES)
@@ -8003,6 +8029,7 @@ async def api_project_tree(request: web.Request) -> web.Response:
             "repo": False,
             "truncated": bool(truncated_directories),
             "truncatedDirectories": truncated_directories,
+            "hiddenOnlyDirectories": hidden_only_directories,
         }
 
     result = await asyncio.to_thread(_run)
@@ -8025,7 +8052,7 @@ async def api_project_tree(request: web.Request) -> web.Response:
     # "Duplicate path" on adjacent identical entries. dict.fromkeys keeps first
     # occurrence. This does not affect "truncated": the cap is applied to the
     # raw listing above.
-    for key in ("paths", "directories", "truncatedDirectories"):
+    for key in ("paths", "directories", "truncatedDirectories", "hiddenOnlyDirectories"):
         result[key] = list(
             dict.fromkeys(redact_path_segments(p, redact) for p in result[key])
         )
