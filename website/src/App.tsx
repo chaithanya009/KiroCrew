@@ -86,7 +86,6 @@ import { SortableContext, useSortable, verticalListSortingStrategy, arrayMove } 
 import { CSS } from '@dnd-kit/utilities'
 import ChatPage from './pages/ChatPage'
 import PopoutFrame from './pages/PopoutFrame'
-import ArtifactPopoutFrame from './pages/ArtifactPopoutFrame'
 import TerminalPopoutFrame from './pages/TerminalPopoutFrame'
 
 import ErrorBoundary from './components/ErrorBoundary'
@@ -107,10 +106,6 @@ import CapabilitiesPage from './pages/CapabilitiesPage'
 // chunk sits at its size budget — the import() boundary keeps the page (and
 // its drawer/roster tree) out of the initial bundle.
 const MembersPage = lazy(() => import('./pages/members/MembersPage'))
-import ArtifactsPage from './pages/ArtifactsPage'
-import ArtifactDetailPage from './pages/ArtifactDetailPage'
-import RemoteArtifactDetailPage from './pages/RemoteArtifactDetailPage'
-import ArtifactDeployPage from './pages/ArtifactDeployPage'
 import SettingsPage from './pages/SettingsPage'
 import { InAppUpdateFlow } from './pages/settings/AboutPanel'
 import EmbedSettingsPage from './pages/EmbedSettingsPage'
@@ -3363,7 +3358,6 @@ export default function App() {
     {isPopout ? (
       <Routes>
         <Route path="/popout/chat/:slug?" element={<ErrorBoundary><PopoutFrame /></ErrorBoundary>} />
-        <Route path="/popout/artifact/:slug" element={<ErrorBoundary><ArtifactPopoutFrame /></ErrorBoundary>} />
         <Route path="/popout/terminal" element={<ErrorBoundary><TerminalPopoutFrame /></ErrorBoundary>} />
         {/* Belt-and-braces: any stray in-window navigation re-pins to the
             frame this window loaded as (isPopout is sticky, so the dashboard
@@ -4748,7 +4742,7 @@ export default function App() {
                 open the full /chat/<key> experience inside this same shell. */}
             <Route path="/sessions" element={<ErrorBoundary><Suspense fallback={null}><SessionsPage /></Suspense></ErrorBoundary>} />
             {/* Knowledge moved into Agent Capabilities; old bookmarks land on its tab. */}
-            <Route path="/knowledge" element={<Navigate to="/capabilities?tab=knowledge" replace />} />
+            <Route path="/knowledge" element={<Navigate to="/capabilities" replace />} />
 
             <Route path="/members" element={<ErrorBoundary><Suspense fallback={null}><MembersPage /></Suspense></ErrorBoundary>} />
             <Route path="/overview" element={<Navigate to="/settings/overview" replace />} />
@@ -4781,11 +4775,8 @@ export default function App() {
                 Matches bare /settings too (empty splat). */}
             <Route path="/settings/*" element={<SettingsPage />} />
             <Route path="/developer" element={<DeveloperPage />} />
-            <Route path="/artifacts" element={<ArtifactsPage />} />
-            <Route path="/artifacts/deploy" element={<Navigate to="/deploy" replace />} />
-            <Route path="/artifacts/remote/:provider/:externalId" element={<ErrorBoundary><RemoteArtifactDetailPage /></ErrorBoundary>} />
-            <Route path="/artifacts/:slug" element={<ArtifactDetailPage />} />
-            <Route path="/deploy" element={<ArtifactDeployPage />} />
+            <Route path="/artifacts/*" element={<Navigate to="/chat" replace />} />
+            <Route path="/deploy" element={<Navigate to="/chat" replace />} />
             {/* Builtin app routes — auto-discovered from registry. React Router v6
                 ranks static paths higher than parameterized ones, so /settings, /agents
                 etc. still match first. Unrecognized paths fall through to /chat.

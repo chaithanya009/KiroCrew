@@ -158,7 +158,6 @@ const NEW_MENU_GROUPS: { id: string; items: { kind: ViewKind | 'terminal'; icon:
       { kind: 'issues', icon: <CircleDot size={15} /> },
       { kind: 'files', icon: <Folders size={15} /> },
       { kind: 'links', icon: <LinkIcon size={15} /> },
-      { kind: 'artifacts', icon: <Component size={15} /> },
       { kind: 'subagents', icon: <Bot size={15} /> },
       { kind: 'workflows', icon: <Workflow size={15} /> },
       { kind: 'git', icon: <GitBranch size={15} /> },
@@ -516,6 +515,7 @@ export default function SidePanel({
   // to the leading tab — otherwise the withdrawal would hold only for a fresh
   // strip, which is not what the feature map promises.
   const isWithheld = useCallback((kind: TabKind): boolean => {
+    if (kind === 'artifact' || kind === 'artifacts') return true
     if (!hiddenViews) return false
     if (kind === 'terminal') return hiddenViews.has('terminal')
     if (kind === 'app' || isPanelTabKind(kind)) return hiddenViews.has('app')
@@ -525,10 +525,9 @@ export default function SidePanel({
     // its documents, or a persisted file tab would stay on the strip — and stay
     // ACTIVE — while every slot-bound view is withdrawn.
     if (kind === 'file' || kind === 'diff' || kind === 'folder') return hiddenViews.has('files')
-    if (kind === 'artifact') return hiddenViews.has('artifacts')
     return hiddenViews.has(kind)
   }, [hiddenViews])
-  const visibleTabs = useMemo(() => (hiddenViews ? tabs.filter(t => !isWithheld(t.kind)) : tabs), [tabs, hiddenViews, isWithheld])
+  const visibleTabs = useMemo(() => tabs.filter(t => !isWithheld(t.kind)), [tabs, isWithheld])
   const activeId = useMemo(() => {
     if (storedActiveId === null) return null
     if (leadingTabs?.some(t => t.id === storedActiveId)) return storedActiveId

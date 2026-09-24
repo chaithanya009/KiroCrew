@@ -420,6 +420,7 @@ _AUTO_NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$")
 
 # Bundled fallback — inside the kiro_crew package
 _BUILTIN_SKILLS_DIR = Path(__file__).parent / "builtin_skills"
+_EXCLUDED_FORK_SKILLS = frozenset({"artifacts", "learn", "memory", "knowledge"})
 
 
 @dataclass(frozen=True)
@@ -1836,7 +1837,7 @@ def _ensure_builtin_skills(base: Path) -> None:
     # Deliberate consequence: installs that predate provenance recording keep
     # their stale builtin dirs until a human removes them, because there is no
     # packaged tree left to prove ownership against.
-    stale_builtins = {"learn", "subagent", "cron", "kirocrew-core"} - source_names
+    stale_builtins = {"learn", "artifacts", "subagent", "cron", "kirocrew-core"} - source_names
     if base.exists():
         for name in stale_builtins:
             stale = base / name
@@ -2973,12 +2974,11 @@ class SkillsLoader:
     ) -> list[tuple[str, Path, str | None]]:
         """Return all ``(name, skill_file, within)`` pairs, filtering out disabled app skills."""
         disabled_apps = self._get_disabled_app_names()
-        if not disabled_apps:
-            return self._iter(project_dir)
         return [
             (name, skill_file, within)
             for name, skill_file, within in self._iter(project_dir)
-            if self._owning_app(name, skill_file) not in disabled_apps
+            if name not in _EXCLUDED_FORK_SKILLS
+            and self._owning_app(name, skill_file) not in disabled_apps
         ]
 
     def catalog_project_skills(self, project_dir: str | Path) -> list[dict]:
@@ -3782,7 +3782,7 @@ class SkillsLoader:
         matches enumeration: a repository cannot serve the body for a name the
         operator already installed globally.
         """
-        if not self._safe_name(name):
+        if not self._safe_name(name) or name in _EXCLUDED_FORK_SKILLS:
             return None
         _t0 = time.monotonic()
         skill_file = self._dir / name / "SKILL.md"

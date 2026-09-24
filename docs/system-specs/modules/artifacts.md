@@ -1,5 +1,9 @@
 # Artifacts Module
 
+> Fork status: disabled. The fork hides the artifact library, stops automatic
+> widget and image registration, excludes artifact MCP and CLI commands, and
+> rejects artifact API routes. Existing on-disk artifacts are preserved.
+
 ## Overview
 
 Artifacts give chat-rendered LLM-generated UI a persistent identity, version

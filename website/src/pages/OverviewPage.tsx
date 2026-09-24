@@ -1,7 +1,7 @@
 import { lazy, Suspense, type ReactNode } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
-import { ArrowLeft, ArrowRight, BarChart3, Brain, Clock } from 'lucide-react'
+import { ArrowLeft, ArrowRight, BarChart3, Clock } from 'lucide-react'
 import { useAppSelector } from '../store'
 import { useUptime } from '../hooks/useUptime'
 import { api } from '../api/client'
@@ -37,8 +37,8 @@ const MemoryTab = lazy(() => import('./overview/MemoryTab'))
  * on the Import tab.
  */
 
-const DRILL_VIEWS = ['memory', 'usage', 'wakatime'] as const
-type DrillView = (typeof DRILL_VIEWS)[number]
+type DrillView = 'memory' | 'usage' | 'wakatime'
+const DRILL_VIEWS: readonly DrillView[] = ['usage', 'wakatime']
 
 function fmtNum(n: number | undefined | null): string {
   if (n == null) return '—'
@@ -150,41 +150,7 @@ function WakaTimeSummaryCard({ onOpen }: { onOpen: () => void }) {
   )
 }
 
-/** Memory summary card — consolidation cadence + retention at a glance. */
-function MemorySummaryCard({ onOpen }: { onOpen: () => void }) {
-  const { data, isError, error } = useQuery<{ history_idle_hours?: number; history_max_days?: number; migrated?: boolean }>({
-    queryKey: ['memory-settings'],
-    queryFn: () => api.memorySettings(),
-  })
-  return (
-    <Card>
-      <CardTitle>
-        <Brain className="lucide-inline" /> {i18nT('pages.overviewPage.memory')}
-        <button onClick={onOpen} className="ml-auto inline-flex items-center gap-1 text-[12px] font-medium text-accent bg-transparent border-none cursor-pointer hover:underline">
-          {i18nT('pages.overviewPage.view_details')} <ArrowRight size={12} />
-        </button>
-      </CardTitle>
-      {isError ? (
-        // askAgent on: a read of the persisted memory settings; the card holds no
-        // input. Without this branch a rejected fetch left the skeleton up forever.
-        <ErrorNotice message={error?.message} askAgent testId="overview-memory-error" />
-      ) : !data ? (
-        <div className="skeleton h-14 rounded" />
-      ) : (
-        <div className="flex flex-col gap-1 text-[13px] text-muted">
-          <span>
-            {i18nT('pages.overviewPage.summarizes_chats_into_memory_after')} {data.history_idle_hours ?? 3}{i18nT('pages.overviewPage.h_idle')}
-            {!data.migrated && <> {i18nT('pages.overviewPage.keeps')} {data.history_max_days ?? 90} {i18nT('pages.overviewPage.days_of_history')}</>}
-            {data.migrated && <> {i18nT('pages.overviewPage.semantic_memory_active')}</>}
-          </span>
-          <span>{i18nT('pages.overviewPage.memory_graph_and_store_internals_live_on_the_dev')}</span>
-        </div>
-      )}
-    </Card>
-  )
-}
-
-type StatId = 'uptime' | 'sessions' | 'messages' | 'cronJobs' | 'subagents' | 'lessons'
+type StatId = 'uptime' | 'sessions' | 'messages' | 'cronJobs' | 'subagents'
 /**
  * Catalog key per status tile. A flat `Record` of full literal keys, indexed
  * inline at the `i18nT()` call — the shape `scripts/check-i18n-keys.mjs` can
@@ -197,7 +163,6 @@ export const STAT_LABEL_KEY: Record<StatId, string> = {
   messages: 'pages.overviewPage.stat_messages',
   cronJobs: 'pages.overviewPage.stat_cron_jobs',
   subagents: 'pages.overviewPage.stat_subagents',
-  lessons: 'pages.overviewPage.stat_lessons',
 }
 
 /**
@@ -294,7 +259,6 @@ export default function OverviewPage() {
           { id: 'messages', value: status?.messages },
           { id: 'cronJobs', value: status?.cron_jobs },
           { id: 'subagents', value: status?.subagents },
-          { id: 'lessons', value: status?.lessons },
         ] as { id: StatId; value?: string | number | null; accent?: boolean }[]).map((s, i) => (
           // Keyed on the stable id, not the label: a language switch changes the
           // label, which would remount every tile and replay the stagger animation.
@@ -340,7 +304,6 @@ export default function OverviewPage() {
       <div className="grid gap-3.5 grid-cols-2 max-[760px]:grid-cols-1">
         <UsageSummaryCard onOpen={() => setView('usage')} />
         <WakaTimeSummaryCard onOpen={() => setView('wakatime')} />
-        <MemorySummaryCard onOpen={() => setView('memory')} />
       </div>
 
       {/* Extension slot: the single downstream-owned panel for the region below

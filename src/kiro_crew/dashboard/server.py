@@ -122,7 +122,6 @@ from kiro_crew.dashboard.handlers.artifacts import (
     api_remote_artifacts_fork,
 )
 from kiro_crew.dashboard.handlers.feedback import setup_feedback_routes
-from kiro_crew.dashboard.handlers.knowledge import setup_knowledge_routes
 from kiro_crew.dashboard.handlers.link_meta import setup_link_meta_routes
 from kiro_crew.dashboard.handlers.secrets import setup_secrets_routes
 from kiro_crew.dashboard.handlers.source_providers import (
@@ -170,6 +169,7 @@ from kiro_crew.dashboard.token_auth import (
 from kiro_crew.deploy import _register_core_skills as _register_deploy_skills
 from kiro_crew.deploy.handlers import register_routes as _register_deploy_routes
 from kiro_crew.executors import subprocess_executor
+from kiro_crew.fork_profile import MEMORY_ENABLED, excluded_api_path
 from kiro_crew.hooks import ScriptHookStore, set_global_hook_store
 from kiro_crew.instances import run_marker
 from kiro_crew.instances.registry import InstancesRegistry
@@ -225,6 +225,14 @@ _AIOHTTP_CONTENT_TYPES.add_type("font/woff2", ".woff2")
 _AIOHTTP_CONTENT_TYPES.add_type("font/ttf", ".ttf")
 
 logger = logging.getLogger(__name__)
+
+
+@web.middleware
+async def _fork_feature_filter(request: web.Request, handler):
+    if excluded_api_path(request.path):
+        raise web.HTTPNotFound()
+    return await handler(request)
+
 
 _STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 _DIST_DIR = _STATIC_DIR / "dist"
@@ -4806,7 +4814,7 @@ async def start_dashboard(
     await asyncio.to_thread(_register_deploy_skills)
 
     # Knowledge Library
-    setup_knowledge_routes(app)
+    # The fork keeps the stored data intact but does not start the knowledge library.
     setup_weixin_routes(app)
     setup_feedback_routes(app)
     setup_secrets_routes(app)
@@ -5174,6 +5182,7 @@ async def start_dashboard(
             # latency middleware only, which keeps that one's "times the FULL
             # in-gateway handling" contract intact.
             deny_audit_middleware,
+            _fork_feature_filter,
             host_canonical_redirect,
             host_validation_middleware,
             no_cache_middleware,
@@ -5935,7 +5944,7 @@ async def start_dashboard(
     # Publish the gateway's shared memory task first and do not yield between
     # these assignments. create_task cannot enter its restore/open worker until
     # this coroutine yields back to the gateway after returning the ready state.
-    if schedule_memory_preparation is not None:
+    if MEMORY_ENABLED and schedule_memory_preparation is not None:
         state.memory_startup_task = schedule_memory_preparation()
     state.ready = True
     record_boot_to_ready((time.time() - state.start_time) * 1000.0, server="dashboard")
@@ -6202,6 +6211,7 @@ async def start_api_server(
         # Outer to every barrier that can refuse: a pre-audit 403 is recorded by
         # POSITION here, not by each deny site remembering to.
         deny_audit_middleware,
+        _fork_feature_filter,
         host_validation_middleware,
         csrf_middleware,
         token_auth_middleware(
@@ -6329,7 +6339,7 @@ async def start_api_server(
     # Publish the gateway's shared memory task at the same no-yield boundary as
     # the full dashboard. Headless MCP/chat callers therefore see the barrier
     # whenever they can observe ready=True.
-    if schedule_memory_preparation is not None:
+    if MEMORY_ENABLED and schedule_memory_preparation is not None:
         state.memory_startup_task = schedule_memory_preparation()
     state.ready = True
     record_boot_to_ready((time.time() - state.start_time) * 1000.0, server="api")

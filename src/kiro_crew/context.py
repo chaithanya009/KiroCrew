@@ -30,6 +30,7 @@ from kiro_crew.board_tag_grammar import is_grantable_tag_id
 from kiro_crew.config import live
 from kiro_crew.config.loader import KiroCrewConfig, workspace_dir_for
 from kiro_crew.config.paths import kiro_agents_dir
+from kiro_crew.fork_profile import ARTIFACTS_ENABLED, MEMORY_ENABLED
 from kiro_crew.context_blocks import measure_prompt
 from kiro_crew.cron import get_local_tz
 from kiro_crew.hooks import (
@@ -335,7 +336,7 @@ async def session_store_for_turn(ctx_builder: object, session_key: str) -> str:
         store_of_session, getattr(ctx_builder, "conversation_log", None), session_key
     )
     modes = getattr(ctx_builder, "_session_memory_modes", None)
-    if not isinstance(modes, dict) or modes.get(session_key) != "temporary":
+    if MEMORY_ENABLED and (not isinstance(modes, dict) or modes.get(session_key) != "temporary"):
         try:
             await prepare_store_vectors(ctx_builder, store, session_key=session_key)
         except (OSError, ValueError, sqlite3.Error):
@@ -1471,9 +1472,9 @@ def _config_scoped_groups(
     if cfg is None:
         cfg = KiroCrewConfig.load()
     withheld: set[str] = set()
-    if not (cfg.memory.persistence_enabled and cfg.memory.inject_memory):
+    if not (MEMORY_ENABLED and cfg.memory.persistence_enabled and cfg.memory.inject_memory):
         withheld.add(CONTEXT_GROUP_MEMORY)
-    if not (cfg.memory.persistence_enabled and cfg.memory.inject_lessons):
+    if not (MEMORY_ENABLED and cfg.memory.persistence_enabled and cfg.memory.inject_lessons):
         withheld.add(CONTEXT_GROUP_LESSONS)
     if not withheld:
         return context_groups
@@ -3108,7 +3109,7 @@ class ContextBuilder:
         # Widgets and artifacts need a chat window to render in, which is a
         # property of where the session is DISPLAYED, not where it started: a
         # Slack-born conversation with its dashboard tab open can render both.
-        if not has_dashboard_surface(session_key or ""):
+        if not ARTIFACTS_ENABLED or not has_dashboard_surface(session_key or ""):
             return prompt.replace("{{WIDGET_BLOCK}}", "")
 
         density = getattr(cfg.dashboard, "widget_density", "more")
@@ -3793,11 +3794,7 @@ class ContextBuilder:
                 "[WORKSPACE IDENTITY]\n"
                 f"You are operating in workspace: {ws_name}\n"
                 f"Workspace path: {ws_path}\n"
-                "A workspace is a shared space holding your knowledge base, "
-                "preferences, project notes, daily history and files.\n\n"
-                "Lessons saved with the learn_add tool apply across all "
-                "workspaces. Use them for durable corrections and preferences, "
-                "not for one-off facts.\n"
+                "A workspace is a shared space holding project files.\n"
                 "[End of workspace identity]\n\n"
             )
         _mark("workspace")
@@ -4261,7 +4258,7 @@ class ContextBuilder:
             admitted.append(
                 "[Context budget: omitted "
                 + ", ".join(sorted(omitted))
-                + "; use memory_recall for old memory and skill_search for skills.]\n\n"
+                + "; use skill_search for skills.]\n\n"
             )
         if protected_chars > max_context_chars:
             logger.warning(

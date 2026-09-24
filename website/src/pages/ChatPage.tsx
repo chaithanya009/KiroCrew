@@ -5610,7 +5610,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   const { data: sessionDocs } = useQuery({
     queryKey: ['session-artifacts', activeSlot],
     queryFn: () => api.artifactSessionDocs(activeSlot || undefined),
-    enabled: !!activeSlot,
+    enabled: false,
     staleTime: 15_000,
   })
   const artifactPaths = useMemo(

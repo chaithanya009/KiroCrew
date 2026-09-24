@@ -7,7 +7,7 @@
  * Order in this file = order in the rail (within each group). Add new
  * built-in surfaces here; do not add hardcoded badge logic to `App.tsx`.
  */
-import { MessageSquare, Bell, Component, CalendarDays, Settings, ClipboardCheck, Compass, Webhook, BookOpen, Link2, Library, MessageSquareText, Workflow, ScrollText, Bot } from 'lucide-react'
+import { MessageSquare, Bell, Component, CalendarDays, Settings, ClipboardCheck, Compass, Webhook, BookOpen, Link2, MessageSquareText, Workflow, ScrollText, Bot } from 'lucide-react'
 import type { ReactElement } from 'react'
 import { createSelector } from '@reduxjs/toolkit'
 import { KiroGhostMark } from '../components/KiroGhostMark'
@@ -187,6 +187,7 @@ registerBuiltinSurface({
   labelKey: 'nav.artifacts',
   icon: <Component size={16} />,
   group: 'Main',
+  hiddenFromNav: true,
 })
 
 // Knowledge is not a main-rail surface BY DEFAULT: it lives as a tab inside
@@ -241,7 +242,6 @@ const CAPABILITY_SUB_ITEMS: readonly { tab: string; labelKey: string; label: str
   { tab: 'crews', labelKey: 'pages.capabilitiesPage.crews_label', label: surfaceMachineValue('Crews'), icon: <Bot size={16} /> },
   { tab: 'skills', labelKey: 'pages.capabilitiesPage.skills_label', label: surfaceMachineValue('Skills'), icon: <BookOpen size={16} /> },
   { tab: 'mcp', labelKey: 'pages.capabilitiesPage.connections_label', label: surfaceMachineValue('Connections'), icon: <Link2 size={16} /> },
-  { tab: 'knowledge', labelKey: 'pages.capabilitiesPage.knowledge_label', label: surfaceMachineValue('Knowledge'), icon: <Library size={16} /> },
   { tab: 'prompts', labelKey: 'pages.capabilitiesPage.prompts_label', label: surfaceMachineValue('Prompts'), icon: <MessageSquareText size={16} /> },
   { tab: 'steering', labelKey: 'pages.capabilitiesPage.steering_label', label: surfaceMachineValue('Steering files'), icon: <ScrollText size={16} /> },
   { tab: 'hooks', labelKey: 'pages.capabilitiesPage.hooks_label', label: surfaceMachineValue('Hooks'), icon: <Webhook size={16} /> },

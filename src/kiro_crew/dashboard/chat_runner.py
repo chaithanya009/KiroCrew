@@ -357,6 +357,7 @@ from kiro_crew.wakatime.heartbeats import (
     note_coding_activity,
 )
 from kiro_crew.widget_artifacts import register_widgets_off_loop
+from kiro_crew.fork_profile import ARTIFACTS_ENABLED
 
 logger = logging.getLogger(__name__)
 
@@ -4978,7 +4979,7 @@ def _schedule_widget_registration(
     keys off the SAME ``slot.is_restricted`` signal, so the two agree by
     construction.
     """
-    if not text:
+    if not ARTIFACTS_ENABLED or not text:
         return
     if getattr(slot, "is_restricted", False):
         return

@@ -1,6 +1,6 @@
 import { lazy, Suspense, useEffect } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
-import { ScrollText, Monitor, Brain, Archive, Database, Network, Activity, FileCode2, Cpu, Bug, ArrowRight } from 'lucide-react'
+import { ScrollText, Monitor, Archive, Database, Network, Activity, FileCode2, Cpu, Bug, ArrowRight } from 'lucide-react'
 import SidePanelLayout from '../components/SidePanelLayout'
 import { ContentSkeleton } from '../components/ui'
 import { settingsPath } from '../components/settingsPath'
@@ -43,7 +43,6 @@ function buildTabs() {
     { key: 'telemetry', label: i18nT('pages.developerPage.tabs.telemetry.label'), icon: <Activity size={16} />, description: i18nT('pages.developerPage.tabs.telemetry.description') },
     { key: 'storage', label: i18nT('pages.developerPage.tabs.storage.label'), icon: <Database size={16} />, description: i18nT('pages.developerPage.tabs.storage.description') },
     { key: 'mcp-pool', label: i18nT('pages.developerPage.tabs.mcpPool.label'), icon: <Network size={16} />, description: i18nT('pages.developerPage.tabs.mcpPool.description') },
-    { key: 'memory', label: i18nT('pages.developerPage.tabs.memory.label'), icon: <Brain size={16} />, description: i18nT('pages.developerPage.tabs.memory.description') },
     { key: 'config', label: i18nT('pages.developerPage.tabs.config.label'), icon: <FileCode2 size={16} />, description: i18nT('pages.developerPage.tabs.config.description') },
     { key: 'agent-backend', label: i18nT('pages.developerPage.tabs.agentBackend.label'), icon: <Cpu size={16} />, description: i18nT('pages.developerPage.tabs.agentBackend.description') },
     { key: 'debug-tools', label: i18nT('pages.developerPage.tabs.debugTools.label'), icon: <Bug size={16} />, description: i18nT('pages.developerPage.tabs.debugTools.description') },

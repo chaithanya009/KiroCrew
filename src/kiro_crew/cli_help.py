@@ -183,8 +183,18 @@ def render_epilog(width: int = 13) -> str:
     commands immediately above them, and a reader who stops after the first
     screen is exactly the reader who needs them.
     """
+    from kiro_crew.fork_profile import ARTIFACTS_ENABLED, MEMORY_ENABLED
+
+    excluded = set()
+    if not ARTIFACTS_ENABLED:
+        excluded.add("artifact")
+    if not MEMORY_ENABLED:
+        excluded.update({"memory", "knowledge", "learn", "consolidate", "bench"})
     lines: list[str] = []
     for index, (section, commands) in enumerate(COMMAND_GROUPS):
+        commands = tuple((name, summary) for name, summary in commands if name not in excluded)
+        if not commands:
+            continue
         lines.append(f"{section}:")
         for name, summary in commands:
             lines.append(f"  {name:<{width}}{summary}")

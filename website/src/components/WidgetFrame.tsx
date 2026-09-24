@@ -396,7 +396,7 @@ export default function WidgetFrame({ html, title = 'Widget', slug, messageTs, s
         throw e
       }
     },
-    enabled: !!effectiveSlug,
+    enabled: false,
     retry: false,
     staleTime: 5 * 60 * 1000,
     // Optimistic fill: an explicit slug attr means the agent re-emitted an
@@ -518,7 +518,7 @@ export default function WidgetFrame({ html, title = 'Widget', slug, messageTs, s
           {/* Linked whenever the artifact EXISTS — not only when starred. Every
               emitted widget is auto-registered, so the artifact page is
               reachable from the moment it renders. */}
-          {existingSlug ? (
+          {false && existingSlug ? (
             <a
               href={`/artifacts/${existingSlug}`}
               className="text-text hover:text-accent hover:underline"
@@ -530,7 +530,7 @@ export default function WidgetFrame({ html, title = 'Widget', slug, messageTs, s
           {saveError && <span className="ml-2 text-[12px] text-danger" title={saveError}>{i18nT('components.widgetFrame.save_failed')}</span>}
         </span>
         <IconButtonGroup reveal={!expanded}>
-          <IconButton
+          {false && <IconButton
             variant={savedSlug ? 'active' : 'default'}
             onClick={toggleArtifact}
             disabled={saving || !effectiveSlug}
@@ -545,7 +545,7 @@ export default function WidgetFrame({ html, title = 'Widget', slug, messageTs, s
             aria-label={savedSlug ? i18nT('components.widgetFrame.remove_artifact_from_library', { name: savedSlug }) : i18nT('components.widgetFrame.star_as_artifact')}
           >
             <Star size={12} fill={savedSlug ? 'currentColor' : 'none'} />
-          </IconButton>
+          </IconButton>}
           <IconButton onClick={downloadAsHtml} title={i18nT('components.widgetFrame.download_as_html')} aria-label={i18nT('components.widgetFrame.download_as_html')}>
             <Download size={12} />
           </IconButton>

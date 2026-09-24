@@ -971,6 +971,7 @@ export default function CommandBarOverlay({
       })
     }
     for (const entry of SETTINGS_REGISTRY) {
+      if (entry.id.includes('memory') || entry.id.includes('knowledge') || entry.id.includes('artifact')) continue
       rows.push({
         id: `setting:${entry.id}`,
         // The shared resolver, not a bare labelKey lookup: resolving the key
@@ -983,7 +984,7 @@ export default function CommandBarOverlay({
         route: settingsRoute(entry),
       })
     }
-    return rows
+    return rows.filter(row => row.id !== 'command:search-artifacts')
     // `resolved` appears in the deps without appearing in the body on purpose: every
     // title and subtitle above is a catalog lookup, and a language change re-renders
     // the tree without remounting it, which does not recompute a memo. Omitting it

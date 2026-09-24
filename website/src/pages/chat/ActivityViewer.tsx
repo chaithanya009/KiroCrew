@@ -1007,7 +1007,6 @@ export default function ActivityViewer({ subagents, toolLog, open, onToggle, slo
     ...(hasSources ? [{ key: 'changes' as const, label: i18nT('pages.chat.activityViewer.changes'), icon: <GitPullRequest size={13} />, count: sources!.length }] : []),
     ...(hasIssues ? [{ key: 'issues' as const, label: i18nT('pages.chat.activityViewer.issues'), icon: <CircleDot size={13} />, count: issues!.length }] : []),
     { key: 'links', label: i18nT('pages.chat.activityViewer.links'), icon: <LinkIcon size={13} />, count: navLinks?.length || 0 },
-    { key: 'artifacts', label: i18nT('pages.chat.activityViewer.artifacts'), icon: <Component size={13} /> },
     { key: 'subagents', label: i18nT('pages.chat.activityViewer.subagents'), icon: <Bot size={13} />, count: ids.length + toolLog.filter(isSpawnApproval).length },
     { key: 'workflows', label: i18nT('pages.chat.activityViewer.workflows'), icon: <Workflow size={13} />, count: wfRunningCount },
     { key: 'logs', label: i18nT('pages.chat.activityViewer.logs'), icon: <ScrollText size={13} /> },
@@ -1206,7 +1205,7 @@ export default function ActivityViewer({ subagents, toolLog, open, onToggle, slo
       )}
 
       {/* Artifacts tab (in-session documents) */}
-      {effectiveTab === 'artifacts' && <SessionArtifactsTab slot={slot} onArtifactOpen={onArtifactOpen} />}
+      {false && effectiveTab === 'artifacts' && <SessionArtifactsTab slot={slot} onArtifactOpen={onArtifactOpen} />}
 
       {/* Side tab */}
       {/* Sits next to Logs on purpose: both answer "what actually happened

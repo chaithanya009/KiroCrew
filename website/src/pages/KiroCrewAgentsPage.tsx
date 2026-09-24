@@ -635,7 +635,6 @@ function BindingFields({
     <>
       <TemplateField label={templateLabel} options={kiroAgentOptions} value={kiroAgent} onChange={setKiroAgent} subject={subject} editLaterNote provenance={templateProvenance} />
       <WorkspaceField options={workspaceOptions} value={workspace} onChange={setWorkspace} onNewWorkspace={onNewWorkspace} subject={subject} />
-      <p className="text-[11.5px] leading-relaxed text-muted">{i18nT('pages.kiroCrewAgentsPage.private_memory_auto')}</p>
       {modelOptions && setModel && model !== undefined && (
         <ModelField options={modelOptions} value={model} onChange={setModel} />
       )}
@@ -703,7 +702,7 @@ function CrewCard({ agent, isDefault, shared, onOpen }: {
       <div className="grid grid-cols-2 gap-x-3 gap-y-2 border-t border-border pt-3">
         <Binding icon={<Boxes className="lucide-inline" aria-hidden="true" />} label={provider.labels.agentTemplateField} value={agent.kiro_agent} />
         <Binding icon={<FolderOpen className="lucide-inline" aria-hidden="true" />} label={i18nT('pages.kiroCrewAgentsPage.workspace_2')} value={agent.workspace} note={filesShared ? sharedNote : undefined} />
-        <Binding icon={<Database className="lucide-inline" aria-hidden="true" />} label={i18nT('pages.kiroCrewAgentsPage.memory_store')} value={agent.memory_store} note={memoryShared ? sharedNote : undefined} />
+        {false && <Binding icon={<Database className="lucide-inline" aria-hidden="true" />} label={i18nT('pages.kiroCrewAgentsPage.memory_store')} value={agent.memory_store} note={memoryShared ? sharedNote : undefined} />}
         <Binding
           icon={<Sparkles className="lucide-inline" aria-hidden="true" />}
           label={i18nT('pages.kiroCrewAgentsPage.model')}
@@ -791,10 +790,10 @@ function CrewRow({ agent, isDefault, shared, onOpen }: {
         {agent.workspace}
         {filesShared && <Badge variant="warn" className="ml-1.5">{sharedNote}</Badge>}
       </TableCell>
-      <TableCell className="font-mono text-muted">
+      {false && <TableCell className="font-mono text-muted">
         {agent.memory_store}
         {memoryShared && <Badge variant="warn" className="ml-1.5">{sharedNote}</Badge>}
-      </TableCell>
+      </TableCell>}
       <TableCell className={`font-mono ${agent.model ? 'text-muted' : 'italic text-muted'}`}>
         {agent.model || i18nT('pages.kiroCrewAgentsPage.inherited')}
       </TableCell>
@@ -1553,7 +1552,7 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
   const sharingMemoryStore = editing
     ? agents.filter(a => a.name !== editing && a.memory_store === memoryStore).map(a => a.name)
     : []
-  const collidingCrews = [...new Set([...sharingWorkspace, ...sharingMemoryStore])]
+  const collidingCrews = sharingWorkspace
 
   const creating = sheet?.mode === 'create'
   const [avatarUploading, setAvatarUploading] = useState(false)
@@ -1877,7 +1876,7 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
 
   return (
     <>
-      {!embedded && <PageHeader title={i18nT('pages.kiroCrewAgentsPage.agents')} subtitle={i18nT('pages.kiroCrewAgentsPage.manage_agent_workspace_memory_store_bindings')} />}
+      {!embedded && <PageHeader title={i18nT('pages.kiroCrewAgentsPage.agents')} />}
       <div className={`${embedded ? '' : 'px-4 md:px-6'} pb-8 overflow-y-auto flex-1 min-h-0`}>
         {/* A roster that failed to load must not read as "you have no crews":
             the empty state below would say exactly that. Hand-off only while the
@@ -1899,12 +1898,12 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
           testId="crews-editor-options-load-error"
         />
         {/* New members receive member-scoped V2; existing V1 bindings stay unchanged. */}
-        <div className="mb-3.5 flex items-start gap-2 rounded-lg border border-accent-subtle bg-bg-accent px-3 py-2.5">
+        {false && <div className="mb-3.5 flex items-start gap-2 rounded-lg border border-accent-subtle bg-bg-accent px-3 py-2.5">
           <Sparkles className="lucide-inline mt-0.5 shrink-0 text-accent" aria-hidden="true" />
           <span className="text-[12.5px] leading-relaxed text-muted">
             {i18nT('pages.kiroCrewAgentsPage.bindings_member_memory_notice')}
           </span>
-        </div>
+        </div>}
 
         {/* Which crew a new chat starts as, hoisted out of the cards. Two jobs:
             it answers "which one is the default" without hunting for a badge,
@@ -2017,12 +2016,12 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
                       <InfoTip text={i18nT('pages.kiroCrewAgentsPage.bindings_preview_info')} />
                     </span>
                   </TableHead>
-                  <TableHead aria-label={i18nT('pages.kiroCrewAgentsPage.memory_store')}>
+                  {false && <TableHead aria-label={i18nT('pages.kiroCrewAgentsPage.memory_store')}>
                     <span className="inline-flex items-center gap-1.5">
                       {i18nT('pages.kiroCrewAgentsPage.memory_store')}
                       <InfoTip text={i18nT('pages.kiroCrewAgentsPage.bindings_preview_info')} />
                     </span>
-                  </TableHead>
+                  </TableHead>}
                   <TableHead>{i18nT('pages.kiroCrewAgentsPage.model')}</TableHead>
                 </TableRow>
               </TableHeader>
@@ -2388,14 +2387,14 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
                         onNewWorkspace={() => setWsModalOpen(true)}
                         subject="agent"
                       />
-                      <MemoryStoreField
+                      {false && <MemoryStoreField
                         value={memoryStore}
                         member={editing}
                         memoryState={memberMemoryState(editing, memoryStore, kirocrewCfg?.memory_stores)}
                         busy={sheetBusy || !kirocrewCfg}
                         manageDisabled={dirtyPanes.size > 0 || schedDraft}
                         onManage={() => navigate(`/settings/overview?view=memory&store=${encodeURIComponent(editing === 'default' ? 'default' : memoryStore)}`)}
-                      />
+                      />}
                       {/* The default assistant's shared-workspace warning does not
                           describe another member's memory ownership. */}
                       {editing === 'default' && collidingCrews.length > 0 && (

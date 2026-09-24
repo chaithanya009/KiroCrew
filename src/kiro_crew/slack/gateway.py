@@ -3420,7 +3420,9 @@ class GatewayOrchestrator:
         # initialized every shared tier. No old store is opened in the meantime.
         from kiro_crew.memory_startup import MemoryStartup
 
-        self._memory_startup = MemoryStartup.begin()
+        from kiro_crew.fork_profile import MEMORY_ENABLED
+
+        self._memory_startup = MemoryStartup.begin() if MEMORY_ENABLED else None
 
         # Any telemetry.* write rebuilds the metrics recorder, so a field other than
         # `enabled` (retention, export interval, OTLP endpoint) is not frozen at
@@ -10970,6 +10972,10 @@ class GatewayOrchestrator:
 
     def _schedule_memory_preparation(self) -> "asyncio.Task[None] | None":
         """Publish the one restore/open task without yielding to its worker."""
+        from kiro_crew.fork_profile import MEMORY_ENABLED
+
+        if not MEMORY_ENABLED:
+            return None
         if self._memory_startup is None:
             return None
         if self._memory_startup_task is None:

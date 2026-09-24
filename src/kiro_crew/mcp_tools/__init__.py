@@ -17,14 +17,11 @@ from typing import Any
 # Descriptor modules, in the order their tools are advertised.
 DOMAIN_MODULES: tuple[str, ...] = (
     "spawn",
-    "learn",
     "ledger",
     "skills",
     "logs",
     "control",
     "messaging",
-    "artifacts",
-    "knowledge",
     "sessions",
     "workflows",
     "apps",

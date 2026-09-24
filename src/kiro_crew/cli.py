@@ -3049,6 +3049,14 @@ The dashboard port is set with the KIROCREW_PORT env var, not a config key.
     # and before parse_args.
     cli_help.hide_internal_commands(sub)
 
+    # Keep upstream parser definitions intact while removing these commands from
+    # the fork's CLI and help output. This small seam is easier to merge.
+    excluded = {"artifact", "memory", "learn", "knowledge", "consolidate", "bench"}
+    for command in excluded:
+        sub._name_parser_map.pop(command, None)
+    sub._choices_actions[:] = [
+        choice for choice in sub._choices_actions if choice.dest not in excluded
+    ]
     args = parser.parse_args()
 
     # Direct agent-bearing CLI commands do not construct the long-lived

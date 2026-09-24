@@ -1682,6 +1682,10 @@ def _installed_theme_persona(slug: str) -> str:
 
 def _maybe_consolidate(state, slot) -> None:
     """Run memory consolidation unless session is restricted."""
+    from kiro_crew.fork_profile import MEMORY_ENABLED
+
+    if not MEMORY_ENABLED:
+        return
     if state.consolidator and not slot.is_restricted:
         state.consolidator.maybe_consolidate(effective_session_key(slot))
     elif state.consolidator and slot.is_restricted:

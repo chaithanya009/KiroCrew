@@ -29,7 +29,7 @@ def schemas() -> list[dict[str, Any]]:
             "name": "session_ledger_read",
             "description": (
                 "Read THIS session's durable work ledger: the state record "
-                "(goal, phase, next step, tried/rejected approaches, artifact "
+                "(goal, phase, next step, tried/rejected approaches, file "
                 "pointers) plus the recent event tail. The ledger lives on "
                 "disk and survives context compaction — treat it as "
                 "authoritative over your memory of prior cycles. Call it when "
@@ -46,7 +46,7 @@ def schemas() -> list[dict[str, Any]]:
                 "durable ledger, so the state survives context compaction and "
                 "is re-injected into monitor-loop cycles. Write what a cold "
                 "resume needs: `next` as a concrete intent (not a status "
-                "word), approaches you tried and rejected, and artifact "
+                "word), approaches you tried and rejected, and file "
                 "pointers (worktree, branch, PR). Fields you omit keep their "
                 "stored values — partial updates are the norm. Changing "
                 f"`phase` REQUIRES an `event` (+ `event_kind`); phases "

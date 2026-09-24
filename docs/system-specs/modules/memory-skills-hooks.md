@@ -1,5 +1,10 @@
 # Memory, Skills & Hooks Modules
 
+> Fork status: persistent memory and knowledge are disabled. The fork withholds
+> memory and lessons from agent context, disables consolidation and backups,
+> excludes learning and knowledge tools and the artifact skill, and rejects
+> memory and knowledge API routes. Chat transcripts and session resume remain.
+
 ## Overview
 
 Memory V2 is a development-stage replacement with one stable `member_id` mapped

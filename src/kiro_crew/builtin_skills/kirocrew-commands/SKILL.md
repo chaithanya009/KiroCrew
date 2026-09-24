@@ -2,7 +2,7 @@
 name: kirocrew-commands
 description: Complete CLI reference for Kiro Crew commands. Use for help, commands, setup, how to, what can you do, getting started, onboarding.
 always: false
-triggers: help, commands, setup, gateway, how to, what can you do, getting started, onboard, browse, auth, doctor, cron, artifact, memory, snapshot, eval, security, kirocrew pod, pod up, pod down, pod ls, pod status, pod logs, pod provision, pod install, pod token
+triggers: help, commands, setup, gateway, how to, what can you do, getting started, onboard, browse, auth, doctor, cron, snapshot, eval, security, kirocrew pod, pod up, pod down, pod ls, pod status, pod logs, pod provision, pod install, pod token
 inject_on_trigger: false
 ---
 # Kiro Crew CLI Reference
@@ -252,51 +252,6 @@ writes.
 | `kirocrew cron preview SCRIPT` | Run a script cron locally with real MCP tools; notifications are printed, not delivered |
 | `kirocrew cron preview SCRIPT -m "msg" -e K=V` | Preview with an input message / extra env vars |
 
-## Learning & Memory
-
-| Command | Description |
-|---------|-------------|
-| `kirocrew learn list` | List all saved lessons |
-| `kirocrew learn add "rule text"` | Save a lesson (category: knowledge) |
-| `kirocrew learn add "rule text" --category tool` | Save with category (tool/preference/knowledge) |
-| `kirocrew learn add "rule text" --negative "avoid X"` | Save with negative example |
-| `kirocrew learn remove "query"` | Remove lessons matching substring (add `--repo-scope FRAG` to remove only that scope, `--repo-scope ""` for global only) |
-| `kirocrew memory list` | Show semantic memory entries |
-| `kirocrew memory search "query"` | Search episodic memories |
-| `kirocrew memory stats` | Show memory statistics |
-| `kirocrew memory audit` | Scan memory for suspicious content |
-| `kirocrew memory export` | Export the default store's rows to JSON (stdout) |
-| `kirocrew memory export -o file.json` | Export to file |
-| `kirocrew memory export --store <name>` | Export a named store's rows instead |
-| `kirocrew memory import file.json` | Import memory from JSON |
-| `kirocrew memory import --store <name> file.json` | Import into a named store instead |
-| `kirocrew memory migrate` | Migrate legacy markdown memory to vector store |
-| `kirocrew memory show [preferences\|projects\|history]` | Show the markdown memory layer (default: all three; `--format md\|json`, `--since YYYY-MM-DD` for history) |
-| `kirocrew knowledge dedup` | Preview cross-source duplicate knowledge documents (dry-run) |
-| `kirocrew knowledge dedup --apply` | Actually collapse the duplicates |
-| `kirocrew consolidate` | List sessions with unconsolidated messages |
-| `kirocrew consolidate SESSION_KEY` | Force consolidate a session (triggers auto-skill extraction) |
-| `kirocrew consolidate --all` | Consolidate all pending sessions |
-
-## Artifacts
-
-LLM-generated UI components (widgets, HTML, markdown, SVG, JSON, text).
-
-| Command | Description |
-|---------|-------------|
-| `kirocrew artifact list` | List all artifacts |
-| `kirocrew artifact list --tag ops --kind widget` | Filter by tag and kind |
-| `kirocrew artifact list -q "CR"` | Substring filter on name |
-| `kirocrew artifact show SLUG` | Print artifact content |
-| `kirocrew artifact show SLUG --version 2` | Show specific version |
-| `kirocrew artifact show SLUG --meta` | Show metadata as JSON |
-| `kirocrew artifact save --name "My Widget" --content-file widget.html` | Save new artifact |
-| `kirocrew artifact save --name "X" --content "..." --tags ops,cr` | Save with inline content |
-| `kirocrew artifact update SLUG --content-file widget.html` | Update artifact content |
-| `kirocrew artifact update SLUG --name "New Name" --tags ops` | Rename/retag |
-| `kirocrew artifact versions SLUG` | List version numbers |
-| `kirocrew artifact delete SLUG` | Delete artifact and all versions |
-
 ## Agents & Workspaces
 
 | Command | Description |
@@ -374,7 +329,7 @@ On macOS the attach path additionally needs elevated privileges (the OS denies
 `task_for_pid`), so it may require sudo; `--call` needs neither py-spy nor sudo.
 
 `desktop metrics` reads a recording rather than querying the app: `getAppMetrics()`
-is Electron-main-only, so the app samples itself into an artifact when **started**
+is Electron-main-only, so the app samples itself into a recording when **started**
 with `KIROCREW_DEBUG` set. Setting the variable only for the CLI does not make an
 already-running app record -- restart it.
 
@@ -393,11 +348,8 @@ already-running app record -- restart it.
 | `kirocrew security events -n 50` | Show N entries |
 | `kirocrew security verify` | Verify security event log HMAC integrity |
 | `kirocrew eval` | Run smoke test evaluation (~30s) |
-| `kirocrew eval memory_recall_basic` | Run specific scenario by name |
 | `kirocrew eval --all` | Run all scenarios (slow) |
 | `kirocrew eval --judge` | Enable LLM judge scoring |
-| `kirocrew bench list` | Show the available corpora and what is cached |
-| `kirocrew bench fetch CORPUS` | Download a corpus into the local cache and verify its checksum |
 | `kirocrew bench retrieval` | Measure retrieval recall/nDCG against a corpus (deterministic) |
 | `kirocrew bench kb-retrieval` | Measure Knowledge Library recall/MRR/nDCG against a golden set (deterministic) |
 | `kirocrew bench compare A B` | Diff two saved JSON reports; refuses to attribute a delta when the runs disagree on corpus |
@@ -500,7 +452,7 @@ rather than reporting a silent success. These are human debug/diagnostic twins o
 | `kirocrew restore --mode replace` | Replace mode (default) |
 | `kirocrew restore --mode merge` | Merge mode |
 | `kirocrew restore --dry-run` | Preview without applying |
-| `kirocrew restore --components memory,crons` | Restore specific components only |
+| `kirocrew restore --components crons` | Restore specific components only |
 | `kirocrew restore --list-components` | List restorable components |
 | `kirocrew restore --force` | Restore even if gateway is running |
 

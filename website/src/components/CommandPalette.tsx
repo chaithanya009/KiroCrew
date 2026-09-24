@@ -106,7 +106,7 @@ export const SEARCH_DEBOUNCE_MS = 250
  * palette, mirroring the chat composer's `$skill` / `/command` muscle memory.
  * `@` is mapped to Artifacts here (the palette's `@` destination). Value =
  * provider (tab) id. */
-const SIGIL_SCOPE: Record<string, string> = { $: 'skills', '@': 'artifacts', '/': 'actions' }
+const SIGIL_SCOPE: Record<string, string> = { $: 'skills', '/': 'actions' }
 
 export default function CommandPalette({
   open,
@@ -170,7 +170,7 @@ export default function CommandPalette({
   // then a list that narrows. Registering a second folder surface here would make
   // the host own a copy of a feature the app already owns, and the two would drift.
   const tabs = useMemo<ResourceProvider[]>(
-    () => [all, sessions, knowledge, skills, prompts, artifacts, apps, pages, actions, settings],
+    () => [all, sessions, skills, prompts, apps, pages, actions, settings],
     [all, sessions, knowledge, skills, prompts, artifacts, apps, pages, actions, settings],
   )
 
@@ -189,7 +189,6 @@ export default function CommandPalette({
   useEffect(() => {
     registerProvider(sessions)
     registerProvider(prompts)
-    registerProvider(artifacts)
     registerProvider(apps)
     registerProvider(pages)
     registerProvider(actions)

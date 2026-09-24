@@ -3042,11 +3042,11 @@ def _build_memory_config(memory_data: dict) -> MemoryConfig:
         semantic_keys=memory_data.get("semantic_keys", []),
         history_idle_hours=memory_data.get("history_idle_hours", 3.0),
         history_max_days=_safe_nonnegative_int(memory_data.get("history_max_days", 365), 365),
-        backup_enabled=_safe_bool(memory_data.get("backup_enabled", True), True),
+        backup_enabled=False,
         backup_keep=_safe_int(memory_data.get("backup_keep", 7), 7, 1, None),
-        persistence_enabled=_safe_bool(memory_data.get("persistence_enabled", True), True),
-        inject_memory=_safe_bool(memory_data.get("inject_memory", True), True),
-        inject_lessons=_safe_bool(memory_data.get("inject_lessons", True), True),
+        persistence_enabled=False,
+        inject_memory=False,
+        inject_lessons=False,
         migrated=memory_data.get("migrated", False),
     )
 

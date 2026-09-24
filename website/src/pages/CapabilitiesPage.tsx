@@ -1,6 +1,6 @@
 import { lazy, Suspense, useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
-import { Link2, BookOpen, Users, MessageSquareText, Webhook, Compass, Workflow, Library, FileCode2 } from 'lucide-react'
+import { Link2, BookOpen, Users, MessageSquareText, Webhook, Compass, Workflow, FileCode2 } from 'lucide-react'
 import SidePanelLayout from '../components/SidePanelLayout'
 import ErrorBoundary from '../components/ErrorBoundary'
 import RestartButton from '../components/RestartButton'
@@ -10,7 +10,6 @@ import { useConnectionsUiEnabled } from '../hooks/useConnectionsUi'
 import KiroCrewAgentsPage from './KiroCrewAgentsPage'
 import HooksPage from './HooksPage'
 import ConnectionsPage from './connections/ConnectionsPage'
-import KnowledgePage from './KnowledgePage'
 import { SkillsTab, PromptsTab, SteeringTab } from './overview'
 import WorkflowLibraryTab from './overview/WorkflowLibraryTab'
 import { ContentSkeleton } from '../components/ui'
@@ -69,7 +68,6 @@ export default function CapabilitiesPage() {
       // `BookOpen`: Skills already carries BookOpen in this same rail.
       // `fixedContent`: the page is a full-height flex shell (graph view,
       // Virtuoso-style internal scrolling), so its pane must contain it.
-      { key: 'knowledge', label: t('pages.capabilitiesPage.knowledge_label'), icon: <Library size={16} />, description: t('pages.capabilitiesPage.knowledge_description'), group: groupKnowledge, fixedContent: true },
       { key: 'prompts', label: t('pages.capabilitiesPage.prompts_label'), icon: <MessageSquareText size={16} />, description: t('pages.capabilitiesPage.prompts_description', { registry: provider.labels.pluginRegistryName || 'packages' }), group: groupKnowledge },
       { key: 'steering', label: t('pages.capabilitiesPage.steering_label'), icon: <Compass size={16} />, description: t('pages.capabilitiesPage.steering_description'), group: groupKnowledge },
       { key: 'hooks', label: t('pages.capabilitiesPage.hooks_label'), icon: <Webhook size={16} />, description: t('pages.capabilitiesPage.hooks_description'), group: groupAutomation },
@@ -94,7 +92,6 @@ export default function CapabilitiesPage() {
             used to provide: the page lazy-loads the Graph chunk, and a stale
             chunk after a deploy would otherwise reject through to the root
             boundary and take the whole dashboard down with it. */}
-        {tab === 'knowledge' && <ErrorBoundary><KnowledgePage embedded /></ErrorBoundary>}
         {tab === 'steering' && <SteeringTab />}
         {tab === 'hooks' && <HooksPage embedded />}
         {tab === 'prompts' && <PromptsTab />}

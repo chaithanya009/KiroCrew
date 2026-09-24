@@ -5674,6 +5674,10 @@ class DashboardState:
 
     def _count_lessons(self) -> int | None:
         """Count available Global lessons without blocking the recovery dashboard."""
+        from kiro_crew.fork_profile import MEMORY_ENABLED
+
+        if not MEMORY_ENABLED:
+            return 0
         from kiro_crew.memory_startup import MemoryStartupUnavailable
 
         try:

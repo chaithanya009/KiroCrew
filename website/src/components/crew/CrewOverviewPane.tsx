@@ -7,7 +7,7 @@
  * on. Those boxes are gone; the facts they carried are here, and each is a value
  * rather than a sentence.
  */
-import { Boxes, Clock, Cpu, Database, FolderOpen, Users, Waypoints, Webhook } from 'lucide-react'
+import { Boxes, Clock, Cpu, FolderOpen, Users, Waypoints, Webhook } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import CrewOverviewDiagram, { type CrewWireNode } from './CrewOverviewDiagram'
 import type { CrewPaneKey } from './crewEditorSections'
@@ -87,9 +87,9 @@ function Stat({ icon, value, label }: { icon?: React.ReactNode; value: string; l
 }
 
 export default function CrewOverviewPane({
-  hub, templateLabel, template, workspace, memoryStore, modelLabel, modelInherited,
+  hub, templateLabel, template, workspace, modelLabel, modelInherited,
   resolvedModel, activeSchedules, schedulesUnknown, routingWords, sharingCrews,
-  workspaceShared, memoryShared, webhookTokens, webhooksUnknown, onNavigate,
+  workspaceShared, webhookTokens, webhooksUnknown, onNavigate,
 }: CrewOverviewPaneProps) {
   const { t } = useTranslation()
   const unknown = t('components.crewEditor.stat_unknown')
@@ -148,14 +148,6 @@ export default function CrewOverviewPane({
       value: workspace,
       mono: true,
       ...(workspaceShared ? { tag: t('components.crewEditor.tag_shared') } : {}),
-    },
-    {
-      key: 'memory',
-      icon: Database,
-      label: t('pages.kiroCrewAgentsPage.memory_store'),
-      value: memoryStore,
-      mono: true,
-      ...(memoryShared ? { tag: t('components.crewEditor.tag_shared') } : {}),
     },
     {
       key: 'model',

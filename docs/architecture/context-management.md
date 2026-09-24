@@ -1,5 +1,9 @@
 # Context Management
 
+> Fork status: the memory and lessons context groups are always withheld.
+> Session transcripts still support chat history and resume. Artifact and
+> knowledge tools are absent from the fork's MCP registry.
+
 What Kiro Crew puts in front of the model, in what order, and where each piece
 comes from. Six questions, one section each: a fresh main chat session, the
 per-turn additions, a sub-agent, the default agent versus any other agent, a
