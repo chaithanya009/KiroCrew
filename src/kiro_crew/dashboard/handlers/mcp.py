@@ -685,6 +685,92 @@ def _record_probe_verdicts(rows: list[dict[str, Any]]) -> None:
     mcp_quarantine.record_verdicts(_quarantine_verdicts(rows))
 
 
+def _kirocrew_mcp_servers() -> dict[str, Any]:
+    """The Kiro Crew store's ``mcpServers`` map, or ``{}`` when it is not a map.
+
+    Blocking file I/O: the request handlers call it through ``asyncio.to_thread``.
+    A hand-edited store can hold a list or a string under ``mcpServers``; the
+    empty map keeps every reader on the ``.get`` path instead of raising.
+    """
+    servers = _load_json_or_empty(_kirocrew_mcp_json()).get("mcpServers", {})
+    return servers if isinstance(servers, dict) else {}
+
+
+def _display_path(path: Path) -> str:
+    """Collapse the real home prefix to ``~`` so a row never carries it.
+
+    Same rule as ``handlers/steering.py``: the path names a file for the user
+    to edit, and the account name it sits under is not part of that.
+    """
+    out = str(path)
+    for home in {str(Path.home()), str(Path.home().resolve())}:
+        out = out.replace(home, "~")
+    return out
+
+
+def _stamp_config_state(d: dict[str, Any], global_mcps: Any, kirocrew_mcps: Any) -> None:
+    """Stamp the config-derived fields onto one serialized server row.
+
+    ``enabled`` folds every place a disable can live -- the Kiro-global
+    ``mcp.json``, the Kiro Crew store, and the row's own aggregate ``disabled``
+    flag (``list_servers`` sets it from every scope) -- and a disabled row reads
+    ``status: "disabled"``; ``kirocrewManaged`` says whether the store holds the
+    entry, which is what gates the table's Edit action.
+
+    ``disabledIn`` says WHICH scope switched the row off, because the table's
+    two disabled states need opposite controls and cannot be told apart from
+    ``enabled`` + ``kirocrewManaged``: ``"kirocrew"`` is a disable in Kiro
+    Crew's own store, which the Kiro Crew scope badge + Apply lifts (the consent
+    step); ``"shared"`` is a disable in a config this panel does not write for
+    enable -- the shared Kiro ``mcp.json`` the IDE edits, or a provider global
+    -- so the row is inert here. A row disabled in BOTH reads ``"shared"``:
+    lifting the store's flag would leave the shared flag standing, so offering
+    the consent step would offer a re-enable that cannot land. ``None`` when
+    enabled. ``disabledInFile`` names the file to edit (home collapsed to
+    ``~``) when the shared flag is the Kiro-global one; ``None`` otherwise,
+    including a disable only the aggregate flag reports (a provider global or
+    an entry keyed by its raw name), which the table words as "the shared MCP
+    config".
+
+    A ``disabled`` that is anything but the boolean ``True`` is not a disable
+    here: ``"disabled": "false"`` (a string) is a config error ``list_servers``
+    logs, and reading it as truthy would mark the server Disabled.
+
+    One helper for ``GET /api/mcp`` AND both probe paths, because the probe
+    response REPLACES the table's list on the client rather than overlaying it.
+    Stamped from the global file alone, a probe row for a store-disabled server
+    came back ``enabled: true`` and flipped the row live until the next GET, and
+    a row without ``kirocrewManaged`` lost its Edit action for the same interval.
+
+    Either map may come from a hand-edited file whose ``mcpServers`` is not a
+    mapping; a non-dict reads as an empty map rather than failing the whole
+    response after the probe fan-out already ran.
+    """
+    if not isinstance(global_mcps, dict):
+        global_mcps = {}
+    if not isinstance(kirocrew_mcps, dict):
+        kirocrew_mcps = {}
+    name = str(d.get("name") or "")
+    spec = global_mcps.get(name, {})
+    kc_spec = kirocrew_mcps.get(name)
+    d["kirocrewManaged"] = isinstance(kc_spec, dict)
+    shared_off = isinstance(spec, dict) and spec.get("disabled") is True
+    store_off = isinstance(kc_spec, dict) and kc_spec.get("disabled") is True
+    is_disabled = shared_off or store_off or d.get("disabled") is True
+    d["enabled"] = not is_disabled
+    d["disabledIn"] = None
+    d["disabledInFile"] = None
+    if not is_disabled:
+        return
+    d["status"] = "disabled"
+    if store_off and not shared_off:
+        d["disabledIn"] = "kirocrew"
+        return
+    d["disabledIn"] = "shared"
+    if shared_off:
+        d["disabledInFile"] = _display_path(_GLOBAL_MCP_JSON)
+
+
 async def _bg_mcp_probe() -> None:
     """Populate the MCP probe cache — SINGLE-FLIGHT.
 
@@ -736,6 +822,7 @@ async def _run_mcp_probe() -> None:
             global_mcps = data.get("mcpServers", {})
         except (FileNotFoundError, json.JSONDecodeError):
             pass
+        kirocrew_mcps = await asyncio.to_thread(_kirocrew_mcp_servers)
 
         # Route through probe_all() so the fan-out is bounded by its
         # PROBE_MAX_CONCURRENCY semaphore. An
@@ -746,7 +833,7 @@ async def _run_mcp_probe() -> None:
         for s in probed:
             d = s.to_dict()
             spec = global_mcps.get(s.name, {})
-            d["enabled"] = not (isinstance(spec, dict) and spec.get("disabled"))
+            _stamp_config_state(d, global_mcps, kirocrew_mcps)
             if isinstance(spec, dict) and spec.get("disabledTools"):
                 d["disabledTools"] = spec["disabledTools"]
             result.append(d)
@@ -793,20 +880,25 @@ async def api_mcp_servers(request: web.Request) -> web.Response:
     # Browse) so status transitions from "Unknown" to "ok"/"error" on the
     # next page refresh without waiting out the cache TTL.
     #
-    # Only consider rows probe_all() would actually probe. It excludes
-    # consent-disabled servers on purpose (probing spawns the process), so a
-    # disabled row can never enter _mcp_probe_cache — while list_servers()
-    # deliberately returns it so the UI can render the row. Comparing the
-    # unfiltered list against the cache would treat every disabled
-    # server as "new" on EVERY request, bypassing the cache TTL and leaving a
-    # full spawn fan-out permanently in flight for anyone with one disabled
-    # server. Applying probe_all's own filter here keeps the freshness check
-    # and the cache contents talking about the same set.
+    # Only consider rows probe_all() would actually PROBE. It never spawns a
+    # consent-disabled server, so a disabled row enters _mcp_probe_cache only
+    # as an unprobed ``status: "disabled"`` placeholder (or not at all, from a
+    # cache filled before the server was disabled) -- its presence says nothing
+    # about freshness, and comparing the unfiltered list against the cache would
+    # treat a disabled server as "new" on EVERY request, bypassing the cache TTL
+    # and leaving a full spawn fan-out permanently in flight for anyone with one
+    # disabled server. Applying probe_all's own spawn filter here keeps the
+    # freshness check and the cache contents talking about the same set.
     if not stale:
         for srv in servers:
             if srv.disabled:
                 continue
-            if srv.name not in cached_by_name:
+            cached = cached_by_name.get(srv.name)
+            # A ``disabled`` placeholder is not a probe: the server was withheld
+            # from the spawn set when the cache was filled. An enabled row behind
+            # one -- the operator re-enabled the server inside the TTL -- has never
+            # been probed, so it re-arms the fan-out exactly like an absent row.
+            if cached is None or cached.get("status") == "disabled":
                 stale = True
                 break
 
@@ -822,27 +914,20 @@ async def api_mcp_servers(request: web.Request) -> web.Response:
         pass
     # KiroCrew-scope entries: disabled state (consent-disabled installs and
     # custom adds live only here) + which rows the JSON editor can manage.
-    kirocrew_mcps = _load_json_or_empty(_kirocrew_mcp_json()).get("mcpServers", {})
+    kirocrew_mcps = _kirocrew_mcp_servers()
     result: list[dict] = []
     for s in servers:
         d = s.to_dict()
-        # Prefer handler cache status over discovery cache "outdated"
+        # Prefer handler cache status over discovery cache "outdated". A cached
+        # ``disabled`` placeholder carries no observation, so it never overlays a
+        # row that is enabled now; a row still disabled reads ``disabled`` from
+        # its own config state below.
         cached = cached_by_name.get(s.name)
-        if cached and d["status"] in ("outdated", "unknown"):
+        if cached and cached.get("status") != "disabled" and d["status"] in ("outdated", "unknown"):
             d["status"] = cached.get("status", d["status"])
             d["tools"] = cached.get("tools", d["tools"])
             d["error"] = cached.get("error", d["error"])
-        spec = global_mcps.get(s.name, {})
-        kc_spec = kirocrew_mcps.get(s.name)
-        d["kirocrewManaged"] = isinstance(kc_spec, dict)
-        is_disabled = (
-            (isinstance(spec, dict) and spec.get("disabled"))
-            or (isinstance(kc_spec, dict) and kc_spec.get("disabled"))
-            or s.disabled
-        )
-        d["enabled"] = not is_disabled
-        if is_disabled:
-            d["status"] = "disabled"
+        _stamp_config_state(d, global_mcps, kirocrew_mcps)
         err = d.get("error")
         if err:
             err, _ = redact_credentials(err)
@@ -991,11 +1076,12 @@ async def api_mcp_probe(request: web.Request) -> web.Response:
         global_mcps = data.get("mcpServers", {})
     except (FileNotFoundError, json.JSONDecodeError):
         pass
+    kirocrew_mcps = await asyncio.to_thread(_kirocrew_mcp_servers)
     result: list[dict[str, Any]] = []
     for s in servers:
         d = s.to_dict()
         spec = global_mcps.get(s.name, {})
-        d["enabled"] = not (isinstance(spec, dict) and spec.get("disabled"))
+        _stamp_config_state(d, global_mcps, kirocrew_mcps)
         if isinstance(spec, dict) and spec.get("disabledTools"):
             d["disabledTools"] = spec["disabledTools"]
         result.append(d)

@@ -16,7 +16,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from conftest import host_abs
-from kiro_crew import platform_compat
+from kiro_crew import mcp_discovery, platform_compat
 from kiro_crew.mcp_discovery import (
     MCP_REDACTED_HEADER_VALUE,
     SCOPE_CC_GLOBAL,
@@ -363,6 +363,371 @@ class TestListServers:
 
         await probe_all()
         assert "pending" not in probed
+
+    @pytest.mark.parametrize("shared_scope", [SCOPE_KIRO_GLOBAL, SCOPE_CC_GLOBAL])
+    def test_shared_scope_disabled_server_keeps_a_row_after_sync(
+        self, tmp_path, monkeypatch, shared_scope
+    ) -> None:
+        """A server disabled in a SHARED scope's ``mcp.json`` (the Kiro-global
+        file the IDE edits, or a provider global) and held by no other source
+        still gets a row.
+
+        This is the post-sync state: discovery skips disabled entries and the
+        rebuild never adds a disabled shared server to the agent config, so the
+        agent file does not know the name. Dropping the row here is what made
+        the panel show 6 of 7 configured servers after Discover & Sync while
+        the IDE kept listing all 7 (three of them greyed)."""
+        agent_dir = tmp_path / "agents"
+        agent_dir.mkdir()
+        (agent_dir / "defaults.json").write_text(
+            json.dumps({"mcpServers": {"github": {"command": "npx"}}})
+        )
+        store = tmp_path / "store.json"
+        store.write_text(json.dumps({"mcpServers": {}}))
+        shared_mcp = tmp_path / "shared.json"
+        shared_mcp.write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "github": {"command": "npx"},
+                        "figma": {"command": "npx", "args": ["figma-mcp"], "disabled": True},
+                    }
+                }
+            )
+        )
+        monkeypatch.setenv("KIROCREW_PROJECT_DIR", str(tmp_path))
+        monkeypatch.setattr(
+            "kiro_crew.mcp_discovery._MCP_SOURCES",
+            ((store, SCOPE_KIROCREW), (shared_mcp, shared_scope)),
+        )
+        monkeypatch.setattr("kiro_crew.mcp_discovery._MCP_JSON_PATHS", (store, shared_mcp))
+        monkeypatch.setattr("kiro_crew.mcp_discovery.Path.home", lambda: tmp_path)
+        by_name = {s.name: s for s in list_servers()}
+        assert set(by_name) == {"github", "figma"}
+        assert by_name["figma"].disabled is True
+        assert by_name["figma"].command == "npx"
+        assert by_name["figma"].args == ["figma-mcp"]
+        assert by_name["figma"].source == "mcp.json"
+        # The enabled neighbour is untouched by the new arm.
+        assert by_name["github"].disabled is False
+
+    @staticmethod
+    def _seed_shared_scope(tmp_path, monkeypatch, disabled_value, servers=None) -> Path:
+        """A shared-scope ``mcp.json`` holding ``figma`` with the given ``disabled``
+        -- or, with *servers*, exactly that ``mcpServers`` mapping.
+
+        Returns the shared file so a test can rewrite the value between calls.
+        Both module-level ledger states are reset so tests do not see each
+        other's warn-once history.
+        """
+        agent_dir = tmp_path / "agents"
+        agent_dir.mkdir(exist_ok=True)
+        (agent_dir / "defaults.json").write_text(json.dumps({"mcpServers": {}}))
+        store = tmp_path / "store.json"
+        store.write_text(json.dumps({"mcpServers": {}}))
+        shared_mcp = tmp_path / "shared.json"
+        if servers is None:
+            servers = {"figma": {"command": "npx", "disabled": disabled_value}}
+        shared_mcp.write_text(json.dumps({"mcpServers": servers}))
+        monkeypatch.setenv("KIROCREW_PROJECT_DIR", str(tmp_path))
+        monkeypatch.setattr(
+            "kiro_crew.mcp_discovery._MCP_SOURCES",
+            ((store, SCOPE_KIROCREW), (shared_mcp, SCOPE_KIRO_GLOBAL)),
+        )
+        monkeypatch.setattr("kiro_crew.mcp_discovery._MCP_JSON_PATHS", (store, shared_mcp))
+        monkeypatch.setattr("kiro_crew.mcp_discovery.Path.home", lambda: tmp_path)
+        monkeypatch.setattr("kiro_crew.mcp_discovery._disabled_flag_warned", set())
+        monkeypatch.setattr("kiro_crew.mcp_discovery._disabled_flag_overflow_warned", False)
+        return shared_mcp
+
+    @staticmethod
+    def _invalid_disabled_warnings(caplog) -> list[str]:
+        """The per-server 'not a boolean' lines, without the overflow line."""
+        return [
+            r.getMessage()
+            for r in caplog.records
+            if "not a boolean" in r.getMessage() and "'disabled' in the" in r.getMessage()
+        ]
+
+    @staticmethod
+    def _overflow_warnings(caplog) -> list[str]:
+        return [
+            r.getMessage() for r in caplog.records if "not listed individually" in r.getMessage()
+        ]
+
+    def test_shared_scope_non_boolean_disabled_is_not_a_disabled_row(
+        self, tmp_path, monkeypatch, caplog
+    ) -> None:
+        """``"disabled": "false"`` (a string) is a config error, not a disable.
+
+        Only a literal ``true`` earns the shared-scope arm's Disabled row; read
+        as truthy, the string marked the server Disabled on the dashboard. It is
+        read as ABSENT instead -- the row is listed enabled, as it would be with
+        no ``disabled`` key at all -- and the log names the value and says the
+        server is enabled, so an operator who wrote ``"true"`` learns the switch
+        did not take."""
+        self._seed_shared_scope(tmp_path, monkeypatch, "false")
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.mcp_discovery"):
+            rows = list_servers()
+        by_name = {s.name: s for s in rows}
+        assert "figma" in by_name
+        assert by_name["figma"].disabled is False
+        assert [s.name for s in rows if s.disabled] == []
+        warnings = [r for r in caplog.records if "'disabled'" in r.getMessage()]
+        assert len(warnings) == 1
+        assert "'figma'" in warnings[0].getMessage()
+        assert "'false'" in warnings[0].getMessage()
+        assert "not a boolean" in warnings[0].getMessage()
+        assert "ENABLED" in warnings[0].getMessage()
+
+    def test_non_boolean_disabled_reads_as_absent_at_every_read(
+        self, tmp_path, monkeypatch, caplog
+    ) -> None:
+        """The invalid value is normalized ONCE, for every read, not only where
+        it is reported.
+
+        The listing reported the string and then read it again with truthiness
+        at two later sites: the agent-config pass, which hid an agent row whose
+        entry carried it, and the aggregate flag pass (3c), which stamped
+        ``disabled`` onto an EXISTING agent row whose shared-scope entry carried
+        it -- so a server the log had just called a config error rendered
+        Disabled anyway, and the sync offer skipped it. Every read now takes the
+        value as absent: the agent row stays enabled, the shared entry that
+        is in no agent config is listed enabled, and the sync offers it."""
+        agent_dir = tmp_path / "agents"
+        agent_dir.mkdir(exist_ok=True)
+        (agent_dir / "defaults.json").write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "github": {"command": "gh-mcp"},
+                        "linear": {"command": "linear-mcp", "disabled": "false"},
+                    }
+                }
+            )
+        )
+        store = tmp_path / "store.json"
+        store.write_text(json.dumps({"mcpServers": {}}))
+        shared_mcp = tmp_path / "shared.json"
+        shared_mcp.write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "github": {"command": "gh-mcp", "disabled": "false"},
+                        "figma": {"command": "npx", "disabled": "yes"},
+                    }
+                }
+            )
+        )
+        monkeypatch.setenv("KIROCREW_PROJECT_DIR", str(tmp_path))
+        monkeypatch.setattr(
+            "kiro_crew.mcp_discovery._MCP_SOURCES",
+            ((store, SCOPE_KIROCREW), (shared_mcp, SCOPE_KIRO_GLOBAL)),
+        )
+        monkeypatch.setattr("kiro_crew.mcp_discovery._MCP_JSON_PATHS", (store, shared_mcp))
+        monkeypatch.setattr("kiro_crew.mcp_discovery.Path.home", lambda: tmp_path)
+        monkeypatch.setattr("kiro_crew.mcp_discovery._disabled_flag_warned", set())
+        monkeypatch.setattr("kiro_crew.mcp_discovery._disabled_flag_overflow_warned", False)
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.mcp_discovery"):
+            rows = {s.name: s for s in list_servers()}
+        # The existing agent row is not flagged by the string in its shared entry
+        # (red on truthiness at 3c), the agent entry carrying the string is a
+        # listed enabled row (red on truthiness at step 1), and the shared-only
+        # entry is listed enabled (red on truthiness in the introduce arm).
+        assert set(rows) == {"github", "linear", "figma"}, sorted(rows)
+        assert [n for n, s in rows.items() if s.disabled] == []
+        # Reported once per (server, value) -- the two shared-scope strings.
+        named = sorted(m.split("'")[1] for m in self._invalid_disabled_warnings(caplog))
+        assert named == ["figma", "github"]
+        # The sync offer agrees with the listing: a shared entry missing from the
+        # agent config is offered, and offered WITHOUT the ill-typed key.
+        offered = {s.name: s for s in discover_servers_to_sync()}
+        assert "figma" in offered
+        assert offered["figma"].disabled is False
+
+    def test_non_boolean_disabled_warns_once_and_rearms_after_a_fix(
+        self, tmp_path, monkeypatch, caplog
+    ) -> None:
+        """One warning per (server, value), however often the list is read; a
+        value that is fixed and later broken again is reported again, so the
+        ledger neither floods the log nor goes silent for the process lifetime."""
+        shared_mcp = self._seed_shared_scope(tmp_path, monkeypatch, "false")
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.mcp_discovery"):
+            list_servers()
+            list_servers()
+        assert sum("'disabled'" in r.getMessage() for r in caplog.records) == 1
+        caplog.clear()
+        # Fixed: a real boolean gets a real Disabled row and clears the ledger.
+        shared_mcp.write_text(
+            json.dumps({"mcpServers": {"figma": {"command": "npx", "disabled": True}}})
+        )
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.mcp_discovery"):
+            rows = list_servers()
+        assert [s.name for s in rows if s.disabled] == ["figma"]
+        assert sum("'disabled'" in r.getMessage() for r in caplog.records) == 0
+        # Broken again: reported again.
+        shared_mcp.write_text(
+            json.dumps({"mcpServers": {"figma": {"command": "npx", "disabled": "false"}}})
+        )
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.mcp_discovery"):
+            list_servers()
+        assert sum("'disabled'" in r.getMessage() for r in caplog.records) == 1
+
+    def test_invalid_disabled_ledger_keeps_exactly_the_cap_and_says_so_once(
+        self, tmp_path, monkeypatch, caplog
+    ) -> None:
+        """Past the cap the ledger holds exactly N digests, the N are reported
+        one line each, and the rest get ONE line naming how many were refused
+        -- not a line per refused server, and nothing on a re-read. A refused
+        pair gets no entry anywhere, so the cap bounds the retention itself,
+        not just the count of lines."""
+        monkeypatch.setattr("kiro_crew.mcp_discovery._DISABLED_FLAG_LEDGER_CAP", 3)
+        servers = {f"s{i}": {"command": "npx", "disabled": f"no-{i}"} for i in range(5)}
+        self._seed_shared_scope(tmp_path, monkeypatch, None, servers=servers)
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.mcp_discovery"):
+            rows = list_servers()
+        # Read as absent: all five are listed, none Disabled, cap or no cap.
+        assert {s.name for s in rows} >= set(servers)
+        assert [s.name for s in rows if s.disabled] == []
+        assert len(mcp_discovery._disabled_flag_warned) == 3
+        named = self._invalid_disabled_warnings(caplog)
+        assert [n for n in servers if any(f"'{n}'" in m for m in named)] == ["s0", "s1", "s2"]
+        overflow = self._overflow_warnings(caplog)
+        assert len(overflow) == 1
+        assert "2 more server(s)" in overflow[0]
+        assert "beyond the 3 reported" in overflow[0]
+        caplog.clear()
+        # Same config read again: the episode is already announced.
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.mcp_discovery"):
+            list_servers()
+        assert self._invalid_disabled_warnings(caplog) == []
+        assert self._overflow_warnings(caplog) == []
+        assert len(mcp_discovery._disabled_flag_warned) == 3
+
+    def test_invalid_disabled_ledger_retains_digests_never_the_config_text(
+        self, tmp_path, monkeypatch, caplog
+    ) -> None:
+        """Every retained field is fixed-size: a long server name and a long
+        value leave one 16-hex-digit digest, with neither text inside it. The
+        per-server log line still names the value -- a log line is not
+        retention, and it is what the operator fixes from."""
+        name = "figma-" + "x" * 300
+        value = "false" * 100
+        self._seed_shared_scope(
+            tmp_path, monkeypatch, None, servers={name: {"command": "npx", "disabled": value}}
+        )
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.mcp_discovery"):
+            list_servers()
+        (entry,) = mcp_discovery._disabled_flag_warned
+        assert len(entry) == mcp_discovery._DISABLED_FLAG_DIGEST_HEX == 16
+        assert set(entry) <= set("0123456789abcdef")
+        assert "false" not in entry and "xxx" not in entry
+        (line,) = self._invalid_disabled_warnings(caplog)
+        assert value in line and name in line
+
+    def test_invalid_disabled_overflow_is_announced_again_only_after_it_ends(
+        self, tmp_path, monkeypatch, caplog
+    ) -> None:
+        """A config that stays over the cap is announced once; a read in which
+        everything fits ends the episode, so a later overflow is a new one and
+        is announced again. Servers the cap refused earlier are reported
+        individually as soon as pruning makes room for them."""
+        monkeypatch.setattr("kiro_crew.mcp_discovery._DISABLED_FLAG_LEDGER_CAP", 3)
+        bad = {f"s{i}": {"command": "npx", "disabled": f"no-{i}"} for i in range(4)}
+        shared_mcp = self._seed_shared_scope(tmp_path, monkeypatch, None, servers=bad)
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.mcp_discovery"):
+            list_servers()
+        assert len(self._overflow_warnings(caplog)) == 1
+        assert not any("'s3'" in m for m in self._invalid_disabled_warnings(caplog))
+        caplog.clear()
+        # Two of the tracked ones fixed: room for s3, which is reported now, and
+        # nothing was refused, so the episode ends.
+        shared_mcp.write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "s0": {"command": "npx", "disabled": False},
+                        "s1": {"command": "npx", "disabled": False},
+                        "s2": bad["s2"],
+                        "s3": bad["s3"],
+                    }
+                }
+            )
+        )
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.mcp_discovery"):
+            list_servers()
+        assert [m for m in self._invalid_disabled_warnings(caplog) if "'s3'" in m]
+        assert self._overflow_warnings(caplog) == []
+        assert len(mcp_discovery._disabled_flag_warned) == 2
+        caplog.clear()
+        # Broken again past the cap: a new episode, announced again.
+        shared_mcp.write_text(json.dumps({"mcpServers": bad}))
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.mcp_discovery"):
+            list_servers()
+        assert len(self._overflow_warnings(caplog)) == 1
+        assert len(mcp_discovery._disabled_flag_warned) == 3
+
+    @pytest.mark.asyncio
+    async def test_probe_all_returns_disabled_rows_unprobed_in_list_order(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """The probe response replaces the dashboard's list, so a
+        disabled row must come back -- as ``status="disabled"`` with no spawn --
+        rather than vanish until the next page load. Enabled rows are probed
+        exactly as before, and the order is ``list_servers``' own."""
+        monkeypatch.setenv("KIROCREW_PROJECT_DIR", str(tmp_path))
+        monkeypatch.setattr("kiro_crew.mcp_discovery.Path.home", lambda: tmp_path)
+        mcp_json = tmp_path / "mcp.json"
+        mcp_json.write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "alpha": {"command": "a"},
+                        "pending": {"command": "definitely-not-run", "disabled": True},
+                        "zulu": {"command": "z"},
+                    }
+                }
+            )
+        )
+        monkeypatch.setattr("kiro_crew.mcp_discovery._MCP_JSON_PATHS", (mcp_json,))
+        spawned: list[str] = []
+
+        async def fake_probe(server):
+            assert not server.disabled, "a disabled row reached probe_server"
+            spawned.append(server.name)
+            server.status = "ok"
+            return server
+
+        monkeypatch.setattr("kiro_crew.mcp_discovery.probe_server", fake_probe)
+        from kiro_crew.mcp_discovery import probe_all
+
+        rows = await probe_all()
+        assert [s.name for s in rows] == ["alpha", "pending", "zulu"]
+        assert spawned == ["alpha", "zulu"]
+        by_name = {s.name: s for s in rows}
+        assert by_name["pending"].status == "disabled"
+        assert by_name["pending"].disabled is True
+        assert by_name["pending"].error == ""
+        assert by_name["alpha"].status == "ok"
+        assert by_name["zulu"].status == "ok"
+
+    @pytest.mark.asyncio
+    async def test_probe_all_with_only_disabled_rows_returns_them(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """The early return for an empty spawn set still reports the disabled
+        rows -- a config of nothing but disabled servers is not an empty panel."""
+        monkeypatch.setenv("KIROCREW_PROJECT_DIR", str(tmp_path))
+        monkeypatch.setattr("kiro_crew.mcp_discovery.Path.home", lambda: tmp_path)
+        mcp_json = tmp_path / "mcp.json"
+        mcp_json.write_text(
+            json.dumps({"mcpServers": {"pending": {"command": "x", "disabled": True}}})
+        )
+        monkeypatch.setattr("kiro_crew.mcp_discovery._MCP_JSON_PATHS", (mcp_json,))
+        from kiro_crew.mcp_discovery import probe_all
+
+        rows = await probe_all()
+        assert [(s.name, s.status) for s in rows] == [("pending", "disabled")]
 
     def test_disabled_in_agent_blocks_mcp_json(self, tmp_path, monkeypatch) -> None:
         """Server disabled in agent config is not re-added from mcp.json."""
