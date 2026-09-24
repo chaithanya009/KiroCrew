@@ -1167,3 +1167,177 @@ class TestAuditDecisionRedactsBeforeTruncate:
 
         assert len(calls) == 1
         assert calls[0]["resources"] == file_delivery_consent.CLASS_OWNER_DASHBOARD
+
+
+class TestARefusalNamesTheFileItHeldBack:
+    """A held-back file has to be NAMED somewhere the owner can read.
+
+    The error string a refused caller receives is returned to the AGENT, so it
+    cannot serve an owner who is being asked to allow delivery: they would be
+    deciding without knowing which of their files the scanner stopped. The
+    consent audit trail already names a flagged file that went OUT under a grant,
+    and it is served over the security event log, so the refusal belongs in the
+    same place under the same name.
+    """
+
+    @staticmethod
+    def _capture(monkeypatch):
+        import kiro_crew.sel as sel_mod
+
+        calls: list[dict] = []
+
+        class _Recorder:
+            def log_api_access(self, **kwargs) -> None:
+                calls.append(kwargs)
+
+            def log_tool_invocation(self, **kwargs) -> None:
+                """Absorbed: the tool-invocation lane is not what this asserts."""
+
+        monkeypatch.setattr(sel_mod, "sel", lambda: _Recorder())
+        return calls
+
+    @staticmethod
+    def _refusals(calls: list[dict]) -> list[str]:
+        return [
+            c["resources"] for c in calls if c.get("operation") == "file_delivery_consent.refused"
+        ]
+
+    def test_the_helper_records_the_outcome_the_leg_the_name_and_the_reason(self, monkeypatch):
+        calls = self._capture(monkeypatch)
+
+        file_delivery_consent.audit_refusal(
+            file_delivery_consent.CLASS_OWNER_DASHBOARD,
+            leg="file_send",
+            name="device.conf",
+            reason="flagged content",
+        )
+
+        assert len(calls) == 1
+        assert calls[0]["operation"] == "file_delivery_consent.refused"
+        assert calls[0]["outcome"] == "refused"
+        assert calls[0]["resources"] == (
+            f"{file_delivery_consent.CLASS_OWNER_DASHBOARD}: "
+            "file_send: device.conf (flagged content)"
+        )
+
+    def test_the_primary_tool_refusal_names_the_file(self, tmp_path, monkeypatch):
+        """The leg the owner actually meets: an agent sends a flagged file, unigranted."""
+        from kiro_crew.mcp_tools.messaging import file_send
+
+        calls = self._capture(monkeypatch)
+        src = tmp_path / "device.conf"
+        src.write_text(_synth_pem())
+
+        out = file_send("file_send", {"path": str(src)})
+
+        assert "sensitive data" in out and "aborted" in out
+        refusals = self._refusals(calls)
+        assert len(refusals) == 1, calls
+        assert refusals[0] == (
+            f"{file_delivery_consent.CLASS_OWNER_DASHBOARD}: "
+            "file_send: device.conf (flagged content)"
+        )
+
+    def test_a_granted_delivery_records_no_refusal(self, tmp_path, monkeypatch):
+        """The negative direction: the entry must mean refused, not merely flagged."""
+        from kiro_crew import mcp_core
+        from kiro_crew.mcp_tools.messaging import file_send
+
+        src = tmp_path / "device.conf"
+        src.write_text(_synth_pem())
+        _grant()
+        calls = self._capture(monkeypatch)
+
+        with patch.object(mcp_core, "_post", side_effect=lambda path, *a, **kw: {"ok": True}):
+            out = file_send("file_send", {"path": str(src)})
+
+        assert "File sent" in out
+        assert self._refusals(calls) == []
+
+    def test_a_flagged_name_is_recorded_without_reproducing_it(self, tmp_path, monkeypatch):
+        """A name that IS the credential must not be copied verbatim into the log."""
+        from kiro_crew.mcp_tools.messaging import file_send
+
+        key = _synth_aws_key()
+        calls = self._capture(monkeypatch)
+        src = tmp_path / f"notes-{key}.txt"
+        src.write_text("no credential in the body")
+
+        out = file_send("file_send", {"path": str(src)})
+
+        assert "filename contains sensitive content" in out
+        refusals = self._refusals(calls)
+        assert len(refusals) == 1, calls
+        assert "flagged name" in refusals[0]
+        assert key not in refusals[0]
+        assert key[:8] not in refusals[0]
+
+
+class TestEveryScannerRefusalRecordsTheName:
+    """The claim is about the SET of refusal sites, so it is one test, not many.
+
+    A refusal leg added later without an entry has to redden something, and a
+    per-leg test would simply not exist for it. Asserted on the source because
+    three of these legs are reached through aiohttp handlers whose fixtures would
+    cost more than they prove: what is at stake is whether the call is THERE.
+    """
+
+    @staticmethod
+    def _sources():
+        from kiro_crew.dashboard.handlers import files as files_mod
+        from kiro_crew.mcp_tools import messaging as messaging_mod
+
+        return {
+            "file_send": inspect.getsource(messaging_mod.file_send),
+            "notify": inspect.getsource(files_mod.api_outbox_notify),
+            "download": inspect.getsource(files_mod.api_outbox_download),
+            "upload gate": inspect.getsource(files_mod._gate_upload_file),
+        }
+
+    def test_each_leg_records_every_scan_it_can_refuse_on(self):
+        # file_send and notify scan the NAME and the CONTENT; download scans the
+        # content only; the shared upload gate scans the name, binary content and
+        # text content, and routes all three through its own nested helper, so
+        # its calls are counted by that helper's name minus its definition.
+        sources = self._sources()
+        counted = {
+            leg: (
+                src.count("_audit_flagged_refusal(") - src.count("def _audit_flagged_refusal(")
+                if "def _audit_flagged_refusal(" in src
+                else src.count("audit_refusal(")
+            )
+            for leg, src in sources.items()
+        }
+        assert counted == {"file_send": 2, "notify": 2, "download": 1, "upload gate": 3}
+
+    def test_the_upload_gate_pairs_an_entry_with_its_scanner_refusals_only(self):
+        # A shape refusal flags no file, so an entry for it would claim the
+        # scanner stopped something it never looked at. Pinning the PAIRING (not
+        # a count) is what makes a new shape refusal that copies the wrong
+        # neighbour redden.
+        lines = self._sources()["upload gate"].splitlines()
+        paired = {
+            lines[i].strip()
+            for i, following in enumerate(lines[1:])
+            if "_audit_flagged_refusal(" in following and "_audit_denial(" in lines[i]
+        }
+        assert paired == {
+            '_audit_denial("sensitive_filename_rejected")',
+            '_audit_denial("binary_credential_detected")',
+            '_audit_denial("content_redacted")',
+        }
+
+    def test_the_gate_derives_exactly_the_never_grantable_class_ids(self):
+        # The gate builds its class from tool_kind rather than reading a table
+        # that would have to be kept in step with it. The derivation is only
+        # sound while it yields the ids a grant can never cover, so the kinds are
+        # read off the call sites instead of restated here.
+        from kiro_crew.dashboard.handlers import files as files_mod
+
+        kinds: set[str] = set()
+        for fn in (files_mod.api_slack_upload_file, files_mod.api_channel_upload_file):
+            for chunk in inspect.getsource(fn).split('tool_kind="')[1:]:
+                kinds.add(chunk.split('"')[0])
+
+        assert kinds, "no tool_kind found at the upload call sites"
+        assert {f"{kind}_upload" for kind in kinds} == file_delivery_consent.NEVER_GRANTABLE_CLASSES

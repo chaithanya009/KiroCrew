@@ -729,14 +729,17 @@ def public_pending_view(pending: PendingGrant | None) -> dict[str, Any]:
 
 
 def audit_decision(destination_class: str, *, outcome: str, detail: str = "") -> None:
-    """Record a consent state change, a denial, or a consented delivery in the SEL.
+    """Record a consent state change, a denial, a refusal, or a delivery in the SEL.
 
-    Grants, revocations, denials AND deliveries made under a grant are recorded.
-    The delivery entry is the point: the refusal it replaces was self-evident in
-    the tool's error string, whereas a successful consented delivery would
-    otherwise leave no trace that a flagged file left the gate at all. Every
-    entry answers a question an incident review actually asks -- who authorized
-    delivery, when was it withdrawn, and which flagged files went out under it.
+    Grants, revocations, denials, scanner refusals AND deliveries made under a
+    grant are recorded, and the refusal and delivery entries both NAME the file
+    they are about. That pairing is what lets the trail answer an incident
+    review: which flagged files left under a grant, and which ones the scanner
+    held back. A refused caller does get an error string, but that string is
+    returned to the AGENT, while this log is the surface the owner reads, so the
+    refusal has to be recorded here to reach them at all. Every entry answers a
+    question a review actually asks -- who authorized delivery, when it was
+    withdrawn, what went out, and what did not.
 
     Never raises: an audit failure must not be what stops a refusal from being
     enforced. Imported lazily because this module is reached from the MCP stdio
@@ -769,3 +772,23 @@ def audit_decision(destination_class: str, *, outcome: str, detail: str = "") ->
         )
     except Exception:  # pragma: no cover - audit must never break the gate
         logger.debug("could not write the file-delivery consent audit event", exc_info=True)
+
+
+def audit_refusal(destination_class: str, *, leg: str, name: str, reason: str) -> None:
+    """Record that the scanner held a file back, NAMING the file it held.
+
+    The one spelling of the refusal entry, so the refusal sites spread across the
+    tool leg, the dashboard legs and the shared channel-upload gate cannot drift
+    into several vocabularies an owner would have to learn. *leg* names the
+    delivery path in the same words the delivery entries use (``file_send``,
+    ``notify``, ``download``, ``slack upload``), *name* is the file, and *reason*
+    says which scan tripped -- the name or the content.
+
+    The name is the whole point of the entry, and it costs no new disclosure:
+    this channel already names a flagged file that went OUT under a grant, and
+    both entries land in the same owner-read log. :func:`audit_decision` redacts
+    the full detail before clipping it, so a caller may pass *name* verbatim; a
+    site whose refusal reason IS a flagged name passes the redacted form anyway,
+    so that entry reads the same as the neighbouring tool-invocation line.
+    """
+    audit_decision(destination_class, outcome="refused", detail=f"{leg}: {name} ({reason})")

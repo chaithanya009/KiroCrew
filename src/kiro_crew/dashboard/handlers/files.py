@@ -397,6 +397,12 @@ async def api_outbox_notify(request: web.Request) -> web.Response:
             outcome="denied",
             error="sensitive_filename_rejected",
         )
+        file_delivery_consent.audit_refusal(
+            file_delivery_consent.CLASS_OWNER_DASHBOARD,
+            leg="notify",
+            name=redact(raw_filename),
+            reason="flagged name or path",
+        )
         return web.json_response(
             {"error": "filename or path contains sensitive content"}, status=400
         )
@@ -451,10 +457,11 @@ async def api_outbox_notify(request: web.Request) -> web.Response:
     try:
         text = raw.decode("utf-8")
         # The owner's grant covers this leg: the card renders in the owner's own
-        # authenticated dashboard. No audit event here -- the delivery decision is
+        # authenticated dashboard. No DELIVERY entry here -- that decision is
         # already recorded by the tool leg, and the byte handover is recorded by
         # the download route; a third entry for rendering a card would only bury
-        # the two that answer a real question.
+        # the two that answer a real question. A refusal is different: it names a
+        # file the owner has no other way to learn about.
         if redact(text) != text and not file_delivery_consent.is_granted(
             file_delivery_consent.CLASS_OWNER_DASHBOARD
         ):
@@ -465,6 +472,12 @@ async def api_outbox_notify(request: web.Request) -> web.Response:
                 tool_kind="notify",
                 outcome="denied",
                 error="sensitive_content_detected",
+            )
+            file_delivery_consent.audit_refusal(
+                file_delivery_consent.CLASS_OWNER_DASHBOARD,
+                leg="notify",
+                name=raw_filename,
+                reason="flagged content",
             )
             return web.json_response({"error": "file content contains sensitive data"}, status=400)
     except UnicodeDecodeError:
@@ -640,9 +653,9 @@ async def api_outbox_download(request: web.Request) -> web.StreamResponse:
         redacted = redact(text)
         if redacted != text:
             # This is where the flagged bytes actually leave for the owner's
-            # browser, so a grant is honoured here AND the handover is audited --
-            # the refusal it replaces was self-evident in the 400, whereas a
-            # successful consented download would otherwise leave no trace.
+            # browser, so a grant is honoured here AND both outcomes are audited --
+            # the refusal names the file that was held back, and a successful
+            # consented download would otherwise leave no trace.
             #
             # TWO conjuncts, and the second is not redundant. This route is absent
             # from every ``token_auth`` bypass list, which establishes that it needs
@@ -669,6 +682,12 @@ async def api_outbox_download(request: web.Request) -> web.StreamResponse:
                     tool_kind="download",
                     outcome="denied",
                     error="content_redacted",
+                )
+                file_delivery_consent.audit_refusal(
+                    file_delivery_consent.CLASS_OWNER_DASHBOARD,
+                    leg="download",
+                    name=path.name,
+                    reason="flagged content",
                 )
                 return web.json_response(
                     {"error": "file content was redacted; download aborted"}, status=400
@@ -788,6 +807,22 @@ def _gate_upload_file(
             error=error,
         )
 
+    def _audit_flagged_refusal(name: str, reason: str) -> None:
+        """Name a scanner-flagged file in the consent audit trail.
+
+        Called for the scanner refusals only. The shape refusals this gate also
+        makes -- a missing field, a path outside the allowed roots, an oversized
+        read, a type off the binary allowlist -- flag no file, so an entry for
+        them would claim the scanner stopped something it never looked at.
+
+        The class is DERIVED from *tool_kind* rather than looked up in a table
+        that would have to be kept in step with it, and the two values it derives
+        are exactly the legs a grant can never cover.
+        """
+        file_delivery_consent.audit_refusal(
+            f"{tool_kind}_upload", leg=f"{tool_kind} upload", name=name, reason=reason
+        )
+
     if not file_path or not filename:
         _audit_denial("missing_required_fields")
         return (
@@ -805,6 +840,7 @@ def _gate_upload_file(
     # selects a file. Mirrors the MCP-side file_send refusal.
     if redact(filename) != filename:
         _audit_denial("sensitive_filename_rejected")
+        _audit_flagged_refusal(redact(filename), "flagged name")
         return (
             web.json_response(
                 {
@@ -877,6 +913,7 @@ def _gate_upload_file(
         binary_text = raw.decode("latin-1")
         if redact(binary_text) != binary_text:
             _audit_denial("binary_credential_detected")
+            _audit_flagged_refusal(filename, "flagged content")
             return (
                 web.json_response(
                     {
@@ -893,6 +930,7 @@ def _gate_upload_file(
             redacted = redact(text)
             if redacted != text:
                 _audit_denial("content_redacted")
+                _audit_flagged_refusal(filename, "flagged content")
                 return (
                     web.json_response(
                         {

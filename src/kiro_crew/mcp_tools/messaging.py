@@ -942,6 +942,12 @@ def file_send(name: str, args: dict[str, Any]) -> str:
             outcome="denied",
             error=f"sensitive_filename: {redact(clean_name)}",
         )
+        file_delivery_consent.audit_refusal(
+            file_delivery_consent.CLASS_OWNER_DASHBOARD,
+            leg="file_send",
+            name=redact(clean_name),
+            reason="flagged name",
+        )
         return "Error: filename contains sensitive content. Rename the file first."
     # For text files, check content for sensitive data; binary files skip this
     # and validate MIME against the shared BINARY_MIME_ALLOWLIST (deny-by-default).
@@ -983,6 +989,16 @@ def file_send(name: str, args: dict[str, Any]) -> str:
                 tool_name="file_send",
                 outcome="denied",
                 error="sensitive_content_detected",
+            )
+            # The error string below reaches the AGENT. This entry is what reaches
+            # the OWNER, so it carries the name: the panel it points them at asks
+            # them to allow delivery, and an owner who cannot see which of their
+            # files was stopped has nothing to base that on.
+            file_delivery_consent.audit_refusal(
+                file_delivery_consent.CLASS_OWNER_DASHBOARD,
+                leg="file_send",
+                name=clean_name,
+                reason="flagged content",
             )
             return (
                 "Error: file content contains sensitive data; send aborted. The owner "
