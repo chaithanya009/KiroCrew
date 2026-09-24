@@ -45,7 +45,7 @@ describe('provider labels', () => {
     // it exists to catch — including a retired provider left behind, which would
     // keep offering a label for something the backend refuses.
     expect(Object.keys(PROVIDER_LABEL_KEY).sort()).toEqual(
-      [PROVIDER_APPLE, PROVIDER_LOCAL, PROVIDER_TRANSCRIBE].sort(),
+      [PROVIDER_APPLE, PROVIDER_LOCAL, 'off', PROVIDER_TRANSCRIBE].sort(),
     )
   })
 
@@ -106,6 +106,7 @@ describe('availability reasons', () => {
       'stt_import_failed',
       'stt_model_missing',
       'stt_no_wheel_for_platform',
+      'stt_provider_off',
     ])
   })
 

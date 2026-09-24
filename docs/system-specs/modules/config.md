@@ -674,8 +674,20 @@ makes affirming it meaningless, and `--keep` refuses it by name rather than
 promising a setting that never takes effect. Left in place it is inert bytes that
 cost a warning on every load, forever, because a load never writes.
 
-One entry today: `stt.provider`, whose retired and unknown values degrade to
-`local`. The `is_coerced` predicate rides on the ENTRY, not in the detector's loop,
+One entry today: `stt.provider`. Its retired values (`whisper`, `mlx`, `parakeet`,
+`faster`) degrade to `local`; any other unknown value degrades to `off`, so a
+value nobody can account for never selects the in-process native recogniser
+(kirodotdev/KiroCrew#13179). Because the two resolutions differ, `resolves_to` is
+a callable of the stored value (delegating to `_validated_stt_provider`, the
+loader's own rule) and the entry carries the section `default`. `--adopt` uses
+both: it REWRITES a coerced key as what it resolves to, or deletes it only when
+that resolution IS the default (an absent key resolves to the default). So a
+retired name is adopted by removal and runs as `local` before and after, and an
+unknown name is adopted as the literal `"off"` and runs as `off` before and after.
+Adoption never moves the effective provider — deleting an unknown value would have
+made the default `local` apply, handing the incident's user back the engine they
+were escaping — and `coercion_summary` names the resolution instead of claiming
+removal changes nothing. The `is_coerced` predicate rides on the ENTRY, not in the detector's loop,
 so appending a retirement is genuinely sufficient — a detector switching on
 `dotted_key` would leave an appended entry silently unreported, with no test red and
 an operator stuck with a warning nothing can clear. That predicate delegates to

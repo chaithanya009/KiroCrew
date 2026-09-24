@@ -2864,10 +2864,11 @@ class TestSttRetiredProviders:
 
     def test_an_unknown_provider_is_told_what_it_could_have_been(self, caplog) -> None:
         """A typo gets the selectable list; a retired name gets the reason instead,
-        because "mlx is not one of local/apple/transcribe" answers the wrong
-        question for someone who had it working yesterday."""
+        because "mlx is not one of local/apple/transcribe/off" answers the wrong
+        question for someone who had it working yesterday. A typo also lands on
+        ``off`` rather than ``local``: ``test_stt_provider_off`` carries why."""
         with caplog.at_level(logging.WARNING, logger="kiro_crew.config.loader"):
-            assert _validated_stt_provider("whispr") == STT_PROVIDER_LOCAL
+            assert _validated_stt_provider("whispr") == "off"
         assert "whispr" in caplog.text
         for selectable in loader_module._VALID_STT_PROVIDERS:
             assert selectable in caplog.text
@@ -2892,16 +2893,18 @@ class TestSttRetiredProviders:
         with caplog.at_level(logging.WARNING, logger="kiro_crew.config.loader"):
             assert _validated_stt_provider("whisper") == STT_PROVIDER_LOCAL
             assert _validated_stt_provider("parakeet") == STT_PROVIDER_LOCAL
-            assert _validated_stt_provider("whispr") == STT_PROVIDER_LOCAL
+            assert _validated_stt_provider("whispr") == "off"
         assert "whisper" in caplog.text
         assert "parakeet" in caplog.text
         assert "whispr" in caplog.text
 
     def test_a_non_string_provider_degrades_rather_than_raising(self, tmp_path: Path) -> None:
         """The membership tests take an ``object``, so a hand-edited number or a
-        JSON ``null`` has to fall through to the default instead of a TypeError."""
+        JSON ``null`` has to fall through instead of a TypeError. ``null`` names
+        nothing and is read as the absent key (the default); a number is a value
+        that cannot be honoured and fails closed like any other unknown one."""
         assert _loaded_stt(tmp_path, {"provider": None}).provider == STT_PROVIDER_LOCAL
-        assert _loaded_stt(tmp_path, {"provider": 7}).provider == STT_PROVIDER_LOCAL
+        assert _loaded_stt(tmp_path, {"provider": 7}).provider == "off"
 
 
 class TestSttRemovedFieldsAreInert:
