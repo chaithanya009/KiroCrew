@@ -14,6 +14,7 @@ from pathlib import Path, PurePosixPath
 
 from kiro_crew.apps.builtins.dev_fleet import runtime
 from kiro_crew.executors import subprocess_executor
+from kiro_crew.security import sensitive_path_refusal
 
 
 def _resolve_primary_checkout(path: str) -> str:
@@ -76,6 +77,24 @@ class RepoUnreadable(RepoUnavailable):
     """
 
 
+class RepoReadOnly(RepoUnavailable):
+    """The checkout is readable, but this app may only READ it.
+
+    An operator-named git repository that does not carry the Kiro Crew markers is
+    adopted for the generic read surface — worktree list, branch, ahead and
+    own-commit counts, the dirty split, PR state, disk usage — all of which is
+    plain git and gh work that holds for any repository. The mutating half does
+    not generalize: ``worktree remove``, ``update-ref -d``, ``pull --ff-only``,
+    ``git fetch``, the ``pip install -e .`` provision chain and the live-target
+    service unit all act on this product's own source, so they are refused here.
+
+    Shares a base with the two unavailable states so every site that already
+    degrades on ``RepoUnavailable`` degrades on this too: a helper that answers
+    "not derivable" for an unresolved checkout gives the same answer for one it
+    may not write, which is correct without that site being touched.
+    """
+
+
 #: Set at startup when the resolved checkout does not carry the Kiro Crew markers,
 #: to the message ``_repo()`` raises. Tiers 1-2 (env var, config) are taken
 #: verbatim, so a configured path can be a readable directory that is not this
@@ -83,27 +102,69 @@ class RepoUnreadable(RepoUnavailable):
 #: the config-derived source hint.
 _REPO_INVALID_MSG: str | None = None
 
+#: Set at startup when the resolved checkout is a git repository that does not
+#: carry the Kiro Crew markers, to the message ``_repo()`` raises. Truthy means
+#: the fleet is READABLE and every mutating verb is refused; ``_REPO_INVALID_MSG``
+#: is then None, because there is nothing wrong with the path.
+_REPO_READ_ONLY_MSG: str | None = None
 
-def _repo() -> str:
-    """The resolved main checkout path, guaranteed usable.
+
+def _repo_read() -> str:
+    """The resolved main checkout path, safe to READ.
 
     The single gate between ``MAIN_REPO`` and every git argv or path built from
     it. ``git -C ""`` does not fail — it silently runs against this process's
     working directory — and ``Path("")`` is ``Path(".")``, so an unresolved
     checkout reaching a consumer would operate on an arbitrary directory and
-    return plausible results. A configured path that is a readable but unrelated
-    git repository is the same hazard wearing a valid-looking path: git answers
-    happily, so nothing downstream can tell. Raising here makes both states fail
-    loud at every call site — including the ones that never touch a route, like
-    the background refresher and sync — instead of each site carrying (or
-    forgetting) its own guard. Sites that deliberately degrade catch
-    ``RepoUnavailable`` and say what the degraded answer is.
+    return plausible results. Raising here makes that state fail loud at every
+    call site — including the ones that never touch a route, like the background
+    refresher and sync — instead of each site carrying (or forgetting) its own
+    guard. Sites that deliberately degrade catch ``RepoUnavailable`` and say what
+    the degraded answer is.
+
+    Read-only means read-only in the git sense: listing worktrees, resolving
+    remotes and reading refs. It is what the generic surface needs and it is the
+    weaker of the two accessors, so a call site that mutates must NOT use it —
+    ``_repo()`` is the one that also refuses a repository this app may only read.
     """
     if not MAIN_REPO:
         raise RepoNotConfigured("no Kiro Crew checkout found to manage")
     if _REPO_INVALID_MSG:
         raise RepoUnreadable(_REPO_INVALID_MSG)
     return MAIN_REPO
+
+
+def _repo() -> str:
+    """The resolved main checkout path, safe to MUTATE. The default accessor.
+
+    Everything ``_repo_read`` refuses, plus a repository this app may only read.
+    A configured path that is a readable but unrelated git repository is a hazard
+    wearing a valid-looking path: git answers happily, so nothing downstream can
+    tell that ``worktree remove``, ``update-ref -d``, ``pull --ff-only`` and
+    ``pip install -e .`` are landing in a stranger's tree. Refusing in the
+    accessor rather than per verb is what makes that fail CLOSED: a call site
+    added later inherits the refusal by default, and only a site that has
+    reasoned about a foreign repository opts down to ``_repo_read``.
+
+    Verb-rooted safety is not enough on its own, because some mutations are
+    rooted at a WORKTREE path rather than at the main checkout — a rebase fetches
+    into the worktree it rebases. Those are refused at the route boundary, which
+    gates every non-GET on this accessor.
+    """
+    path = _repo_read()
+    if _REPO_READ_ONLY_MSG:
+        raise RepoReadOnly(_REPO_READ_ONLY_MSG)
+    return path
+
+
+def _read_only_reason() -> str | None:
+    """Why mutating verbs are refused on the resolved checkout, or None.
+
+    The one reader of the read-only state outside the accessors, so the route
+    boundary, the ``/fleet`` payload and the row fields that describe this
+    product's own build artifacts all consult one answer rather than three.
+    """
+    return _REPO_READ_ONLY_MSG
 
 
 def _own_source_checkout() -> str | None:
@@ -137,6 +198,21 @@ def _is_kirocrew_checkout(path: str) -> bool:
             and (p / "src" / "kiro_crew").is_dir()
             and (p / "pyproject.toml").is_file()
         )
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def _is_git_checkout(path: str) -> bool:
+    """Whether *path* is a git checkout at all. Blocking — stats only.
+
+    The weaker half of the marker test, and the difference between a path this
+    app can READ and one it can do nothing with. ``.git`` is tested as a path
+    rather than a directory because a linked worktree's is a file.
+    """
+    if not path:
+        return False
+    try:
+        return (Path(path) / ".git").exists()
     except (OSError, RuntimeError, ValueError):
         return False
 
@@ -312,7 +388,18 @@ def _default_main_repo_state() -> tuple[str, bool]:
 
 # Startup replaces this stat-only hint after the complete discovery chain runs.
 MAIN_REPO, MAIN_REPO_INFERRED = _default_main_repo_state()
+
+#: The resolved checkout's OWN default branch, re-resolved by
+#: ``_resolve_base_branch`` on every attempt that publishes a resolution. ``main``
+#: is the import-time value and the fallback: a repository that publishes no
+#: default branch and carries none of ``_LOCAL_BASE_CANDIDATES`` keeps it, which
+#: is the same answer every consumer read before any repository was known.
 BASE_BRANCH = "main"
+
+#: Local branch names tried, in order, when no remote states a default. Both
+#: conventional names are needed: this surface serves a repository the operator
+#: named, and an older one still carries the legacy name as its only default.
+_LOCAL_BASE_CANDIDATES = ("main", "master")  # wokeignore:rule=master
 
 # --- full discovery: once per process, or once per attempt while unresolved ---
 _DISCOVERY_DONE = False
@@ -394,7 +481,7 @@ async def ensure_main_repo_discovered() -> None:
     often still unresolved) cannot consume it unnoticed.
     """
     global _DISCOVERY_DONE, _DISCOVERY_LOCK, MAIN_REPO, MAIN_REPO_INFERRED, _REPO_INVALID_MSG
-    global _LATCHED_CONFIGURED
+    global _LATCHED_CONFIGURED, _REPO_READ_ONLY_MSG
     # A latched VALID resolution is final and returns here with no await at all, so an
     # install that has a fleet to serve pays nothing for the per-poll retry. Only the
     # latched-INVALID state falls through, and it settles under the lock so concurrent
@@ -440,43 +527,81 @@ async def ensure_main_repo_discovered() -> None:
             MAIN_REPO = ""
             MAIN_REPO_INFERRED = False
             _REPO_INVALID_MSG = None
+            _REPO_READ_ONLY_MSG = None
             _DISCOVERY_DONE = False
             return
         discovered = await loop.run_in_executor(
             subprocess_executor(), _discover_main_repo, configured
         )
         invalid_msg: str | None = None
+        read_only_msg: str | None = None
         if discovered:
             discovered = await loop.run_in_executor(
                 subprocess_executor(), _resolve_primary_checkout, discovered
             )
             # Tiers 1-2 are taken verbatim so a typo surfaces against the path the
             # user named — but "not replaced by a discovered checkout" and "not
-            # validated" are separable, and only the first is wanted. An unvalidated
-            # configured path that happens to be SOME readable git repository would
-            # have its worktrees listed and `worktree remove`, `update-ref -d`,
-            # `pull --ff-only` and `pip install -e` run inside it. Validated once here
-            # rather than per call, so no request or refresher cycle pays the stats;
-            # the message is composed here too because it embeds the config-derived
-            # source hint, which reads files.
-            valid, hint = await loop.run_in_executor(
+            # validated" are separable, and only the first is wanted. Validated once
+            # here rather than per call, so no request or refresher cycle pays the
+            # stats; the messages are composed here too because they embed the
+            # config-derived source hint, which reads files.
+            valid, is_git, hint = await loop.run_in_executor(
                 subprocess_executor(),
-                lambda: (_is_kirocrew_checkout(discovered), _repo_source_hint()),
+                lambda: (
+                    _is_kirocrew_checkout(discovered),
+                    _is_git_checkout(discovered),
+                    _repo_source_hint(),
+                ),
             )
-            invalid_msg = (
-                None
-                if valid
-                else (
-                    f"not a Kiro Crew checkout: {discovered} exists but does not carry the "
-                    f"markers (.git, src/kiro_crew/, pyproject.toml). {hint}"
-                )
-            )
+            if not valid:
+                # The generic READ surface — worktree list, branch, ahead and
+                # own-commit counts, the dirty split, PR state, disk usage — is
+                # plain git and gh work that holds for ANY repository, so an
+                # operator who names one explicitly gets a fleet rather than a
+                # banner. Only tiers 1-2 can reach here, because
+                # `_discover_main_repo` adopts an INFERRED candidate solely when it
+                # passes the marker test; the `configured` test states that
+                # dependence instead of relying on it, so no repository is ever
+                # auto-adopted. Mutating verbs stay refused: `worktree remove`,
+                # `update-ref -d`, `pull --ff-only` and `pip install -e` act on
+                # this product's own source, and a stranger's repository is not it.
+                if configured and is_git:
+                    # The one adoption this app performs on a path it did not
+                    # verify as its own, so it is also the one that must ask the
+                    # centralized gate whether the path is fenced. The gate is the
+                    # single definition of a protected location and it
+                    # canonicalizes before deciding, so a link into a fenced tree
+                    # answers the same as the tree. A fenced path is refused
+                    # OUTRIGHT rather than served read-only: reading it is what the
+                    # fence forbids, and the fleet's own reads would disclose its
+                    # worktrees and branches. The gate refuses fail-closed when it
+                    # cannot decide in time, and that answer is taken as given --
+                    # an undecided fence is a fence.
+                    fenced = sensitive_path_refusal(discovered)
+                    if fenced:
+                        invalid_msg = (
+                            f"refused: {discovered} is a protected location. "
+                            f"{runtime._redact(fenced)} {hint}"
+                        )
+                    else:
+                        read_only_msg = (
+                            f"read-only: {discovered} is a git repository but does not carry "
+                            f"the Kiro Crew markers (.git, src/kiro_crew/, pyproject.toml), so "
+                            f"Dev Fleet reads its worktrees and refuses every action that "
+                            f"would change it. {hint}"
+                        )
+                else:
+                    invalid_msg = (
+                        f"not a Kiro Crew checkout: {discovered} exists but does not carry the "
+                        f"markers (.git, src/kiro_crew/, pyproject.toml). {hint}"
+                    )
         MAIN_REPO = discovered
         MAIN_REPO_INFERRED = bool(discovered and not configured)
-        # Assigned on BOTH branches. An attempt that found nothing must not inherit
-        # an earlier attempt's invalid-path message, or `_repo()` would raise
-        # RepoUnreadable against a path this process does not hold.
+        # Assigned on EVERY branch. An attempt that found nothing must not inherit
+        # an earlier attempt's verdict, or `_repo()` would raise against a path this
+        # process does not hold.
         _REPO_INVALID_MSG = invalid_msg
+        _REPO_READ_ONLY_MSG = read_only_msg
         # Written with the rest of this attempt's state, so the staleness test compares
         # against the string THIS attempt read. `MAIN_REPO` is the resolved form of it
         # and is the wrong side of that comparison.
@@ -488,12 +613,81 @@ async def ensure_main_repo_discovered() -> None:
             # the not-yet-loaded sentinel; the loader always assigns a dict, so an
             # operator with no helpers configured still latches at `{}`.
             await _load_trusted_credential_helpers()
-        # Both decline to cache when `_repo()` raises and cost no subprocess in that
-        # case, so an unresolved attempt leaves them to the attempt that resolves.
+        # Resolved BEFORE the remote: remote resolution reads
+        # `branch.<base>.remote` and so needs the base branch name, while the base
+        # branch resolver needs no remote — so the dependency runs one way only.
+        await _resolve_base_branch()
+        # Both decline to cache when `_repo_read()` raises and cost no subprocess in
+        # that case, so an unresolved attempt leaves them to the attempt that resolves.
         await _load_fallback_repos()
         await _upstream_remote()
         # The local, not the global: see the ratchet note in the docstring.
         _DISCOVERY_DONE = bool(discovered)
+
+
+# --- base branch resolution ---
+# A branch NAME is interpolated into git argv both as a bare argument
+# (``git fetch <remote> <base>``) and inside a rev range (``<remote>/<base>..HEAD``),
+# so a repo-controlled value is constrained before it is trusted: a leading ``-``
+# would be parsed as a flag, and an embedded ``..`` would split a range at the
+# wrong place. The leading character class excludes ``-``; ``..`` is checked
+# separately, because the body class admits it.
+_BASE_BRANCH_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]*")
+
+
+def _plausible_branch_name(name: str) -> bool:
+    """Whether *name* is safe to interpolate into a git argv as a branch."""
+    return bool(name) and ".." not in name and bool(_BASE_BRANCH_RE.fullmatch(name))
+
+
+async def _resolve_base_branch() -> None:
+    """Resolve ``BASE_BRANCH`` to the resolved checkout's own default branch.
+
+    Read in the order the answer is trustworthy, and from ONE remote only. A
+    remote's published ``HEAD`` is the repository's own statement of which branch
+    is its default, but ``git remote`` lists names alphabetically, so consulting
+    them in listing order lets an archive or fork remote outvote ``origin``.
+    ``_upstream_remote`` resolves independently and falls back to ``origin``, so
+    the pair can then disagree and ``/rebase`` rewrites a branch onto a base the
+    upstream never published. ``origin`` is therefore the only remote consulted,
+    or the sole remote of a checkout that has exactly one under another name.
+
+    The local candidates are the fallback, and they need no remote at all — which
+    matters, because remote resolution reads ``branch.<base>.remote`` and
+    therefore cannot run before the base branch is known. A base taken from a
+    local branch composes with that read: ``_upstream_remote`` resolves the remote
+    THAT branch tracks.
+
+    Re-resolved on every publishing attempt rather than cached behind a sentinel:
+    an attempt that publishes a DIFFERENT checkout must not inherit the previous
+    repository's default branch, and the cost is a few short git reads once per
+    resolved attempt.
+
+    A resolution that finds nothing leaves the value alone, so an unresolved
+    process keeps ``main`` and every consumer reads the name it always did.
+    """
+    global BASE_BRANCH
+    try:
+        repo = _repo_read()
+    except RepoUnavailable:
+        # No checkout to ask. Reaching git here would answer for whatever tree the
+        # backend happens to sit in, which is the hazard the accessor exists for.
+        return
+    rc, remotes, _err = await runtime._run_cmd(["git", "-C", repo, "remote"], timeout=5)
+    names = remotes.split() if rc == 0 else []
+    remote = "origin" if "origin" in names else (names[0] if len(names) == 1 else "")
+    if remote:
+        ref = await _git(repo, "symbolic-ref", "--short", f"refs/remotes/{remote}/HEAD")
+        # Spelled ``<remote>/<branch>``, and the branch half may itself carry
+        # slashes, so only the FIRST separator belongs to the remote.
+        head = ref.split("/", 1)[1] if ref and "/" in ref else ""
+        if _plausible_branch_name(head):
+            BASE_BRANCH = head
+            return
+    for candidate in _LOCAL_BASE_CANDIDATES:
+        if await _git(repo, "rev-parse", "--verify", "--quiet", f"refs/heads/{candidate}"):
+            BASE_BRANCH = candidate
+            return
 
 
 # --- upstream remote resolution (replaces hardcoded 'origin') ---
@@ -511,7 +705,7 @@ async def _upstream_remote() -> str:
     if _UPSTREAM_REMOTE is not None:
         return _UPSTREAM_REMOTE
     try:
-        repo = _repo()
+        repo = _repo_read()
     except RepoUnavailable:
         # A repo that never resolved must not reach git at all — it would
         # answer for whatever tree the backend happens to sit in. Remote
@@ -592,7 +786,7 @@ def _normalize_repo_identity(url: str) -> tuple[str, str] | None:
 async def _load_fallback_repos() -> None:
     global _FALLBACK_REPOS
     try:
-        repo = _repo()
+        repo = _repo_read()
     except RepoUnavailable:
         # No checkout, no remotes to enumerate; the fallback list stays empty.
         return
@@ -807,9 +1001,12 @@ def _parse_worktree_porcelain(raw: str) -> list[dict]:
 
 async def _worktree_porcelain_entries() -> list[dict]:
     """List all git worktree records of MAIN_REPO, including prunable entries."""
-    # Nothing to discover when no checkout resolved; _repo() raises
-    # RepoNotConfigured and the setup state is the caller's job.
-    repo = _repo()
+    # Nothing to discover when no checkout resolved; _repo_read() raises
+    # RepoNotConfigured and the setup state is the caller's job. The READ
+    # accessor: enumerating worktrees is the generic surface's foundation and
+    # holds for any git repository, so a checkout this app may only read still
+    # produces a fleet.
+    repo = _repo_read()
     rc, stdout, stderr = await runtime._run_cmd(
         ["git", "-C", repo, "worktree", "list", "--porcelain"], timeout=10
     )
@@ -891,6 +1088,8 @@ async def _discover_worktrees() -> list[dict]:
 async def _git(git_dir: str, *args: str, timeout: int = 6, mode: str = "standard") -> str | None:
     # Repo-controlled execution vectors are neutralized centrally in
     # _run_cmd via _GIT_ENV_NEUTRALIZERS — no per-call-site flags needed.
+    # That chokepoint also carries GIT_OPTIONAL_LOCKS=0, so a read here never
+    # rewrites the index of a checkout this app may only read.
     rc, stdout, _ = await runtime._run_cmd(
         ["git", "-C", git_dir, *args], timeout=timeout, mode=mode
     )
@@ -1310,15 +1509,19 @@ __all__ = (
     "MAIN_REPO",
     "MAIN_REPO_INFERRED",
     "RepoNotConfigured",
+    "RepoReadOnly",
     "RepoUnavailable",
     "RepoUnreadable",
+    "_BASE_BRANCH_RE",
     "_CHECKOUT_DIR_NAMES",
     "_CHECKOUT_PARENT_DIRS",
     "_DIRTY_PATH_SAMPLE",
     "_FALLBACK_REPOS",
     "_LATCHED_CONFIGURED",
+    "_LOCAL_BASE_CANDIDATES",
     "_REPO_INVALID_MSG",
     "_REPO_PATH_RE",
+    "_REPO_READ_ONLY_MSG",
     "_UPSTREAM_REMOTE",
     "_candidate_checkouts",
     "_configured_main_repo",
@@ -1341,6 +1544,7 @@ __all__ = (
     "_git_ahead",
     "_git_info",
     "_invalid_resolution_is_stale",
+    "_is_git_checkout",
     "_is_kirocrew_checkout",
     "_load_dev_fleet_cfg",
     "_load_dev_fleet_cfg_checked",
@@ -1351,9 +1555,13 @@ __all__ = (
     "_own_commits_count",
     "_own_source_checkout",
     "_parse_worktree_porcelain",
+    "_plausible_branch_name",
+    "_read_only_reason",
     "_real_dirty",
     "_repo",
+    "_repo_read",
     "_repo_source_hint",
+    "_resolve_base_branch",
     "_resolve_primary_checkout",
     "_same_path",
     "_upstream_remote",
