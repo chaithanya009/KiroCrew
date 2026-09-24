@@ -355,6 +355,20 @@ _CREW_SECRET_LEAVES: list[str] = [
     # straight off disk, and a corrupted record reads as ABSENT to the store —
     # silent loss the conductor cannot see. No legitimate file-tool reader.
     "work-ledger",
+    # The cross-process work root (``work_root``). Not credentials either: the
+    # hazard is WRITE, and it is specific to this root's deterministic keys. A key
+    # is an issue or pull-request number so a later run can compute it again, so a
+    # name here is GUESSABLE in a way a random-suffixed scratch name is not -- and
+    # ``allocate_work`` REJOINS whatever sits at the key rather than refusing it.
+    # Without this entry an agent's auto-approved file tools could plant a tree at
+    # a key it expects some job to use, and that job would adopt the planted
+    # contents as its own prior state. The sandbox mask on the same leaf stops a
+    # spawned subprocess; this entry stops the file tools, and the root needs both
+    # because either alone leaves the other path open. The ``scratch`` root is
+    # deliberately NOT here: it is the agent's own sanctioned write area, named to
+    # it by ``$KIROCREW_SCRATCH``. ``work_root`` opens these paths directly rather
+    # than through this gate, so the sweep and every real consumer keep working.
+    "work",
     # Every append-only per-unit crew log, crew and session alike (crew_log/store.py).
     # Not credentials, but the design's whole premise is that the crew log is the
     # AUTHORITY and the context window only a cache: a conductor reads a unit's

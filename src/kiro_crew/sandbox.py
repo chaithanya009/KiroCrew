@@ -336,6 +336,22 @@ _CREW_HIDDEN_LEAVES: tuple[str, ...] = (
     # as a second such window, so ``$KIROCREW_SCRATCH`` names one place for the
     # whole tree. Siblings from other trees stay hidden either way.
     "scratch",
+    # The cross-process work root (``work_root``): ``<home>/work/<key>``, for
+    # state that must OUTLIVE the process that created it. Masked as a whole and
+    # given NO window, which is the difference from ``scratch`` above: every
+    # consumer runs unsandboxed (the gateway's own maintenance sweep, operator
+    # script crons, an app backend), so no sandboxed process reaches it and no
+    # environment variable names it. Keys are deterministic by design -- an
+    # issue or pull-request number, so a later run finds the directory again --
+    # so an unmasked root would let one session tree guess a name and rewrite
+    # another job's in-flight clone, a sharper hazard than the random-suffixed
+    # scratch names carry. The mask alone would be VACUOUS here, which is why this
+    # leaf appears in two more places: the root is created lazily by the first
+    # ``allocate_work`` call, so it is also in ``_CREW_PRECREATE_HIDDEN_DIR_LEAVES``
+    # (the loop below binds nothing over an absent name), and it is in
+    # ``security.paths`` so the file tools refuse it too. All three, because each
+    # one alone leaves a different path open.
+    "work",
     # The Notes state files below are OWNED by the md-notebook backend, which is itself
     # a sandboxed spawn (`apps/backend.py`), so the mask alone would break the app: the
     # registry write's final rename gets EPERM and attach/clone always fails.
@@ -1550,6 +1566,18 @@ _CREW_PRECREATE_HIDDEN_DIR_LEAVES: tuple[str, ...] = (
     # otherwise the first sandbox spawned before the first grant write sees an
     # unmasked leaf appear later.
     "tag-grants",
+    # The cross-process work root, and it needs this entry MORE than the stores
+    # above rather than less: it is created lazily by the first ``allocate_work``
+    # call, so on a fresh home the leaf is absent at every spawn until some job
+    # allocates, the ``isdir``-guarded ``SENSITIVE_DIRS`` loop skips what does not
+    # exist, and the mask is vacuous for the life of those sandboxes. The
+    # ``scratch`` sibling carries no entry because every spawn allocates one, so
+    # that root exists by construction; nothing allocates a work directory for a
+    # spawn. Left absent, a sandboxed agent could itself create the directory at a
+    # key it expects a job to use -- keys are deterministic by design -- and
+    # ``allocate_work`` would then REJOIN the planted tree. Materialised empty at
+    # 0700 before every spawn so the bind always has a target.
+    "work",
 )
 
 #: The masked md-notebook leaves materialised before a namespace spawn, and what each
@@ -1750,6 +1778,8 @@ _CREW_NO_ALIAS_LEAVES: frozenset[str] = frozenset({"crew-panels", "panel-templat
 #: relocation the product offers:
 #:
 #: * ``scratch`` -- ``agent_scratch.scratch_root()`` is ``config_dir() / "scratch"``;
+#: * ``work`` -- ``work_root.work_root()`` is ``config_dir() / "work"``, and the module
+#:   refuses a linked root at allocation and sweeps nothing through one;
 #: * ``backup`` -- no resolver in the tree reads an override for it either.
 #:
 #: The HARDLINK shape is tolerated for every leaf, which is why it is a property of the
