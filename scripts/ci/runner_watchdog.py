@@ -1462,9 +1462,26 @@ def supersession_clears_hold(
     that test is belt-and-braces rather than the fork boundary itself.
 
     A lookup that cannot answer leaves the hold standing: cancelling needs
-    supersession ESTABLISHED, never assumed from a failed read.
+    supersession ESTABLISHED, never assumed from a failed read. So does an attempt
+    past the first: only attempt 1 is certainly nobody's own re-run.
     """
     if verdict.event != "push" or verdict.head_repo.lower() != policy.repo.lower():
+        return False
+    if verdict.run_attempt != 1:
+        # Attempt 1 is the only attempt nobody has re-run, so it is the only one
+        # this escape may release. A later attempt may BE somebody's `gh run
+        # rerun`, and one already in place when the sweep read the run looks
+        # unchanged to anything that asks "did the attempt move since?", while
+        # the heal path's re-run check then declines it as superseded and
+        # `superseded-before-cancel` is not a failed outcome -- a green tick over
+        # a human action the recovery pass will not restore either, because it
+        # classifies superseded cancelled runs out. Holding such a run costs a
+        # stuck concurrency group; releasing it can cost a person's work.
+        log(
+            f"{_label(verdict)}: the fleet hold stands even though a newer push supersedes it, "
+            f"because this is attempt {verdict.run_attempt} and a re-run attempt may be "
+            f"somebody's own; releasing it could discard their work irrecoverably"
+        )
         return False
     try:
         if is_newest_for_branch(api, policy.repo, verdict):
@@ -2558,6 +2575,26 @@ def run_watchdog(
     def fresh_hold(verdict: RunVerdict) -> tuple[str, str, str | None] | None:
         prime_fresh_evidence()
         if "error" in fresh:
+            # A superseded run is the one case where evidence that could not be
+            # read decides nothing: the hold exists to protect a result someone
+            # wants, and a branch that has moved on wants none, so an unreadable
+            # fleet is not a reason to keep parking every later push behind it.
+            # Asked BEFORE the deferral below, because the deferral is what the
+            # incident's own rate-limit condition turns into a permanent hold.
+            # Fails closed by construction: the supersession lookup is itself an
+            # API read, so the condition that broke the evidence read breaks it
+            # too, and an inconclusive lookup leaves the hold standing.
+            if supersession_clears_hold(api, replace(policy, now=tick.now()), verdict, log):
+                # The deferral below is what usually carries the read's error text
+                # into the log, and this path skips it, so say it here instead: a
+                # cancel must never be the only trace of a fleet the tick could
+                # not read.
+                log(
+                    f"{_label(verdict)}: the dispatch evidence could not be re-read before the "
+                    f"cancel ({fresh['error']}), and it is not held for that: a newer push "
+                    f"supersedes this run, so the unread fleet decides nothing about it"
+                )
+                return None
             # A one-off error (a 502) is genuinely deferrable: nothing was touched,
             # the run stays orphaned and the next tick re-reads it. A RATE LIMIT is
             # not one-off but a condition, and it is the condition that killed the

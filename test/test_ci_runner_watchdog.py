@@ -4433,3 +4433,140 @@ def test_an_unanswerable_supersession_lookup_leaves_the_hold_standing() -> None:
     api = FakeApi({}, {})
     with _mock.patch.object(wd, "is_newest_for_branch", explode):
         assert not wd.supersession_clears_hold(api, _policy(), verdict, lambda _l: None)
+
+
+# ── an unreadable fleet does not park a superseded orphan either ────────────
+
+
+def _kill_the_fresh_evidence_read(api: FakeApi, error: Any) -> None:
+    """Make the SECOND live listing raise, i.e. the re-read `fresh_hold` does.
+
+    The first listing is the sweep's own; the branch listing that answers
+    supersession is a different path and keeps working, which is the case that
+    matters: the fleet could not be re-read, but whether the branch moved on
+    could still be told.
+    """
+    original_get = api.get
+    reads = {"n": 0}
+
+    def get(path: str) -> Any:
+        if re.search(r"/actions/runs\?.*status=in_progress", path):
+            reads["n"] += 1
+            if reads["n"] > 1:
+                raise error
+        return original_get(path)
+
+    api.get = get  # type: ignore[method-assign]
+
+
+def test_a_superseded_orphan_is_cancelled_when_the_fresh_evidence_read_is_rate_limited() -> None:
+    """The deferral must not become the permanent hold the incident was made of.
+
+    A rate limit is a CONDITION: while it persists, every tick re-reads, every tick
+    defers, and the orphan keeps every later commit's run out of its concurrency
+    group -- the exact 6-hour shape this change exists to end. Unreadable fleet
+    evidence decides nothing about a run whose branch has moved on, because the hold
+    protects a result someone wants and a superseded run has none.
+    """
+    api = FakeApi({"in_progress": [_run(1)]}, {1: [_job(11)]}, newest_by_branch={"main": 2})
+    _kill_the_fresh_evidence_read(
+        api, wd.ApiError(403, "API rate limit exceeded for installation ID 12345", remaining="0")
+    )
+    _sweep(api)
+    assert _posts(api, "/cancel") == [f"repos/{REPO}/actions/runs/1/cancel"]
+    assert not _posts(api, "/rerun")
+
+
+def test_an_unreadable_fleet_still_defers_a_run_that_is_not_superseded() -> None:
+    """Negative control: the fail-closed evidence re-read is not weakened.
+
+    Same runs, same unreadable fleet, only the branch listing differs, so the change
+    above cannot pass by clearing the hold for every run.
+    """
+    api = FakeApi({"in_progress": [_run(1)]}, {1: [_job(11)]}, newest_by_branch={"main": 1})
+    _kill_the_fresh_evidence_read(api, wd.ApiError(502, "bad gateway"))
+    verdicts, outcomes = _sweep(api)
+    verdict = _verdict_of(verdicts, 1)
+    assert verdict.verdict == wd.SKIPPED_NO_DISPATCH_EVIDENCE
+    assert "could not be re-read" in verdict.detail
+    assert api.posts == []
+    assert outcomes == {1: wd.OUTCOME_EVIDENCE_REREAD_DEFERRED}
+
+
+def test_an_unanswerable_supersession_lookup_keeps_the_unreadable_fleets_hold() -> None:
+    """Fails closed twice over: neither read answered, so nothing is cancelled and
+    the outcome still reds the tick."""
+
+    def explode(*_a: Any, **_k: Any) -> bool:
+        raise wd.LookupInconclusive("the branch listing could not be read")
+
+    import unittest.mock as _mock
+
+    api = FakeApi({"in_progress": [_run(1)]}, {1: [_job(11)]}, newest_by_branch={"main": 2})
+    _kill_the_fresh_evidence_read(
+        api, wd.ApiError(403, "API rate limit exceeded for installation ID 12345", remaining="0")
+    )
+    with _mock.patch.object(wd, "is_newest_for_branch", explode):
+        verdicts, outcomes = _sweep(api)
+    assert _verdict_of(verdicts, 1).verdict == wd.SKIPPED_NO_DISPATCH_EVIDENCE
+    assert api.posts == []
+    assert outcomes == {1: wd.OUTCOME_ABORTED_RATE_LIMITED}
+
+
+def test_the_unreadable_fleet_is_named_in_the_log_before_a_superseded_cancel() -> None:
+    """A cancel must never be the only trace of a fleet the tick could not read.
+
+    The deferral is what usually carries the read's error text into the log, and this
+    path skips the deferral, so it has to say it itself: `prime_fresh_evidence`
+    stashes the error and logs nothing.
+    """
+    api = FakeApi({"in_progress": [_run(1)]}, {1: [_job(11)]}, newest_by_branch={"main": 2})
+    _kill_the_fresh_evidence_read(
+        api, wd.ApiError(403, "API rate limit exceeded for installation ID 12345", remaining="0")
+    )
+    lines: list[str] = []
+    clock = _Clock()
+    wd.run_watchdog(api, _policy(), clock=clock.now, sleep=clock.sleep, log=lines.append)
+    assert _posts(api, "/cancel") == [f"repos/{REPO}/actions/runs/1/cancel"]
+    said = " ".join(lines)
+    assert "could not be re-read before the cancel" in said
+    assert "API rate limit exceeded for installation" in said
+    assert "supersedes this run" in said
+
+
+def _verdict_at(attempt: int) -> Any:
+    return wd.RunVerdict(
+        run_id=1,
+        run_attempt=attempt,
+        head_branch="main",
+        head_repo=REPO,
+        event="push",
+        status="in_progress",
+        url="https://example.invalid/runs/1",
+        age=timedelta(minutes=60),
+        verdict=wd.ORPHANED,
+        workflow="ci.yml",
+    )
+
+
+def test_a_rerun_attempt_is_never_released_by_supersession() -> None:
+    """A re-run attempt may BE somebody's own, and this escape cannot tell.
+
+    A hand `gh run rerun` already in place when the sweep reads the run looks
+    unchanged to anything asking "did the attempt move since?", the re-run check then
+    declines it as superseded, and `superseded-before-cancel` is not a failed
+    outcome -- a green tick over a human action the recovery pass will not restore.
+    """
+    api = FakeApi({}, {}, newest_by_branch={"main": 2})
+    lines: list[str] = []
+    assert not wd.supersession_clears_hold(api, _policy(), _verdict_at(2), lines.append)
+    said = " ".join(lines)
+    assert "this is attempt 2" in said
+    assert "discard their work" in said
+
+
+def test_attempt_one_is_still_released_by_supersession() -> None:
+    """Positive control: the incident's own shape is a stuck attempt-1 run, so the
+    escape must still fire there or the fix this PR exists for is gone."""
+    api = FakeApi({"in_progress": [_run(1)]}, {1: [_job(11)]}, newest_by_branch={"main": 2})
+    assert wd.supersession_clears_hold(api, _policy(), _verdict_at(1), lambda _l: None)

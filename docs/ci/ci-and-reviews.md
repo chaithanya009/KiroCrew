@@ -921,7 +921,15 @@ Details worth knowing:
     one-off error defers and stays green, but one that fails on a RATE LIMIT carries
     `aborted-rate-limited` and reds the tick: a limit is a condition, not a one-off,
     so every tick would otherwise defer and look healthy while the orphan keeps
-    parking later pushes behind it. Once a cancel is accepted the watchdog
+    parking later pushes behind it. One run escapes that deferral: a run a newer
+    push has SUPERSEDED, asked about before the tick defers, because evidence it
+    could not read decides nothing about a result nobody wants. Two guards bound
+    it. Supersession must come from a lookup that ANSWERED, so the condition that
+    broke the evidence read usually blocks the escape too, and the unreadable
+    fleet is named in the log beside the cancel. And it applies to ATTEMPT 1 only,
+    the one attempt certainly nobody's own re-run: a later attempt may be
+    somebody's `gh run rerun`, which the re-run check would then decline as
+    superseded with no recovery. Once a cancel is accepted the watchdog
     owns the run until it is re-run: it polls to `completed`, escalates to
     `force-cancel` after 90 s, and re-runs each run as it completes inside one
     shared five-minute budget. The whole tick runs inside the script's own
