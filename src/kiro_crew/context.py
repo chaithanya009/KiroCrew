@@ -2560,6 +2560,8 @@ _REPLAY_INJECT_MAX_ROWS = (
 ) // _REPLAY_INJECT_CAP_CHARS
 
 _REPLAY_CONVERSATION_MAX_ROWS = 500
+_REPLAY_RECOVERY_TOOL_MAX_ROWS = 32
+_REPLAY_RECOVERY_TOOL_CAP_CHARS = 1_200
 
 
 def _replay_identity(row: dict) -> tuple | None:
@@ -2614,6 +2616,7 @@ def _replay_rows(
     exclude_last_n: int = 0,
     pending_messages: list[dict] | None = None,
     current_message: dict | None = None,
+    include_completed_tools: bool = False,
 ) -> list[dict]:
     """Tail of the chain under per-role quotas, in chronological order.
 
@@ -2629,9 +2632,24 @@ def _replay_rows(
     from kiro_crew.image_refs import strip_image_refs
 
     kept: list[dict] = []
-    conv = inj = 0
-    for m in reversed(messages):
+    conv = inj = tools = 0
+    last_user = max((i for i, row in enumerate(messages) if row.get("role") == "user"), default=-1)
+    for index in range(len(messages) - 1, -1, -1):
+        m = messages[index]
         role = m["role"]
+        if role == "tool":
+            meta = m.get("meta")
+            if (
+                not include_completed_tools
+                or index <= last_user
+                or not isinstance(meta, dict)
+                or meta.get("done") is not True
+                or tools >= _REPLAY_RECOVERY_TOOL_MAX_ROWS
+            ):
+                continue
+            tools += 1
+            kept.append(m)
+            continue
         if role == "inject":
             if inj >= _REPLAY_INJECT_MAX_ROWS:
                 continue
@@ -2718,6 +2736,7 @@ def build_session_replay(
     model_window: int | None = None,
     pending_messages: list[dict] | None = None,
     current_message: dict | None = None,
+    include_completed_tools: bool = False,
 ) -> str | None:
     """Build session replay from KiroCrew's conversation_log.
 
@@ -2732,6 +2751,10 @@ def build_session_replay(
     and exclude *current_message* explicitly before applying quotas or budgets.
     The legacy *exclude_last_n* applies only when no live snapshot is supplied.
 
+    *include_completed_tools* is reserved for a fresh session continuing an
+    interrupted turn. It adds bounded result excerpts from that request only;
+    ordinary history replay still omits tool output.
+
     *model_window* scales the replay budget to the active model's context
     window (the dashboard's primary history vehicle — it must shrink on a
     smaller model just like the capped sections do, or it would dominate a 200K
@@ -2744,9 +2767,11 @@ def build_session_replay(
         exclude_last_n=exclude_last_n,
         pending_messages=pending_messages,
         current_message=current_message,
+        include_completed_tools=include_completed_tools,
     )
     if not messages:
         return None
+    from kiro_crew.image_refs import strip_image_refs
 
     # Replay is a separate, existing tail-history allowance, not background
     # capacity. Preserve small-window replay limits; larger windows cannot
@@ -2759,17 +2784,38 @@ def build_session_replay(
     # their own share and older ones are skipped, while the scan keeps looking for
     # user/assistant rows rather than stopping at the first inject row that spills.
     inject_budget = max(1, replay_budget // _REPLAY_INJECT_BUDGET_DIVISOR)
+    tool_budget = replay_budget // 4
+    tool_cap = max(400, round(_REPLAY_RECOVERY_TOOL_CAP_CHARS * factor))
 
     # Build lines from most recent to oldest, stop when budget exhausted
     lines: list[str] = []
     total = 0
     inject_total = 0
+    tool_total = 0
     for m in reversed(messages):
         role = m["role"].title()
         content = m.get("content", "")
+        if m["role"] == "tool":
+            meta = m["meta"]
+            purpose = meta.get("purpose") or meta.get("tool_name") or content
+            purpose = str(purpose).replace("\n", " ")[:200]
+            output = strip_image_refs(str(meta.get("output") or "(no saved output)"))
+            prefix = f"Tool completed: {purpose}\nResult excerpt: "
+            room = max(0, tool_cap - len(prefix))
+            if len(output) > room:
+                marker = " …[truncated]… "
+                kept_chars = max(0, room - len(marker))
+                head = kept_chars * 3 // 4
+                tail = kept_chars - head
+                output = output[:head] + marker + (output[-tail:] if tail else "")
+            line = prefix + output
+            if tool_total + len(line) > tool_budget:
+                continue
+        else:
+            line = f"{role}: {content}"
         if m["role"] == "inject" and len(content) > inject_cap:
             content = content[:inject_cap] + "…[truncated]"
-        line = f"{role}: {content}"
+            line = f"{role}: {content}"
         if m["role"] == "inject" and inject_total + len(line) > inject_budget and lines:
             continue
         if total + len(line) > replay_budget and lines:
@@ -2778,6 +2824,8 @@ def build_session_replay(
         total += len(line) + 2  # +2 for separator
         if m["role"] == "inject":
             inject_total += len(line) + 2
+        elif m["role"] == "tool":
+            tool_total += len(line) + 2
 
     lines.reverse()
     replay = "\n\n".join(lines)

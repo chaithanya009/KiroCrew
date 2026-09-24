@@ -10823,6 +10823,9 @@ async def _run_chat(
                             pending_messages=list(slot.messages),
                             current_message=_current_replay_message,
                             model_window=window_for_provider_client(client),
+                            include_completed_tools=(
+                                _synthetic_recovery_turn and _POSTTOKEN_RECOVER_MSG in message
+                            ),
                         )
                         or ""
                     )

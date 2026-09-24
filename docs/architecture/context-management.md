@@ -67,7 +67,7 @@ cannot disagree with what was sent.
 | 17 | `[Learned corrections …]` | vector `get_lessons_context`, else `lessons.jsonl` | `lessons` group |
 | 18 | `## Recent Session Context` | `conversation_log.recent_with_provenance` | `memory` group |
 | 19 | `[RESPONSE PREFERENCES]` | `_build_response_preferences_section` | reply-style level set |
-| 20 | `[CONVERSATION HISTORY …]` | outer replay, `build_session_replay` | compressed history passed |
+| 20 | `[CONVERSATION HISTORY …]` | outer replay, `build_session_replay` | compressed history passed; fresh-session post-token recovery also carries bounded completed-tool excerpts |
 
 **A Memory V2 member is the one exception to this order.** Its essentials
 envelope (`_build_v2_essentials`) is not a row in the table: the last step of

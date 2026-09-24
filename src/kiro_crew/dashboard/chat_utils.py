@@ -1915,10 +1915,11 @@ _BUSY_RECOVER_MSG = (
 _POSTTOKEN_RECOVER_MSG = (
     f"{POSTTOKEN_RECOVERY_PREFIX}\n"
     "The previous response was interrupted partway through by a transient "
-    "backend error. The work already done above (including any completed tool "
-    "results) is preserved in the conversation. Continue from where it stopped "
-    "to finish the original request — do NOT restart from scratch and do NOT "
-    "re-run steps or tools that already completed successfully."
+    "backend error. Completed work is saved, but a fresh backend session may "
+    "show only excerpts of earlier tool results. Use those to see what already "
+    "ran, and selectively re-read missing details if needed. Continue from "
+    "where it stopped to finish the original request; do NOT repeat completed "
+    "side-effecting actions."
 )
 _EMPTY_AUTO_CONTINUE_MSG = (
     f"{EMPTY_RESPONSE_RECOVERY_PREFIX}\n"

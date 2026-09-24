@@ -99,6 +99,78 @@ class TestRecentExcludeLastN:
 
 
 class TestBuildSessionReplayMesh1726:
+    def test_interrupted_turn_replays_completed_tool_excerpts_only_when_requested(self):
+        current = {"role": "inject", "content": "recovery", "meta": {"mid": "now"}}
+        rows = [
+            {"role": "user", "content": "earlier request"},
+            {"role": "tool", "content": "old read", "meta": {"done": True, "output": "OLD_RESULT"}},
+            {"role": "user", "content": "current request"},
+            {
+                "role": "tool",
+                "content": "new read",
+                "meta": {"done": True, "purpose": "Inspect deployment", "output": "CURRENT_RESULT"},
+            },
+            {
+                "role": "tool",
+                "content": "unfinished read",
+                "meta": {"done": False, "output": "PENDING"},
+            },
+            current,
+        ]
+
+        ordinary = build_session_replay(None, "k", pending_messages=rows, current_message=current)
+        recovery = build_session_replay(
+            None, "k", pending_messages=rows, current_message=current, include_completed_tools=True
+        )
+
+        assert ordinary is not None and "CURRENT_RESULT" not in ordinary
+        assert recovery is not None and "Inspect deployment" in recovery
+        assert "CURRENT_RESULT" in recovery
+        assert "OLD_RESULT" not in recovery
+        assert "PENDING" not in recovery
+        assert "Inject: recovery" not in recovery
+
+    def test_interrupted_tool_result_is_bounded_and_conversation_survives(self):
+        rows = [
+            {"role": "user", "content": "REVIEW_REQUEST"},
+            {
+                "role": "tool",
+                "content": "large read",
+                "meta": {
+                    "done": True,
+                    "purpose": "Read changes",
+                    "output": "START" + "x" * 20_000 + "END",
+                },
+            },
+        ]
+
+        replay = build_session_replay(
+            None, "k", pending_messages=rows, include_completed_tools=True
+        )
+
+        assert replay is not None and "REVIEW_REQUEST" in replay
+        assert "START" in replay and "END" in replay
+        assert "[truncated]" in replay
+        assert len(replay) < 3_000
+
+    def test_interrupted_review_retains_each_completed_step(self):
+        rows = [{"role": "user", "content": "REVIEW_REQUEST"}]
+        rows.extend(
+            {
+                "role": "tool",
+                "content": f"read {i}",
+                "meta": {"done": True, "purpose": f"STEP_{i}", "output": "x" * 10_000},
+            }
+            for i in range(13)
+        )
+
+        replay = build_session_replay(
+            None, "k", pending_messages=rows, include_completed_tools=True
+        )
+
+        assert replay is not None and "REVIEW_REQUEST" in replay
+        assert all(f"STEP_{i}" in replay for i in range(13))
+
     def test_build_session_replay_drops_current_turn(self, tmp_path):
         """End-to-end: build_session_replay with exclude_last_n=1 returns None
         when the only on-disk message is the just-flushed current-turn user msg.

@@ -917,6 +917,12 @@ await. Same-text older deliveries remain history because exclusion uses the
 captured row's identity. There is no additional whole-slot prefix after this replay.
 An explicit replay, including an empty replay, suppresses `ContextBuilder`'s
 inner JSONL fallback; only an absent replay requests fallback construction.
+For an automatic post-token recovery on a fresh native session, replay also
+includes completed tool activity since the latest user request. Each saved
+result is excerpted and the tool rows have their own count and character
+budgets, so large outputs cannot consume the whole replay. Ordinary cold-start
+replay continues to omit tool rows. The recovery instruction describes the
+excerpts accurately and permits selective re-reading of missing details.
 
 1. New session → full context injected (memory + skills + lessons + last 20 messages)
 2. Messages saved to JSONL with provenance after each response
