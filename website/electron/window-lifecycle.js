@@ -36,7 +36,7 @@ const { createBrowserOps } = require("./browser-ops");
 const { runAnnotateOp } = require("./browser-annotate");
 const { createAgentCommandChannel } = require("./browser-agent-channel");
 const { attachContextMenu } = require("./context-menu");
-const { validateRemoteSettings } = require("./validation");
+const { saveRemoteCrewConfig } = require("./remote-crew-setup");
 const { getRemoteHostConfig, setRemoteHostConfig } = require("./host-config");
 const { openPathHardened } = require("./open-path");
 const { DEFAULT_REMOTE_BIN, DEFAULT_REMOTE_PATH } = require("./remote-token");
@@ -1307,33 +1307,31 @@ function createWindowLifecycle(options) {
             remotePort: remotePortValue,
             remotePath,
           } = JSON.parse(savedTitle);
-          if (host) {
-            const error = validateRemoteSettings(
-              host,
-              bin,
-              remotePortValue,
-              remotePath,
-            );
-            const parent = focused && !focused.isDestroyed() ? focused : null;
-            if (error) {
-              dialog.showMessageBox(parent, {
-                type: "error",
-                title: "Invalid Input",
-                message: error,
-              });
-              return;
-            }
+          const parent = focused && !focused.isDestroyed() ? focused : null;
+          if (!host) {
+            // Clearing belongs to this surface: the shared writer stores a crew
+            // and refuses an empty host.
+            setRemoteHostConfig(store, focusedPort, {});
+            const cleared = `Remote host for :${focusedPort} cleared (using local token)`;
+            console.log(cleared);
+            dialog.showMessageBox(parent, { message: cleared, type: "info" });
+            return;
           }
-          setRemoteHostConfig(store, focusedPort, {
+          const { saved, error } = saveRemoteCrewConfig(store, focusedPort, {
             host,
             binPath: bin,
             remotePort: remotePortValue,
             remotePath,
           });
-          const parent = focused && !focused.isDestroyed() ? focused : null;
-          const message = host
-            ? `Remote host for :${focusedPort} set to ${host}`
-            : `Remote host for :${focusedPort} cleared (using local token)`;
+          if (!saved) {
+            dialog.showMessageBox(parent, {
+              type: "error",
+              title: "Invalid Input",
+              message: error,
+            });
+            return;
+          }
+          const message = `Remote host for :${focusedPort} set to ${host}`;
           console.log(message);
           dialog.showMessageBox(parent, { message, type: "info" });
         }
