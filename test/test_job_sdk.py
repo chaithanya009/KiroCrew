@@ -4324,6 +4324,22 @@ class TestABrokenParamsMapOnDiskCostsOnlyItsBadEntries:
         }
         assert len(JobRun.from_dict(raw).params) == job_sdk._MAX_PARAMS
 
+    def test_a_broken_entry_does_not_cost_a_valid_one_its_place(self) -> None:
+        """The count bound applies to the entries that SURVIVE.
+
+        Cutting to the bound before dropping the broken ones would let one broken
+        entry at the front spend a slot, so a record holding the bound's worth of
+        valid entries behind it would come back one short, and that loss is
+        durable once the reconciliation pass rewrites the record.
+        """
+        params: dict[object, object] = {"broken": 5}
+        params.update({f"good{i:02d}": "v" for i in range(job_sdk._MAX_PARAMS)})
+        raw = {"run_id": "a" * 32, "app": "x", "kind": "k", "params": params}
+        read = JobRun.from_dict(raw).params
+        assert len(read) == job_sdk._MAX_PARAMS
+        assert "broken" not in read
+        assert read[f"good{job_sdk._MAX_PARAMS - 1:02d}"] == "v"
+
     def test_a_record_written_with_params_round_trips_through_the_store(
         self, tmp_path: Path
     ) -> None:

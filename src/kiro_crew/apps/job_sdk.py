@@ -233,10 +233,11 @@ _MAX_RECORD_BYTES = 1 << 20
 
 #: Bounds on one run's parameter map, applied where the caller's map enters.
 #: Parameters NAME the work -- an account, a target, a mode -- so the map is
-#: small by construction: at most this many entries, each key and value clipped
-#: to the lengths below. The whole map therefore cannot exceed roughly nine
-#: kilobytes, well inside ``_MAX_RECORD_BYTES``, so no caller can grow a record
-#: past the size the disable scan refuses to open.
+#: small by construction: at most this many entries, and a key or value longer
+#: than the lengths below is REFUSED rather than shortened to fit. The whole map
+#: therefore cannot exceed roughly nine kilobytes, well inside
+#: ``_MAX_RECORD_BYTES``, so no caller can grow a record past the size the
+#: disable scan refuses to open.
 _MAX_PARAMS = 16
 _MAX_PARAM_KEY = 64
 _MAX_PARAM_VALUE = 512
@@ -835,14 +836,20 @@ class JobRun:
                     kwargs[name] = value
             elif want == "dict[str, str]":
                 if isinstance(value, dict):
-                    kwargs[name] = {
-                        k: v
-                        for k, v in list(value.items())[:_MAX_PARAMS]
+                    # Filter, THEN cut to the bound: cutting first lets a broken
+                    # entry near the front spend a slot, so a record carrying the
+                    # bound's worth of valid entries behind it comes back one
+                    # short -- and the reconciliation rewrite makes that loss
+                    # durable. The bound is a limit on what SURVIVES.
+                    kept = [
+                        (k, v)
+                        for k, v in value.items()
                         if isinstance(k, str)
                         and isinstance(v, str)
                         and 0 < len(k) <= _MAX_PARAM_KEY
                         and len(v) <= _MAX_PARAM_VALUE
-                    }
+                    ]
+                    kwargs[name] = dict(kept[:_MAX_PARAMS])
             elif isinstance(value, str):
                 kwargs[name] = value
         kwargs.setdefault("run_id", "")
