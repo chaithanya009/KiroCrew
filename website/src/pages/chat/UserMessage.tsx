@@ -242,10 +242,10 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
         {/* `edit-grow` is a CSS grid auto-sizer: a hidden ::after mirror (fed by
             data-replicated-value) drives the grid track so the textarea grows
             with its own content — width AND height — exactly like the read-only
-            bubble it replaces, capped at 550px or the column, whichever is
-            smaller. No JS measurement. */}
+            bubble it replaces, capped at the content column (Settings → Chat →
+            Content Width, via the row's --mc-content-width). No JS measurement. */}
         <div
-          className="edit-grow user-bubble px-4 py-2 leading-relaxed rounded-xl bg-card text-card-fg overflow-hidden min-w-0 w-fit max-w-[min(550px,100%)] outline-solid outline-2 -outline-offset-2 outline-accent/60 focus-within:outline-accent"
+          className="edit-grow user-bubble px-4 py-2 leading-relaxed rounded-xl bg-card text-card-fg overflow-hidden min-w-0 w-fit max-w-full outline-solid outline-2 -outline-offset-2 outline-accent/60 focus-within:outline-accent"
           data-replicated-value={draft}
           style={{ overflowWrap: 'anywhere', wordBreak: 'break-word', fontSize: 'var(--mc-message-font-size, 14px)' }}
         >
@@ -285,10 +285,14 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
 
   const bubble = (
     // 'message-bubble' is a stable theming hook — see website/docs/theming-contract.md
+    // `max-w-full`, not a pixel cap: the bubble's maximum is the content column
+    // the transcript row clamps to --mc-content-width, so Settings → Chat →
+    // Content Width governs it exactly as it governs agent output (#8398), while
+    // `w-fit` keeps a short message hugging its text.
     // Disable is safe: the keyboard-accessible edit path is the aria-labelled
     // pencil button in the action row below, not this bubble.
     // eslint-disable-next-line jsx-a11y/no-static-element-interactions
-    <div ref={userRef} onCopy={handleCopy} onDoubleClick={canEditResend ? handleDoubleClick : undefined} className={`message-bubble mc-message-font-scope msg-content px-4 py-2 leading-relaxed rounded-xl overflow-hidden min-w-0 w-fit max-w-[min(550px,100%)] ${isSteer ? 'bg-accent-subtle text-text' : 'user-bubble bg-card text-card-fg'}`} style={{ overflowWrap: 'anywhere', wordBreak: 'break-word', fontSize: 'var(--mc-message-font-size, 14px)' }}>
+    <div ref={userRef} onCopy={handleCopy} onDoubleClick={canEditResend ? handleDoubleClick : undefined} className={`message-bubble mc-message-font-scope msg-content px-4 py-2 leading-relaxed rounded-xl overflow-hidden min-w-0 w-fit max-w-full ${isSteer ? 'bg-accent-subtle text-text' : 'user-bubble bg-card text-card-fg'}`} style={{ overflowWrap: 'anywhere', wordBreak: 'break-word', fontSize: 'var(--mc-message-font-size, 14px)' }}>
       {/* `messageTs` FIRST, `clientTs` only as a fallback. The opposite order is
           correct for the audio key above, which wants the optimistic bubble's own
           identity, but this value is COMPARED against server-clock slot mint
@@ -325,14 +329,15 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
               decision behind it. */}
           {steerDecision && <SteerDecisionLine record={steerDecision} />}
           <motion.div
-            /* Same width cap as the bubble, not just max-w-full: this wrapper
-               sits between the content column and the bubble, and a percentage
-               cap only bites once EVERY box in that chain carries one (see the
-               root's comment). With only max-w-full, intrinsic sizing treats
-               the bubble's percentage max-width as none, the wrapper inflates
-               to the full column, and the capped bubble inside lands at its
-               LEFT edge while the badge stays right. */
-            className="relative w-fit max-w-[min(550px,100%)]"
+            /* Same width cap as the bubble (the column, `max-w-full`): this
+               wrapper sits between the content column and the bubble, and a
+               percentage cap only bites once EVERY box in that chain carries
+               one (see the root's comment). During intrinsic sizing a
+               percentage max-width is treated as none, so a wrapper whose cap
+               differed from the bubble's would inflate to the full column and
+               the capped bubble inside would land at its LEFT edge while the
+               badge stays right; one shared cap resolves both to one width. */
+            className="relative w-fit max-w-full"
             initial={playSteer ? { opacity: 0, x: 16 } : false}
             animate={{ opacity: 1, x: 0 }}
             transition={{ duration: 0.32, ease: 'easeOut' }}
