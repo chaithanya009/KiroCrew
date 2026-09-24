@@ -201,6 +201,12 @@ class TestHappyRun:
             "origin",
             "pid",
             "dedupe_key",
+            # The caller's parameter map. Admitted rather than refused because it
+            # is a flat map of strings, bounded and scrubbed at the single call
+            # that accepts it, so the writer has no payload to reason about. A
+            # nested or free-typed field is still a design decision this set
+            # forces somebody to make.
+            "params",
             "cancellable",
             "created_at",
             "updated_at",
@@ -2105,11 +2111,21 @@ class TestRecordIsAlwaysWritable:
 
     def test_every_field_of_a_live_record_is_json_serializable(self, sdk: JobSDK) -> None:
         """Pinned on the record's own shape, so a future field cannot slip in
-        holding something ``json.dumps`` refuses."""
+        holding something ``json.dumps`` refuses.
+
+        One field holds a MAP, and it is admitted only while every key and value
+        in it is a string: a map one level deep of strings is what keeps the
+        record a flat document, and a nested value would fail here.
+        """
         sdk.register("work", lambda h: None)
-        run_id = sdk.start("work")
+        run_id = sdk.start("work", params={"account": "123456789012"})
         run = _wait_terminal(sdk, run_id)
         for name, value in run.to_dict().items():
+            if isinstance(value, dict):
+                assert all(
+                    isinstance(k, str) and isinstance(v, str) for k, v in value.items()
+                ), f"{name} holds an entry that is not string to string"
+                continue
             assert isinstance(value, (str, int, bool)), f"{name} is {type(value).__name__}"
 
 
@@ -2182,6 +2198,12 @@ class TestSanitizeInvariant:
             "origin",
             "pid",
             "dedupe_key",
+            # Caller-supplied, like ``dedupe_key``, and still not the writer's
+            # problem: ``_validated_params`` refuses anything but a bounded flat
+            # map of strings and scrubs each value at the single call that accepts
+            # one, so what reaches the writer is already sanitized. A field a
+            # RUNNER can set still lands in the difference below.
+            "params",
             "cancellable",
             "created_at",
             "updated_at",
@@ -4106,3 +4128,207 @@ class TestThreadStartFailure:
         assert sdk.list_active() == []
         again = sdk.start("work", dedupe_key="k")
         assert _wait_terminal(sdk, again).status == DONE
+
+
+# ---------------------------------------------------------------------------
+# 25. start(params=...) / JobHandle.params
+# ---------------------------------------------------------------------------
+
+
+class TestParamsReachTheRunner:
+    """A caller names the work, and the runner reads the name off its handle.
+
+    The channel exists so a runner stops having to re-read its own record to
+    learn what it was started for, and so a starter that is not the browser can
+    say which account, target or mode a run is about.
+    """
+
+    def test_a_runner_reads_its_params_off_the_handle(self, sdk: JobSDK) -> None:
+        seen: list[dict[str, str]] = []
+        sdk.register("work", lambda h: seen.append(h.params))
+        run_id = sdk.start("work", params={"account": "123456789012", "mode": "full"})
+        assert _wait_terminal(sdk, run_id).status == DONE
+        assert seen == [{"account": "123456789012", "mode": "full"}]
+
+    def test_the_record_carries_the_same_strings_the_runner_saw(self, sdk: JobSDK) -> None:
+        """Read back off DISK, so a resume sees what the runner saw."""
+        sdk.register("work", lambda h: None)
+        run_id = sdk.start("work", params={"account": "123456789012"})
+        _wait_terminal(sdk, run_id)
+        assert sdk.get(run_id).params == {"account": "123456789012"}
+
+    def test_naming_nothing_is_an_empty_map_not_a_missing_field(self, sdk: JobSDK) -> None:
+        sdk.register("work", lambda h: None)
+        run_id = sdk.start("work")
+        _wait_terminal(sdk, run_id)
+        assert sdk.get(run_id).params == {}
+        assert sdk.get(run_id).to_dict()["params"] == {}
+
+    def test_the_handle_hands_back_a_copy_so_a_runner_cannot_edit_the_record(
+        self, sdk: JobSDK
+    ) -> None:
+        """The record keeps its single writer.
+
+        A runner holding the record's own mapping could change a field the SDK is
+        about to serialize, which is a second writer reached through the handle.
+        """
+        sdk.register("work", lambda h: h.params.update({"account": "999999999999"}))
+        run_id = sdk.start("work", params={"account": "123456789012"})
+        _wait_terminal(sdk, run_id)
+        assert sdk.get(run_id).params == {"account": "123456789012"}
+
+    def test_a_credential_shaped_value_is_scrubbed_before_anyone_holds_it(
+        self, sdk: JobSDK
+    ) -> None:
+        """Scrubbed at the boundary, so the runner and the disk agree.
+
+        The channel names work; it is not a way to pass a secret through a
+        durable record.
+        """
+        secret = "AKIAIOSFODNN7EXAMPLE"
+        seen: list[dict[str, str]] = []
+        sdk.register("work", lambda h: seen.append(h.params))
+        run_id = sdk.start("work", params={"cmd": f"aws_secret_access_key={secret}"})
+        _wait_terminal(sdk, run_id)
+        on_disk = (sdk.store.dir / f"{run_id}.json").read_text(encoding="utf-8")
+        assert secret not in on_disk
+        assert secret not in seen[0]["cmd"]
+        assert seen[0]["cmd"] == sdk.get(run_id).params["cmd"]
+
+    def test_the_async_twin_carries_them_too(self, sdk: JobSDK) -> None:
+        sdk.register("work", lambda h: None)
+        run_id = asyncio.run(sdk.start_async("work", params={"account": "1"}))
+        _wait_terminal(sdk, run_id)
+        assert sdk.get(run_id).params == {"account": "1"}
+
+    def test_an_adopted_run_keeps_the_first_callers_params(self, sdk: JobSDK) -> None:
+        """Adoption returns the run already executing, so its parameters stand.
+
+        Merging the second caller's map would mean rewriting a running run's
+        record, which is exactly the second writer the module refuses.
+        """
+        release = threading.Event()
+        started = threading.Event()
+
+        def runner(h):
+            started.set()
+            release.wait(5.0)
+
+        sdk.register("work", runner)
+        first = sdk.start("work", dedupe_key="k", params={"account": "111"})
+        assert started.wait(5.0)
+        second = sdk.start("work", dedupe_key="k", params={"account": "222"})
+        assert second == first
+        release.set()
+        _wait_terminal(sdk, first)
+        assert sdk.get(first).params == {"account": "111"}
+
+
+class TestParamsAreRefusedNotTrimmed:
+    """Every shape the channel will not carry, and what happens instead.
+
+    A caller handing a shape this map cannot hold has made a mistake at the call
+    site, so it is refused THERE. Trimming to fit would hand the runner a
+    silently incomplete set of parameters, and a runner acting on half its
+    parameters does the wrong work while reporting success.
+    """
+
+    #: (params, the exception the call site gets). One row per case the check
+    #: owes an answer for: a container that is not a mapping, too many entries, a
+    #: key that is not a string, an empty key, an over-long key, a value that is
+    #: not a string (including a bool, which is an int and not a string), and an
+    #: over-long value.
+    CASES = [
+        ([], TypeError),
+        ("account=1", TypeError),
+        (5, TypeError),
+        ({str(i): "v" for i in range(17)}, ValueError),
+        ({1: "v"}, TypeError),
+        ({"": "v"}, ValueError),
+        ({"k" * 65: "v"}, ValueError),
+        ({"k": 1}, TypeError),
+        ({"k": True}, TypeError),
+        ({"k": None}, TypeError),
+        ({"k": {"nested": "v"}}, TypeError),
+        ({"k": ["v"]}, TypeError),
+        ({"k": "v" * 513}, ValueError),
+    ]
+
+    def test_each_wrong_shape_raises_at_the_call_site(self, sdk: JobSDK) -> None:
+        sdk.register("work", lambda h: None)
+        for params, expected in self.CASES:
+            with pytest.raises(expected):
+                sdk.start("work", params=params)  # type: ignore[arg-type]
+
+    def test_a_refused_call_starts_nothing(self, sdk: JobSDK) -> None:
+        """The check runs before any state is touched.
+
+        A refusal that had already claimed a dedupe key or written a record would
+        leave a run nothing finishes.
+        """
+        sdk.register("work", lambda h: None)
+        with pytest.raises(TypeError):
+            sdk.start("work", dedupe_key="k", params={"k": 1})  # type: ignore[arg-type]
+        assert sdk.list_active() == []
+        assert sdk.list_recent() == []
+        # The key was never claimed, so a correct call still gets a fresh run.
+        run_id = sdk.start("work", dedupe_key="k", params={"k": "1"})
+        assert _wait_terminal(sdk, run_id).status == DONE
+
+    def test_the_largest_accepted_map_stays_well_inside_the_record_bound(self, sdk: JobSDK) -> None:
+        """The bounds are what keep a caller from growing a record past the size
+        the disable scan refuses to open."""
+        biggest = {f"{'k' * 63}{i:x}": "v" * 512 for i in range(16)}
+        sdk.register("work", lambda h: None)
+        run_id = sdk.start("work", params=biggest)
+        _wait_terminal(sdk, run_id)
+        size = (sdk.store.dir / f"{run_id}.json").stat().st_size
+        assert size < job_sdk._MAX_RECORD_BYTES
+
+
+class TestABrokenParamsMapOnDiskCostsOnlyItsBadEntries:
+    """A hand-edited or foreign record must stay readable.
+
+    The record is data the gateway re-reads across upgrades, so one unusable
+    entry must not make an app's whole run history unreadable -- the same rule
+    the rest of ``from_dict`` follows.
+    """
+
+    def test_entries_that_break_the_shape_are_dropped_and_the_rest_survive(self) -> None:
+        raw = {
+            "run_id": "a" * 32,
+            "app": "x",
+            "kind": "k",
+            "params": {
+                "good": "kept",
+                "bad_value": 5,
+                7: "bad_name",
+                "": "empty name",
+                "k" * 65: "over long name",
+                "over_long_value": "v" * 513,
+            },
+        }
+        assert JobRun.from_dict(raw).params == {"good": "kept"}
+
+    def test_a_params_field_that_is_not_a_map_falls_back_to_empty(self) -> None:
+        for body in ("account=1", 5, [], None):
+            run = JobRun.from_dict({"run_id": "a" * 32, "app": "x", "kind": "k", "params": body})
+            assert run.params == {}, f"{type(body).__name__} did not fall back"
+
+    def test_a_map_over_the_count_bound_is_cut_to_the_bound(self) -> None:
+        raw = {
+            "run_id": "a" * 32,
+            "app": "x",
+            "kind": "k",
+            "params": {str(i): "v" for i in range(40)},
+        }
+        assert len(JobRun.from_dict(raw).params) == job_sdk._MAX_PARAMS
+
+    def test_a_record_written_with_params_round_trips_through_the_store(
+        self, tmp_path: Path
+    ) -> None:
+        store = JobStore(tmp_path)
+        run = JobRun(run_id="b" * 32, app="x", kind="k", status=DONE)
+        run.params = {"account": "123456789012"}
+        store.write(run)
+        assert store.read(run.run_id).params == {"account": "123456789012"}

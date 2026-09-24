@@ -95,10 +95,11 @@ def _safe(text: str) -> str:
 def _public_view(run: JobRun, cancelling: frozenset[str], live: frozenset[str]) -> dict[str, Any]:
     """The record as the browser sees it.
 
-    ``origin`` and ``pid`` are host facts with no client meaning, so they are
-    withheld. Everything else the record holds is served: P1's record has no
-    caller- or runner-supplied payload to decide about, which is why there is no
-    per-field withholding rule here any more.
+    FOUR fields are withheld, for two different reasons. ``origin`` and ``pid``
+    are host facts with no client meaning. ``dedupe_key`` and ``params`` are
+    strings the CALLER chose: an app names a run's work for its own runner, and a
+    client reading those strings back would be reading the app's business rather
+    than the run's state. Everything else the record holds is served.
 
     ``cancelling`` is one of two fields NOT read off the record. It says a cancel
     has been asked for and the worker has not reached the checkpoint where it
