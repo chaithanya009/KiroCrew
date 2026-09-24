@@ -25,6 +25,7 @@ from kiro_crew.kiro_prerequisite import (
     identity_stamp_mismatch,
     mark_identity_parked,
 )
+from kiro_crew.messaging import turn_ceiling
 from kiro_crew.messaging.link import canonical_key
 from kiro_crew.metrics.sessions import (
     END_REASON_DESTROYED,
@@ -1913,6 +1914,7 @@ class SessionLifecycleService:
         turn needs to create and map a new session under the same key.
         """
         owner = self._owner
+        requested_key = key
         key = owner._fold_key(key)
         async with owner._lock:
             current = owner._sessions.get(key)
@@ -1929,6 +1931,22 @@ class SessionLifecycleService:
             owner._advance_session_generation(key)
             owner._compact_cooldown_until.pop(key, None)
             owner._compact_pending_verdict.pop(key, None)
+            # Beside the other per-key state this discard forgets, and for the same
+            # reason. A channel conversation that reached its turn ceiling is
+            # latched under this key, the key survives a discard (channel linkage
+            # is retained by design), and the refusal text tells the user to reset
+            # the conversation. So the reset has to be what clears it: without this
+            # the only thing that releases a latched conversation is a gateway
+            # restart, and the notice names a remedy that does nothing.
+            #
+            # BOTH spellings, because the ceiling counts under the key the CHANNEL
+            # holds while ``_fold_key`` resolves an alias onto the live key, so the
+            # two can differ and clearing only the folded one would leave the latch
+            # standing under the channel's own spelling.
+            ceiling = turn_ceiling.shared_ceiling()
+            ceiling.reset(key)
+            if requested_key != key:
+                ceiling.reset(requested_key)
             # Store replay suppression atomically with the pop. Origin-link
             # state intentionally survives this operation.
             if replay:

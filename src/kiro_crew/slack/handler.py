@@ -90,7 +90,7 @@ from kiro_crew.llm_helpers import (
     save_conversation_turn_off_loop,
 )
 from kiro_crew.memory_stores import UnknownMemoryStore
-from kiro_crew.messaging import auto_title, privacy_mode
+from kiro_crew.messaging import auto_title, privacy_mode, turn_ceiling
 from kiro_crew.messaging.commands import (
     compact_unsupported_backend,
     compact_unsupported_reply,
@@ -115,6 +115,7 @@ from kiro_crew.messaging.renderer import count_redaction_tags, redaction_notice
 from kiro_crew.messaging.session_trust import _trusted_sessions as _shared_trusted_sessions
 from kiro_crew.messaging.session_trust import add_trusted_session as _add_trusted_session
 from kiro_crew.messaging.session_trust import clear_trusted_sessions, is_session_trusted
+from kiro_crew.messaging.turn_ceiling import TurnCeilingExceeded
 from kiro_crew.platform import current_context
 from kiro_crew.providers.base import (
     EVENT_COMPLETE,
@@ -4042,7 +4043,19 @@ async def handle_message(
         # ordered w.r.t. close_all's _closing set. Abort if closing (the outer
         # finally releases the lease).
         try:
-            sessions.begin_turn(session_key)
+            turn_ceiling.gate(session_key, lambda: sessions.begin_turn(session_key))()
+        except TurnCeilingExceeded as exc:
+            # At the conversation's turn ceiling, so no turn opened. This route
+            # streams without a TurnDriver, so the notice is posted directly
+            # rather than rendered; without it the pause would be the same
+            # silence the per-message echo guard already leaves.
+            logger.warning("Slack turn ceiling reached for %s -- conversation paused", session_key)
+            try:
+                await slack.post_message(channel, str(exc), reply_ts or None)
+            except Exception:
+                logger.debug("turn-ceiling notice post failed", exc_info=True)
+            await slack.set_thread_status(channel, reply_ts, "")
+            return
         except SessionClosingError:
             logger.info("Aborting Slack dispatch for %s — gateway shutting down", session_key)
             await slack.set_thread_status(channel, reply_ts, "")

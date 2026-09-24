@@ -62,6 +62,7 @@ from kiro_crew.executors import run_in_embed_pool
 from kiro_crew.history import mint_row_mid
 from kiro_crew.hooks import TOOL_AUTO_APPROVE, TOOL_DENY, hook_gate_kwargs
 from kiro_crew.memory_stores import UnknownMemoryStore
+from kiro_crew.messaging import turn_ceiling
 from kiro_crew.messaging.attachments import IngestLimits
 from kiro_crew.messaging.attachments import cleanup as cleanup_attachments
 from kiro_crew.messaging.commands import (
@@ -102,6 +103,7 @@ from kiro_crew.messaging.session_resume import (
     refused_resume_is_restricted,
 )
 from kiro_crew.messaging.transport import InboundMessage
+from kiro_crew.messaging.turn_ceiling import TurnCeilingExceeded
 from kiro_crew.messaging.upload_gate import session_is_restricted, uploads_restricted
 from kiro_crew.monitoring.completion import MonitorCompletionHook
 from kiro_crew.monitoring.models import MonitorDispatchResult
@@ -1052,9 +1054,16 @@ class DiscordDispatcher:
                 audit_session_key=session_key,
                 audit_agent=agent or "kirocrew",
                 closing_gate=(
+                    # Inbound arm only. `_begin_monitor_turn` drives an armed
+                    # monitor loop, which already carries its own cycle cap and
+                    # runtime budget; counting its cycles against the
+                    # conversation would let a long legitimate watch latch the
+                    # conversation and then refuse the human's next message.
                     _begin_monitor_turn
                     if monitor_completion is not None
-                    else lambda: self.sessions.begin_turn(session_key)
+                    else turn_ceiling.gate(
+                        session_key, lambda: self.sessions.begin_turn(session_key)
+                    )
                 ),
                 monitor_completion=monitor_completion,
             )
@@ -1161,6 +1170,16 @@ class DiscordDispatcher:
                 session_key,
             )
             return MonitorDispatchResult.UNAVAILABLE
+        except TurnCeilingExceeded as exc:
+            # At the conversation's turn ceiling, so no turn opened. Reachable
+            # only from the inbound arm, because the monitor arm does not compose
+            # the ceiling. NOT spooled: the spool replays a message our restart
+            # dropped, and this one was refused on purpose. The notice is
+            # rendered so the pause is visible in the channel.
+            logger.warning(
+                "Discord turn ceiling reached for %s -- conversation paused", session_key
+            )
+            await turn_ceiling.render_refusal(out_renderer, str(exc))
         except SessionClosingError:
             logger.info(
                 "Discord monitor dispatch refused during shutdown for %s",
