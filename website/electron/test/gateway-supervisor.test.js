@@ -66,9 +66,13 @@ function switchableHttp(state) {
 // one it means (by delay) or prove none is left armed.
 function fakeTimers() {
   const pending = [];
+  // Intervals stay armed across ticks, so they live apart from one-shots:
+  // `fire` must never consume one, and a test can prove one was cleared.
+  const intervals = [];
   let nextId = 1;
   return {
     pending,
+    intervals,
     setTimeoutFn(fn, ms) {
       const id = nextId;
       nextId += 1;
@@ -79,11 +83,26 @@ function fakeTimers() {
       const index = pending.findIndex((timer) => timer.id === id);
       if (index >= 0) pending.splice(index, 1);
     },
+    setIntervalFn(fn, ms) {
+      const id = nextId;
+      nextId += 1;
+      intervals.push({ id, fn, ms });
+      return id;
+    },
+    clearIntervalFn(id) {
+      const index = intervals.findIndex((timer) => timer.id === id);
+      if (index >= 0) intervals.splice(index, 1);
+    },
     fire(ms) {
       const index = pending.findIndex((timer) => timer.ms === ms);
       assert.ok(index >= 0, `a ${ms}ms timer is armed`);
       const [timer] = pending.splice(index, 1);
       timer.fn();
+    },
+    tick(ms) {
+      const interval = intervals.find((timer) => timer.ms === ms);
+      assert.ok(interval, `a ${ms}ms interval is armed`);
+      interval.fn();
     },
   };
 }
@@ -128,7 +147,7 @@ function harness(overrides = {}) {
       ...(overrides.app || {}),
     },
     store,
-    BrowserWindow: class {},
+    BrowserWindow: overrides.BrowserWindow || class {},
     nativeTheme: { shouldUseDarkColors: false },
     dialog: overrides.dialog
       || { showMessageBox: async () => ({ response: 1 }) },
@@ -173,6 +192,8 @@ function harness(overrides = {}) {
     execFileSyncFn: () => { throw new Error("execFileSync must not run in this harness"); },
     setTimeoutFn: overrides.timers ? overrides.timers.setTimeoutFn : undefined,
     clearTimeoutFn: overrides.timers ? overrides.timers.clearTimeoutFn : undefined,
+    setIntervalFn: overrides.timers ? overrides.timers.setIntervalFn : undefined,
+    clearIntervalFn: overrides.timers ? overrides.timers.clearIntervalFn : undefined,
     processRef,
     dirname: "/virtual/electron",
   });
@@ -1043,4 +1064,321 @@ test("linux refuses the respawn too, where unverifiedIncumbent is false by desig
   assert.strictEqual(spawnCalls.length, 0);
   assert.ok(logs.some((line) => line.includes("could not capture the incumbent PID on :5476")));
   assert.deepStrictEqual(quits, []);
+});
+
+// ---------------------------------------------------------------------------
+// "Installation still finishing" dialog: auto-retry while the bundle lands.
+// ---------------------------------------------------------------------------
+
+const INSTALLING_PROBE_MS = 5000;
+const INSTALLING_COMPLETE_LINGER_MS = 700;
+const BUNDLE_ROOT = "/virtual/resources/backend-dist/kirocrew-backend-x64";
+const BUNDLE_BIN = `${BUNDLE_ROOT}/bin/kirocrew`;
+const BUNDLE_LIB = `${BUNDLE_ROOT}/lib/python3.12`;
+const { REQUIRED_STDLIB_PARTS, SPAWN_MARKER } = require(path.join(__dirname, "..", "bundle-integrity.js"));
+
+// The error dialog is an ordinary BrowserWindow. This stand-in records what
+// the supervisor paints into it and lets a test act as the user (click) or as
+// the probe's own close(), both of which end in the `closed` handshake.
+function fakeDialogWindows() {
+  const windows = [];
+  class FakeBrowserWindow {
+    constructor(options) {
+      this.options = options;
+      this.handlers = {};
+      this.destroyed = false;
+      this.loaded = [];
+      this.scripts = [];
+      this.webContents = {
+        executeJavaScript: (js) => {
+          this.scripts.push(js);
+          return Promise.resolve();
+        },
+      };
+      windows.push(this);
+    }
+    setMenu() {}
+    on(event, fn) {
+      (this.handlers[event] ||= []).push(fn);
+    }
+    emit(event, ...args) {
+      for (const fn of this.handlers[event] || []) fn(...args);
+    }
+    loadURL(url) { this.loaded.push(url); }
+    isDestroyed() { return this.destroyed; }
+    close() {
+      if (this.destroyed) return;
+      this.destroyed = true;
+      this.emit("closed");
+    }
+    // What the page's act() does: set the title, then close the window.
+    click(action) {
+      this.emit("page-title-updated", {}, `mc-action:${action}`);
+      this.close();
+    }
+    // The message text the probe last painted (the initial one is in the URL).
+    paintedMessages() {
+      return this.scripts.map((js) => JSON.parse(js.slice(js.indexOf("= ") + 2)));
+    }
+  }
+  return { windows, FakeBrowserWindow };
+}
+
+// A bundled backend tree the test extracts piece by piece: `files` is the set of
+// paths on disk right now. Only the supervisor's own fs calls are modelled.
+function extractingBundleFs(files, { launchLog = null } = {}) {
+  const dirs = () => ({
+    [`${BUNDLE_ROOT}/bin`]: ["python3", "kirocrew"],
+    [`${BUNDLE_ROOT}/lib`]: ["python3.12"],
+  });
+  return {
+    files,
+    constants: { X_OK: 1 },
+    mkdirSync() {},
+    accessSync(file) {
+      if (files.has(file)) return;
+      const error = new Error("not found");
+      error.code = "ENOENT";
+      throw error;
+    },
+    existsSync(file) { return files.has(file); },
+    readdirSync(dir) {
+      const listing = dirs()[dir];
+      if (!listing) throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+      return listing;
+    },
+    openSync() { return 41; },
+    closeSync() {},
+    readFileSync(file) {
+      if (launchLog !== null && file === "/virtual/logs/gateway-launch.log") return launchLog;
+      throw new Error("no launch log yet");
+    },
+  };
+}
+
+function bundleFiles({ missing = [] } = {}) {
+  const files = new Set([
+    BUNDLE_BIN,
+    `${BUNDLE_ROOT}/bin`,
+    `${BUNDLE_ROOT}/lib`,
+    BUNDLE_LIB,
+  ]);
+  for (const part of REQUIRED_STDLIB_PARTS) {
+    if (missing.includes(part)) continue;
+    files.add(`${BUNDLE_LIB}/${part}/__init__.py`);
+  }
+  return files;
+}
+
+// Boot straight into the installing dialog: the pre-spawn refusal sets the
+// failure record, connect() reads it and opens the dialog. The parent window
+// reports destroyed once a gateway child has been spawned, which ends the
+// post-retry boot before it starts polling a backend this harness has not got.
+async function installingDialogHarness({ missing }) {
+  const files = bundleFiles({ missing });
+  const fsMod = extractingBundleFs(files);
+  const timers = fakeTimers();
+  const { windows, FakeBrowserWindow } = fakeDialogWindows();
+  const statuses = [];
+  let spawnCalls = [];
+  const window = {
+    // Destroyed once a retry has spawned: that ends the post-retry boot before
+    // it polls a backend this harness has not got.
+    isDestroyed: () => spawnCalls.length > 0,
+    show() {},
+    focus() {},
+    isMinimized: () => false,
+    restore() {},
+    webContents: {
+      loadFile() {},
+      send: (channel, message) => statuses.push(`${channel}:${message}`),
+    },
+  };
+  const built = harness({
+    fsMod,
+    timers,
+    BrowserWindow: FakeBrowserWindow,
+    mainWindow: window,
+    app: { show() {} },
+  });
+  ({ spawnCalls } = built);
+  assert.strictEqual(await built.supervisor.start(), false, "the incomplete bundle is refused before spawn");
+  assert.ok(built.errors.some((line) => line.includes("spawn REFUSED: incomplete bundle")));
+  const connected = built.supervisor.connect(window);
+  await flush();
+  assert.strictEqual(windows.length, 1, "the failure dialog opened");
+  return { ...built, files, timers, windows, dialog: windows[0], connected, statuses };
+}
+
+test("installing dialog re-probes the bundle and repaints the falling count", async () => {
+  const { dialog, timers, files, spawnCalls } = await installingDialogHarness({
+    missing: ["urllib", "zipfile", "zoneinfo"],
+  });
+  assert.match(decodeURIComponent(dialog.loaded[0]), /installation still finishing/);
+  assert.match(decodeURIComponent(dialog.loaded[0]), /3 components are/);
+  assert.strictEqual(timers.intervals.length, 1, "one probe interval is armed");
+  assert.strictEqual(timers.intervals[0].ms, INSTALLING_PROBE_MS);
+
+  // Nothing changed on disk: no repaint, no retry.
+  timers.tick(INSTALLING_PROBE_MS);
+  assert.deepStrictEqual(dialog.paintedMessages(), []);
+  assert.strictEqual(dialog.destroyed, false);
+
+  // Two more parts land: the count moves, the dialog stays.
+  files.add(`${BUNDLE_LIB}/urllib/__init__.py`);
+  files.add(`${BUNDLE_LIB}/zipfile/__init__.py`);
+  timers.tick(INSTALLING_PROBE_MS);
+  assert.match(dialog.paintedMessages().at(-1), /1 component is/);
+  assert.strictEqual(dialog.destroyed, false);
+  assert.strictEqual(spawnCalls.length, 0, "no retry while a part is still missing");
+  assert.strictEqual(timers.intervals.length, 1, "the probe keeps running");
+});
+
+test("installing dialog retries exactly once when the probe reports complete", async () => {
+  const { dialog, timers, files, spawnCalls, connected, logs } = await installingDialogHarness({
+    missing: ["zoneinfo"],
+  });
+  files.add(`${BUNDLE_LIB}/zoneinfo/__init__.py`);
+  timers.tick(INSTALLING_PROBE_MS);
+
+  // The completion line gets a moment on screen before the window goes.
+  assert.match(dialog.paintedMessages().at(-1), /Installation finished/);
+  assert.strictEqual(dialog.destroyed, false, "the dialog lingers on the completion line");
+  assert.strictEqual(timers.intervals.length, 0, "the probe was cleared at completion");
+  assert.ok(logs.some((line) => line.includes("bundle complete — retrying")));
+  assert.strictEqual(spawnCalls.length, 0, "no retry before the linger ends");
+  timers.fire(INSTALLING_COMPLETE_LINGER_MS);
+  assert.strictEqual(dialog.destroyed, true, "the dialog closed itself after the linger");
+
+  await connected;
+  assert.strictEqual(spawnCalls.length, 1, "the retry re-entered startGateway once and spawned");
+  assert.strictEqual(spawnCalls[0][0], BUNDLE_BIN);
+  // A second interval tick after close must be impossible: nothing is armed.
+  assert.throws(() => timers.tick(INSTALLING_PROBE_MS), /interval is armed/);
+});
+
+test("a user click stops the probe so a later tick cannot overrule the choice", async () => {
+  const { dialog, timers, files, spawnCalls, connected } = await installingDialogHarness({
+    missing: ["zoneinfo"],
+  });
+  assert.strictEqual(timers.intervals.length, 1, "the probe is armed while the dialog is up");
+  files.add(`${BUNDLE_LIB}/zoneinfo/__init__.py`);
+  // The user quits in the instant the bundle completes. In Electron the title
+  // update and the `closed` event are separate turns, so a probe tick can land
+  // between them; it must find the probe already gone.
+  dialog.emit("page-title-updated", {}, "mc-action:quit");
+  assert.strictEqual(timers.intervals.length, 0, "the click cleared the probe");
+  assert.throws(() => timers.tick(INSTALLING_PROBE_MS), /interval is armed/);
+  dialog.close();
+  await connected;
+  assert.strictEqual(spawnCalls.length, 0, "quit was honoured; no retry spawned");
+  assert.deepStrictEqual(dialog.paintedMessages(), [], "nothing was repainted after the choice");
+});
+
+test("a click during the completion linger wins over the pending auto-close", async () => {
+  const { dialog, timers, files, spawnCalls, connected } = await installingDialogHarness({
+    missing: ["zoneinfo"],
+  });
+  files.add(`${BUNDLE_LIB}/zoneinfo/__init__.py`);
+  timers.tick(INSTALLING_PROBE_MS);
+  assert.strictEqual(dialog.destroyed, false);
+  dialog.click("quit");
+  assert.strictEqual(dialog.destroyed, true);
+  // The linger timer still fires; it must find nothing left to close.
+  timers.fire(INSTALLING_COMPLETE_LINGER_MS);
+  await connected;
+  assert.strictEqual(spawnCalls.length, 0, "the user's quit was honoured over the auto-retry");
+});
+
+// The crash matcher accepts stdlib names and dotted submodules the probe never
+// inspects (a package's sibling file, a module outside REQUIRED_STDLIB_PARTS).
+// A dialog reached that way must not auto-retry: with a permanently truncated
+// bundle the probe would report complete on every tick and the gateway would
+// respawn and crash forever. It keeps the manual dialog and the manual copy.
+test("a crash reclassified as installing gets the manual dialog, no probe", async () => {
+  const files = bundleFiles();
+  const launchLog = `${SPAWN_MARKER}
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+ModuleNotFoundError: No module named 'ssl'
+`;
+  const fsMod = extractingBundleFs(files, { launchLog });
+  const timers = fakeTimers();
+  const { windows, FakeBrowserWindow } = fakeDialogWindows();
+  let spawnCalls = [];
+  const window = {
+    // The first spawn is the crashing one; destroyed only after a retry spawned.
+    isDestroyed: () => spawnCalls.length > 1,
+    show() {},
+    focus() {},
+    isMinimized: () => false,
+    restore() {},
+    webContents: { loadFile() {}, send() {} },
+  };
+  const built = harness({
+    fsMod,
+    timers,
+    BrowserWindow: FakeBrowserWindow,
+    mainWindow: window,
+    app: { show() {} },
+  });
+  ({ spawnCalls } = built);
+  assert.strictEqual(await built.supervisor.start(), true, "the complete-looking bundle spawns");
+  assert.strictEqual(spawnCalls.length, 1);
+  spawnCalls[0].child.exitCode = 1;
+  spawnCalls[0].child.emit("exit", 1, null);
+  const connected = built.supervisor.connect(window);
+  await flush();
+  assert.strictEqual(windows.length, 1, "the failure dialog opened");
+  const html = decodeURIComponent(windows[0].loaded[0]);
+  assert.match(html, /installation still finishing/, "the crash was reclassified as installing");
+  assert.match(html, /Wait, then retry/, "manual copy: no automatic start is promised");
+  assert.ok(!/starts on its own/i.test(html), "auto-retry copy must not appear here");
+  assert.strictEqual(timers.intervals.length, 0, "no probe is armed for a reclassified crash");
+  windows[0].click("quit");
+  await connected;
+  assert.strictEqual(spawnCalls.length, 1, "no automatic respawn");
+});
+
+test("installing dialog stops probing once an update install is dispatched", async () => {
+  const { supervisor, dialog, timers, files, spawnCalls } = await installingDialogHarness({
+    missing: ["zoneinfo"],
+  });
+  supervisor.onInstallDispatched();
+  files.add(`${BUNDLE_LIB}/zoneinfo/__init__.py`);
+  timers.tick(INSTALLING_PROBE_MS);
+
+  assert.strictEqual(timers.intervals.length, 0, "the probe disarmed itself");
+  assert.strictEqual(dialog.destroyed, false, "the dialog stays for the user");
+  assert.deepStrictEqual(dialog.paintedMessages(), [], "nothing was repainted");
+  assert.strictEqual(spawnCalls.length, 0, "no retry while the updater owns the gateway");
+});
+
+test("non-installing failure dialogs arm no probe", async () => {
+  // Local gateway off: the "no gateway on port" dialog, manual-only as before.
+  const timers = fakeTimers();
+  const { windows, FakeBrowserWindow } = fakeDialogWindows();
+  const window = {
+    isDestroyed: () => false,
+    show() {},
+    focus() {},
+    isMinimized: () => false,
+    restore() {},
+    webContents: { loadFile() {}, send() {} },
+  };
+  const { supervisor } = harness({
+    store: fakeStore({ runLocalGateway: false }),
+    timers,
+    BrowserWindow: FakeBrowserWindow,
+    mainWindow: window,
+    app: { show() {} },
+  });
+  assert.strictEqual(await supervisor.start(), false);
+  const connected = supervisor.connect(window);
+  await flush();
+  assert.strictEqual(windows.length, 1);
+  assert.match(decodeURIComponent(windows[0].loaded[0]), /no gateway on port/);
+  assert.strictEqual(timers.intervals.length, 0, "no probe for a failure that does not self-resolve");
+  windows[0].click("quit");
+  await connected;
 });
