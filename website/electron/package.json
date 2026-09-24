@@ -195,6 +195,7 @@
       "capture-trust.js",
       "display-media.js",
       "focus-chrome.js",
+      "focus-cursor.js",
       "permission-handler.js",
       "browser-view.js",
       "browser-control.js",

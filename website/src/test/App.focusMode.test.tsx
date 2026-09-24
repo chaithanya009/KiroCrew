@@ -318,6 +318,93 @@ describe('focus mode — shell layout', () => {
     expect(header.style.transform).toBe('translateY(-100%)')
   })
 
+  it('dismisses an edge-revealed rail once the cursor is reported far from the window', async () => {
+    // The rail is opened by a gesture that ENDS outside the window, so no
+    // in-window event is coming and the positional close has nobody to hear
+    // from. Left alone it sat over the content the user left to glance at.
+    //
+    // Distance decides it, measured in the Electron main process: the renderer
+    // gets no mouse events off-window, so this bridge is the only thing that can
+    // tell "parked just outside the rail" from "gone to another window".
+    let reply: ((away: boolean) => void) | null = null
+    let stops = 0
+    ;(window as Window & { electronAPI?: unknown }).electronAPI = {
+      watchCursorAway: (cb: (away: boolean) => void) => {
+        reply = cb
+        return () => { stops += 1; reply = null }
+      },
+    }
+    renderWithProviders(<App />, { route: '/chat' })
+    const toggle = await screen.findByTestId('focus-mode-toggle')
+    await act(async () => { fireEvent.click(toggle) })
+    const rail = screen.getByRole('navigation', { name: 'Main navigation' })
+
+    vi.useFakeTimers()
+    try {
+      const leave = () => act(() => {
+        document.dispatchEvent(new MouseEvent('mouseout', {
+          bubbles: true, relatedTarget: null, clientX: 4, clientY: 400,
+        }))
+      })
+      leave()
+      expect(rail.style.transform).toBe('translateX(0)')
+
+      // Only the distance answer dismisses it. The cursor may be an inch
+      // outside the rail it just summoned, and it stays up.
+      act(() => { vi.advanceTimersByTime(10_000) })
+      expect(rail.style.transform).toBe('translateX(0)')
+
+      // Cursor came back inside instead: reported by main, because the band it
+      // re-enters through can be a drag region the page never sees.
+      act(() => { reply?.(false) })
+      act(() => { vi.advanceTimersByTime(10_000) })
+      expect(rail.style.transform).toBe('translateX(0)')
+
+      // Now it genuinely travels away.
+      leave()
+      act(() => { reply?.(true) })
+      expect(rail.style.transform).toBe('translateX(calc(-100% - 12px))')
+
+      // The window losing focus hides it immediately — the user is in another
+      // app, which is not a distance question — and releases the poll. The same
+      // edge exit re-opens the rail (that overshoot IS the reveal gesture), so
+      // one `leave()` sets the state this needs.
+      leave()
+      expect(rail.style.transform).toBe('translateX(0)')
+      act(() => { window.dispatchEvent(new Event('blur')) })
+      expect(rail.style.transform).toBe('translateX(calc(-100% - 12px))')
+      expect(stops).toBeGreaterThan(0)
+    } finally {
+      vi.useRealTimers()
+      delete (window as Window & { electronAPI?: unknown }).electronAPI
+    }
+  })
+
+  it('stays open off-window with no Electron bridge until blur', async () => {
+    // A browser tab (and an embedded pane) cannot see the cursor off-window, so
+    // leaving the window does not dismiss; blur does.
+    renderWithProviders(<App />, { route: '/chat' })
+    const toggle = await screen.findByTestId('focus-mode-toggle')
+    await act(async () => { fireEvent.click(toggle) })
+    const rail = screen.getByRole('navigation', { name: 'Main navigation' })
+
+    vi.useFakeTimers()
+    try {
+      act(() => {
+        document.dispatchEvent(new MouseEvent('mouseout', {
+          bubbles: true, relatedTarget: null, clientX: 4, clientY: 400,
+        }))
+      })
+      expect(rail.style.transform).toBe('translateX(0)')
+      act(() => { vi.advanceTimersByTime(10_000) })
+      expect(rail.style.transform).toBe('translateX(0)')
+      act(() => { window.dispatchEvent(new Event('blur')) })
+      expect(rail.style.transform).toBe('translateX(calc(-100% - 12px))')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('reveals the chrome when the pointer settles on a peek strip', async () => {
     renderWithProviders(<App />, { route: '/chat' })
     const toggle = await screen.findByTestId('focus-mode-toggle')

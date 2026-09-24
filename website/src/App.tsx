@@ -1808,11 +1808,14 @@ export default function App() {
     // The revealed header doubles as the window-drag surface, and a drag region
     // eats pointer events before hit-testing — so closing must be POSITIONAL:
     // only a mousemove observed below the header band closes the bar, and event
-    // silence (pointer resting on the draggable empty region, dragging the
-    // window, or off-window) can never hide it. 42 is the header's height (its
+    // silence (pointer resting on the draggable empty region, or dragging the
+    // window) can never hide it. 42 is the header's height (its
     // inline style below); +6 slack so grazing the band's bottom edge does not
     // count as departure.
     departWhen: e => e.clientY > 48,
+    // The pointer LEAVING the window is the one case positional close cannot
+    // see, and the slam below opens the bar in exactly that state.
+    dismissOnWindowExit: true,
   })
   const railPeek = useHoverIntent({
     enabled: focusActive, openMs: 120, closeMs: 260,
@@ -1823,6 +1826,7 @@ export default function App() {
     // enter/leave history for the event-based close to work from. 236 is the
     // rail track width; +12 slack.
     departWhen: e => e.clientX > 248,
+    dismissOnWindowExit: true,
   })
   // Edge-slam reveal: overshooting a trigger straight OUT of the window must
   // OPEN the overlay, not cancel it (the overshoot fires mouseleave on its way
@@ -1838,7 +1842,10 @@ export default function App() {
   // no Electron bridge) and browser tabs. In a browser a trip to the tab strip
   // or URL bar also exits through the top and pops the header; that false
   // positive is transient (the header closes as soon as the pointer re-enters
-  // below the band) and is accepted in exchange for the slam working uniformly.
+  // below the band, or on blur or an outside click) and is accepted in exchange
+  // for the slam working uniformly. In the
+  // desktop app the same trip is not a false positive at all: the tab strip is
+  // inches away, so the cursor never crosses the dismissal distance.
   //
   // Depends on the two `openNow` callbacks, NOT on the hover-intent objects that
   // carry them: useHoverIntent returns a fresh object literal every render, so

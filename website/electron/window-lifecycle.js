@@ -15,6 +15,7 @@ const {
 } = require("./fullscreen-transition-watch");
 const { createDisplayMediaHandler } = require("./display-media");
 const { applyFocusModeChrome } = require("./focus-chrome");
+const { createFocusCursorWatch } = require("./focus-cursor");
 const {
   createPermissionRequestHandler,
   createPermissionCheckHandler,
@@ -1860,6 +1861,18 @@ function createWindowLifecycle(options) {
     applyFocusModeChrome(win, visible, { positionTrafficLights });
   }
 
+  // Off-window cursor distance for a focus-mode reveal. Every platform, unlike
+  // handleFocusMode's macOS-only traffic lights: the renderer stops receiving
+  // mouse events the moment the pointer crosses a window edge wherever it runs,
+  // so the dismissal distance can only be measured here.
+  const focusCursorWatch = createFocusCursorWatch({ screen, log: glog });
+
+  function handleWatchFocusCursor(sender, watching) {
+    const win = windowForWebContents(sender);
+    if (!win) return;
+    focusCursorWatch.watch(win, watching);
+  }
+
   function handleWindowControl(sender, action, senderFrame) {
     const win = windowForWebContents(sender);
     if (!win) return;
@@ -2175,6 +2188,7 @@ function createWindowLifecycle(options) {
     chrome: {
       setThemeAccent,
       focusMode: handleFocusMode,
+      watchFocusCursor: handleWatchFocusCursor,
       windowControl: handleWindowControl,
       setThemeMode,
       setTitlebarMode,
