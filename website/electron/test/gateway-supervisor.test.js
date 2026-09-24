@@ -452,6 +452,9 @@ async function spawnedSuccessor(built) {
   await supervisor.start();
   spawnCalls[0].child.emit("exit", 75, null);
   spawnCalls[1].child.emit("exit", 75, null);
+  // The port is read for an existing gateway before the successor is exec'd, so
+  // the spawn lands a turn after the event that asks for it.
+  await flush();
   const successor = successorCall(spawnCalls);
   assert.ok(successor, "a successor copy of this app is spawned");
   successor.child.emit("spawn");
@@ -497,8 +500,13 @@ test("a second stale exit starts a fresh copy of the app and exits only once its
   assert.strictEqual(spawnCalls.filter((call) => call[0] !== APP_EXEC_PATH).length, 2,
     "the budget is one backend re-resolve per incident");
   assert.ok(state.execProbes.length >= 1, "the app executable is probed before restarting");
+  // The port is read for an existing gateway before the successor is exec'd, so
+  // the spawn lands a turn after the event that asks for it.
+  await flush();
   const successor = successorCall(spawnCalls);
   assert.ok(successor, "a successor copy of this app is spawned");
+  assert.ok(requests.some((url) => url.endsWith("/api/ready")),
+    "the port is read before the handoff, so an existing gateway cannot be mistaken for the successor");
   assert.deepStrictEqual(successor[1], ["--some-flag"], "the successor gets this instance's arguments");
   assert.deepStrictEqual(successor[2], { detached: true, stdio: "ignore" });
   assert.strictEqual(state.lockReleases, 1, "the single-instance lock is released so the successor can win it");
@@ -527,6 +535,31 @@ test("a second stale exit starts a fresh copy of the app and exits only once its
   assert.deepStrictEqual(timers.pending, [], "the deadline is disarmed once the successor is confirmed");
   assert.ok(state.statuses.filter((entry) => entry === "status:Restarting Kiro Crew to finish the update…").length >= 2,
     "the restart announcement is re-sent on every poll so a splash that loaded late still shows it");
+});
+
+test("a gateway already answering on the successor's port abandons the handoff", async () => {
+  const { supervisor, spawnCalls, logs, state, timers } = staleBundleHarness();
+
+  await supervisor.start();
+  spawnCalls[0].child.emit("exit", 75, null);
+  // Something else is serving on the port the successor would bind: a gateway a
+  // terminal started, or a side-by-side install. Its readiness is indistinguishable
+  // from a successor's, so confirming on it would exit this instance on a
+  // stranger's liveness -- and if the successor then died during initialization,
+  // nothing would be left running at all.
+  state.http.status = 200;
+  state.http.body = JSON.stringify({ ready: true });
+  spawnCalls[1].child.emit("exit", 75, null);
+  await flush();
+
+  assert.strictEqual(successorCall(spawnCalls), undefined,
+    "no successor is exec'd, because its readiness could not be told from the gateway already there");
+  assert.deepStrictEqual(state.exits, [], "this instance keeps running");
+  assert.strictEqual(state.lockReleases, 0, "the single-instance lock is kept, so a later manual launch still routes here");
+  assert.ok(!timers.pending.some((timer) => timer.ms === SUCCESSOR_READY_TIMEOUT_MS),
+    "no handoff wait is armed for a handoff that never began");
+  assert.ok(logs.some((line) => line.includes("already answers") && line.includes("surfacing the failure")),
+    "the refusal is logged with the port's answer");
 });
 
 test("a successor whose gateway is still booting (503 starting) also counts as alive", async () => {
@@ -616,6 +649,8 @@ test("a bundle pruned after the probe fails the successor spawn and falls back t
   await supervisor.start();
   spawnCalls[0].child.emit("exit", 75, null);
   spawnCalls[1].child.emit("exit", 75, null);
+  // The port is read for an existing gateway before the successor is exec'd.
+  await flush();
   const successor = successorCall(spawnCalls);
   assert.ok(successor);
   assert.deepStrictEqual(state.exits, []);
@@ -645,6 +680,8 @@ test("a pruned bundle whose app executable survived still restarts the app", asy
   assert.strictEqual(spawnCalls.length, 2);
   spawnCalls[1].child.emit("error", enoent);
 
+  // The port is read for an existing gateway before the successor is exec'd.
+  await flush();
   const successor = successorCall(spawnCalls);
   assert.ok(successor);
   successor.child.emit("spawn");
