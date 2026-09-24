@@ -24,6 +24,7 @@ from __future__ import annotations
 import errno
 import logging
 import os
+import stat
 import threading
 import time
 from pathlib import Path
@@ -35,6 +36,27 @@ logger = logging.getLogger(__name__)
 
 _SECRET_KEY_FILE = "token_signing.key"
 _MIN_KEY_BYTES = 32
+
+#: Directory (a direct child of the crew data home) both gateway auth stores stage their
+#: temp files in: this module's ``token_signing.key`` and ``refresh_tokens``'
+#: ``refresh_chains.json``. Spelled as a literal rather than imported from
+#: ``kiro_crew.sandbox`` to keep this module off that import chain, exactly as
+#: ``service/live_target.py`` spells ``live-target-staging``; the equality is pinned by a
+#: test instead.
+#:
+#: Staging beside either leaf is what this exists to avoid. Both are masked in an agent
+#: sandbox as individual FILES, and a mask covers a PATH rather than an inode, so a temp
+#: beside one of them sits in the data-home root -- visible in every sandbox, and
+#: ``link(2)``-able by a same-uid agent for as long as the write takes. The temp carries
+#: the FULL key or chain state, so a link taken in that window keeps reading the bytes
+#: after the publish, and a crash between write and publish leaves the same unmasked file
+#: on disk. The spawn-time hard-link refusal cannot close this: it runs BEFORE a spawn,
+#: while this window opens during one.
+#:
+#: The sandbox launcher masks this directory in every namespace and precreates it, and
+#: ``security.paths`` fences it, both as a whole DIRECTORY -- so every temp name inside it,
+#: present and future, is covered without a second entry to remember.
+_AUTH_STORE_STAGING_LEAF = "auth-store-staging"
 
 # Bounded retry budget for the create-then-read interleaving window. The SOLE
 # creator opens the key file with O_EXCL, then writes 32 bytes; a racing reader
@@ -57,9 +79,10 @@ _CREATE_BACKOFF_SECONDS = 0.02
 #: handle holds the path -- transient, and the one this most needs to keep out),
 #: ENOSPC, EDQUOT, EIO and EROFS. Each of those exhausts the retry budget and
 #: degrades to an ephemeral secret with the destination untouched. EXDEV is
-#: excluded too, for the opposite reason: the staged file is a same-directory
-#: sibling, so a cross-device link cannot arise and listing it would only suggest
-#: the staging path is allowed to move.
+#: excluded too, for the opposite reason: the staged file lives in a SUBDIRECTORY of the
+#: key's own parent (see :data:`_AUTH_STORE_STAGING_LEAF`), so it and the destination are
+#: always on one filesystem and a cross-device link cannot arise. Listing it would only
+#: suggest the staging path is allowed to leave that filesystem.
 _LINK_UNSUPPORTED_ERRNOS = frozenset(
     {
         getattr(errno, name)
@@ -84,6 +107,51 @@ def _is_link_unsupported(exc: OSError) -> bool:
     if exc.errno in _LINK_UNSUPPORTED_ERRNOS:
         return True
     return getattr(exc, "winerror", None) in _LINK_UNSUPPORTED_WINERRORS
+
+
+def auth_store_staging_dir(home: Path) -> Path:
+    """Return the auth-store staging directory under *home*, creating it if absent.
+
+    Shared by this module's signing-key publish and ``refresh_tokens``' state publish so
+    the two cannot drift onto different staging policies. The directory is validated
+    rather than trusted, on the same grounds ``service.live_target._publish_pointer``
+    validates its own: the name sits in the data-home root, so a directory found there is
+    not necessarily one this process created.
+
+    Refuses rather than repairs, so a directory nobody here created is never silently
+    adopted:
+
+    * not a directory (a symlink included, via ``lstat``) -- following it would stage the
+      full key or chain state wherever it points, outside both the mask and the fence;
+    * group- or world-accessible where modes exist -- the payload is written owner-only,
+      but a wider directory mode lets another account enumerate the temps' names, and a
+      writable one lets them pre-plant a name.
+
+    ``EXDEV`` is not a concern for the caller that publishes with ``os.link``: this is a
+    subdirectory of the key's own parent, so the staged file and its destination are
+    always on one filesystem.
+    """
+    staging = home / _AUTH_STORE_STAGING_LEAF
+    try:
+        st = os.lstat(staging)
+    except FileNotFoundError:
+        home.mkdir(parents=True, exist_ok=True)
+        # exist_ok: the sandbox materialiser precreates the same directory, and the two
+        # auth stores publish concurrently.
+        staging.mkdir(mode=0o700, exist_ok=True)
+        st = os.lstat(staging)
+    if not stat.S_ISDIR(st.st_mode):
+        raise OSError(
+            errno.ENOTDIR,
+            f"{staging} is not a directory; refusing to stage a gateway auth store through it",
+        )
+    if os.name != "nt" and st.st_mode & 0o077:
+        raise OSError(
+            errno.EPERM,
+            f"{staging} is not owner-only (mode {stat.S_IMODE(st.st_mode):o}); "
+            "chmod 700 it or remove it, then restart the gateway",
+        )
+    return staging
 
 
 def _enforce_owner_only(key_path: Path) -> None:
@@ -368,18 +436,29 @@ def _load_or_create_secret() -> bytes:
             #    an in-place O_EXCL create provides; os.replace would
             #    let each racer install its own key and leave the losers
             #    signing with bytes that are no longer on disk.
-            # The suffix is load-bearing, not cosmetic. This file holds the FULL
-            # key until the publish link lands, and a kill between that link and
-            # the cleanup unlink below leaves it on disk. security.py's keystone
-            # fence protects a publish artifact by SHAPE -- a direct child of a
-            # keystone leaf's own directory whose name ends in one of
-            # _KEYSTONE_ARTIFACT_SUFFIXES -- so ".tmp" is what puts a leftover
-            # copy of the signing key behind the same fence as the key itself,
-            # rather than leaving it readable to agent tools (a forged-token
-            # path). It also matches the suffix atomic_write's own mkstemp temp
-            # already uses. test_token_auth.py pins this against the real
-            # predicate so a rename cannot silently leave the fence behind.
-            staged = key_path.with_name(
+            # Staged in a masked, fenced DIRECTORY rather than beside the key.
+            # This file holds the FULL key until the publish link lands, and a
+            # kill between that link and the cleanup unlink below leaves it on
+            # disk. Beside the key it sat in the data-home root, which is
+            # sandbox-visible and same-uid writable, so a leftover -- or the
+            # write window itself -- was a readable copy of the signing key and
+            # a link(2) target for an agent: a forged-token path.
+            #
+            # _AUTH_STORE_STAGING_LEAF is masked in every agent namespace
+            # (sandbox._CREW_HIDDEN_LEAVES) and fenced from the file tools
+            # (security.paths._CREW_SECRET_LEAVES), in both cases as a whole
+            # directory, so every name inside it is covered however it is
+            # spelled. The keystone-artifact suffix rule does not reach this
+            # path: it covers a direct child of a keystone leaf's own directory,
+            # and this file sits one level below that.
+            #
+            # The ".tmp" suffix matches the shape atomic_write's own mkstemp temp
+            # uses, and keeps any stray artifact left loose in the data-home root
+            # behind the keystone fence. What makes THIS file unreachable is the
+            # directory holding it, not its name. test_token_auth.py pins the
+            # staged path against the real predicate so a rename cannot silently
+            # leave the fence behind.
+            staged = auth_store_staging_dir(key_path.parent) / (
                 f".{key_path.name}.{os.getpid()}.{os.urandom(8).hex()}.tmp"
             )
             key = os.urandom(_MIN_KEY_BYTES)
@@ -454,8 +533,10 @@ def _load_or_create_secret() -> bytes:
             # key sits at key_path, which is the divergence this function exists
             # to prevent. So keep the recoverable second name and return the key
             # that IS on disk. Keeping it is only safe because the staging name
-            # ends in ".tmp": the leftover stays behind security.py's keystone
-            # fence instead of becoming a readable copy of the signing key.
+            # lives inside _AUTH_STORE_STAGING_LEAF: that directory is masked in
+            # every agent namespace and fenced from the file tools, so the
+            # leftover stays unreachable instead of becoming a readable copy of
+            # the signing key.
             #
             # fsync_dir returns quietly where a directory sync cannot be
             # EXPRESSED (Windows has no directory descriptor; some network mounts

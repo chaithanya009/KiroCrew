@@ -33,14 +33,14 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterable, Mapping
 
-from kiro_crew.atomic_write import atomic_write
+from kiro_crew.atomic_write import atomic_write, replace_with_retry
 from kiro_crew.config.loader import config_dir
 from kiro_crew.dashboard.boot_id import current_boot_id
 from kiro_crew.dashboard.revocation_gen import (
     current_revocation_gen,
     current_revocation_gen_or_none,
 )
-from kiro_crew.dashboard.token_secret import _get_secret
+from kiro_crew.dashboard.token_secret import _get_secret, auth_store_staging_dir
 
 if TYPE_CHECKING:
     pass
@@ -566,12 +566,35 @@ class RefreshStateManager:
                 # hit the outer OSError handler below and drop the
                 # reuse-detection record entirely, which is worse than a state
                 # file another local user can read.
+                #
+                # Staged in _AUTH_STORE_STAGING_LEAF rather than beside the state
+                # file, then renamed onto it. mkstemp already denies the attacker
+                # a NAME to pre-plant, but a temp beside the state file sits in
+                # the data-home root, which is sandbox-visible and same-uid
+                # writable: an agent listing that directory during the write can
+                # link(2) the temp and keep reading the consumed-JTI and
+                # revoked-chain state after the rename, and a crash between write
+                # and rename leaves the same unmasked file behind. The staging
+                # directory is masked in every agent namespace and fenced from the
+                # file tools as a whole directory, so no name inside it is
+                # reachable either way. Both steps are atomic renames, so the
+                # destination is never partial.
+                staged = auth_store_staging_dir(self._state_path.parent) / (
+                    f"{self._state_path.name}.{os.getpid()}.{os.urandom(8).hex()}.tmp"
+                )
                 atomic_write(
-                    self._state_path,
+                    staged,
                     json.dumps(data, separators=(",", ":")).encode("utf-8"),
                     restrict_to_owner=True,
                     restrict_on_error="warn",
                 )
+                try:
+                    replace_with_retry(staged, self._state_path)
+                except OSError:
+                    # Nothing was published; drop our candidate so it cannot
+                    # linger holding a full copy of the chain state.
+                    staged.unlink(missing_ok=True)
+                    raise
             except OSError as e:
                 logger.warning(
                     "refresh_tokens: failed to persist state to %s (%s)",

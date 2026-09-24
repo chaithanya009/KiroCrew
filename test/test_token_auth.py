@@ -1520,8 +1520,15 @@ def test_signing_secret_transient_publish_failure_never_creates_the_destination(
         "a transient publish failure created the destination anyway — a kill in "
         "that write window persists the 0-byte key this fix removes"
     )
-    # Nothing of ours is left in the config dir either.
-    assert list(tmp_path.iterdir()) == []
+    # No copy of ours is left either. The staging directory itself is expected --
+    # the publish creates it before staging and it is masked and fenced -- so what
+    # must be empty is the directory, not the data home.
+    assert [p.name for p in tmp_path.iterdir()] == [
+        ts._AUTH_STORE_STAGING_LEAF
+    ], "a failed publish left something other than the staging directory behind"
+    assert (
+        list((tmp_path / ts._AUTH_STORE_STAGING_LEAF).iterdir()) == []
+    ), "a staged copy of the signing key survived a failed publish"
 
 
 def test_signing_secret_persists_on_a_filesystem_without_hard_links(tmp_path, monkeypatch) -> None:
@@ -1618,8 +1625,8 @@ def test_signing_secret_failed_dir_sync_keeps_a_recoverable_name(tmp_path, monke
     So a genuine sync failure keeps the staging name as a recoverable second
     reference, and still returns the key that is on disk rather than degrading to
     an ephemeral secret (which would diverge from the persisted key). The kept
-    leftover is safe precisely because it ends in ``.tmp`` and so stays behind the
-    keystone fence.
+    leftover is safe precisely because it sits inside the masked, fenced staging
+    directory.
     """
     import errno as _errno
 
@@ -1630,7 +1637,7 @@ def test_signing_secret_failed_dir_sync_keeps_a_recoverable_name(tmp_path, monke
     def _failing_sync(path, **kwargs):  # type: ignore[no-untyped-def]
         # best_effort would swallow this; strict must let it surface here.
         assert not kwargs.get("best_effort"), (
-            "the publish must sync the directory STRICTLY — best_effort hides the "
+            "the publish must sync the directory STRICTLY -- best_effort hides the "
             "very EIO that makes dropping the second name unsafe"
         )
         raise OSError(_errno.EIO, "simulated: device refused the directory sync")
@@ -1642,11 +1649,18 @@ def test_signing_secret_failed_dir_sync_keeps_a_recoverable_name(tmp_path, monke
     key_file = tmp_path / ts._SECRET_KEY_FILE
     assert key_file.exists(), "the key was not published"
     assert key_file.read_bytes() == secret, (
-        "returned an ephemeral secret while a valid key sits on disk — the "
+        "returned an ephemeral secret while a valid key sits on disk -- the "
         "divergence the exclusive publish exists to prevent"
     )
 
-    leftovers = [p for p in tmp_path.iterdir() if p.name != ts._SECRET_KEY_FILE]
+    # The recoverable second name lives in the staging directory, not beside the
+    # key: the data-home root is sandbox-visible, so a leftover there would be a
+    # readable copy of the signing key.
+    staging = tmp_path / ts._AUTH_STORE_STAGING_LEAF
+    assert sorted(p.name for p in tmp_path.iterdir()) == sorted(
+        [ts._SECRET_KEY_FILE, ts._AUTH_STORE_STAGING_LEAF]
+    ), "a copy of the signing key was left loose in the data-home root"
+    leftovers = list(staging.iterdir())
     assert len(leftovers) == 1, (
         "a failed directory sync must keep exactly one recoverable second name, "
         f"found {[p.name for p in leftovers]}"
@@ -1657,10 +1671,20 @@ def test_signing_secret_failed_dir_sync_keeps_a_recoverable_name(tmp_path, monke
         "the kept name is a separate inode, so it is a second COPY of the signing "
         "key rather than a second name for it"
     )
-    # And it is still fenced, which is what makes keeping it acceptable.
+    # And it is still fenced, which is what makes keeping it acceptable. Asserted
+    # where the staging directory REALLY sits: the fence resolves its targets from
+    # the real crew-home prefixes, so a tmp_path candidate would prove nothing.
     from kiro_crew import security
 
-    assert kept.name.endswith(security._KEYSTONE_ARTIFACT_SUFFIXES)
+    targets = security._home_dir_targets(
+        tuple(d for d in security.sensitive_home_dirs() if d.endswith(ts._AUTH_STORE_STAGING_LEAF))
+    )
+    assert targets, "the fence resolved no staging directory, so nothing is protected"
+    for target in sorted(targets):
+        assert security.is_sensitive_path(os.path.join(target, kept.name)), (
+            f"a leftover {kept.name!r} in {target} would not be fenced -- it holds a "
+            "full copy of the signing key and agent tools could read it"
+        )
 
 
 def test_signing_secret_staging_file_is_covered_by_the_keystone_fence(
@@ -1668,20 +1692,29 @@ def test_signing_secret_staging_file_is_covered_by_the_keystone_fence(
 ) -> None:
     """A leftover staging file must be fenced exactly like the key it copies.
 
-    The staging sibling holds the FULL signing key until the publish link lands,
-    and a kill between that link and the cleanup unlink leaves it on disk. The
-    keystone fence in ``security.py`` protects a publish artifact by SHAPE — a
-    direct child of a keystone leaf's own directory whose name ends in one of
-    ``_KEYSTONE_ARTIFACT_SUFFIXES`` — so a staging name outside those suffixes
-    leaves a readable copy of the key for an agent tool to fetch and forge tokens
-    with.
+    The staged file holds the FULL signing key until the publish link lands, and a
+    kill between that link and the cleanup unlink leaves it on disk. It is
+    protected by living inside ``_AUTH_STORE_STAGING_LEAF``, which
+    ``security.paths`` fences as a whole DIRECTORY -- so every name inside it is
+    covered, present and future.
 
-    Asserted against the real predicate rather than against the literal suffix, so
-    the coupling survives a rename on either side. The name is tested in the
-    directory the key actually lives in: the fence resolves its parent set from
-    the real crew-home prefixes, so pointing ``KIROCREW_HOME`` at a temp dir would
-    move the key without moving the fence and prove nothing.
+    Two things are asserted, because either alone can be true while the key is
+    exposed. First, the publish really does stage INSIDE that directory: a temp
+    beside the key would sit in the data-home root, which is sandbox-visible and
+    same-uid writable, and no suffix rule makes that unreachable to a spawned
+    shell. Second, the fence really does cover that path -- asserted where the
+    directory REALLY sits, since the fence resolves its targets from the real
+    crew-home prefixes and a ``tmp_path`` candidate would prove nothing.
+
+    The no-suffix control is the point of the third assertion: the fence must
+    cover a name that ends in no keystone suffix at all. That is what
+    distinguishes the directory entry now doing the work from the old
+    ``_KEYSTONE_ARTIFACT_SUFFIXES`` shape rule, which reached only a direct child
+    of a keystone leaf's own directory and stopped applying when the temp moved
+    down one level.
     """
+    from pathlib import Path
+
     from kiro_crew import security
     from kiro_crew.dashboard import token_secret as ts
 
@@ -1698,45 +1731,63 @@ def test_signing_secret_staging_file_is_covered_by_the_keystone_fence(
     monkeypatch.undo()
 
     assert captured, "the publish never linked, so no staging name was observed"
-    staged_name = os.path.basename(captured[0])
-    assert staged_name.endswith(
-        security._KEYSTONE_ARTIFACT_SUFFIXES
-    ), f"staging name {staged_name!r} is outside the keystone artifact suffixes"
+    staged = Path(captured[0])
+    assert staged.parent == tmp_path / ts._AUTH_STORE_STAGING_LEAF, (
+        f"the key was staged at {staged} instead of inside "
+        f"{ts._AUTH_STORE_STAGING_LEAF!r}; a temp in the data-home root is visible "
+        "in every agent sandbox and link(2)-able while the write is in flight"
+    )
 
-    # Now ask the fence about that same name where the key really sits.
-    parents = security._home_dir_targets(security._KEYSTONE_ARTIFACT_PARENTS)
-    assert parents, "the fence resolved no keystone artifact parents"
-    for parent in sorted(parents):
-        candidate = os.path.join(parent, staged_name)
-        assert security._is_keystone_publish_artifact(candidate), (
-            f"a leftover {staged_name!r} in {parent} would not be fenced — it "
+    targets = security._home_dir_targets(
+        tuple(d for d in security.sensitive_home_dirs() if d.endswith(ts._AUTH_STORE_STAGING_LEAF))
+    )
+    assert targets, "the fence resolved no staging directory, so nothing is protected"
+    for target in sorted(targets):
+        assert security.is_sensitive_path(os.path.join(target, staged.name)), (
+            f"a leftover {staged.name!r} in {target} would not be fenced -- it "
             "holds a full copy of the signing key and agent tools could read it"
+        )
+        # Control: coverage must not depend on the filename's suffix.
+        assert security.is_sensitive_path(os.path.join(target, "leftover-with-no-suffix")), (
+            f"{target} is fenced only for suffixed names, so the protection is still "
+            "the old shape rule rather than the directory entry"
         )
 
 
 def test_signing_secret_publish_leaves_no_staging_file_behind(tmp_path, monkeypatch) -> None:
-    """The staging sibling is this process's private file and must not survive.
+    """The staged file is this process's private file and must not survive.
 
     A leftover staging file is inert (the key is published under its own name)
-    but it holds a full copy of the signing secret, so the config directory must
-    contain exactly the key file after a successful publish -- and after a
-    publish this process LOST to a sibling, where its candidate is dropped
-    rather than installed.
+    but it holds a full copy of the signing secret, so after a successful publish
+    the staging directory must be EMPTY -- and equally after a publish this
+    process LOST to a sibling, where its candidate is dropped rather than
+    installed.
+
+    The staging DIRECTORY itself is expected to remain: it is masked, fenced and
+    precreated by the sandbox materialiser, so it is a fixture of the data home
+    rather than an artifact of one write. What must not remain is a file in it.
     """
     from kiro_crew.dashboard import token_secret as ts
 
     monkeypatch.setattr("kiro_crew.config.loader.config_dir", lambda: tmp_path)
     key_file = tmp_path / ts._SECRET_KEY_FILE
+    staging = tmp_path / ts._AUTH_STORE_STAGING_LEAF
+
+    expected_home = sorted([ts._SECRET_KEY_FILE, ts._AUTH_STORE_STAGING_LEAF])
 
     secret = ts._load_or_create_secret()
     assert key_file.read_bytes() == secret
-    assert [p.name for p in tmp_path.iterdir()] == [ts._SECRET_KEY_FILE]
+    assert sorted(p.name for p in tmp_path.iterdir()) == expected_home
+    assert [
+        p.name for p in staging.iterdir()
+    ] == [], "a staged file survived the publish; it holds a full copy of the signing key"
 
     # Now the losing path: a key already exists, so a second loader must read it
     # and leave nothing of its own candidate behind.
     again = ts._load_or_create_secret()
     assert again == secret, "second loader diverged from the persisted key"
-    assert [p.name for p in tmp_path.iterdir()] == [ts._SECRET_KEY_FILE]
+    assert sorted(p.name for p in tmp_path.iterdir()) == expected_home
+    assert [p.name for p in staging.iterdir()] == [], "the losing loader left its candidate staged"
 
 
 def test_signing_secret_binary_write_survives_windows_text_mode(tmp_path, monkeypatch) -> None:

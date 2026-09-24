@@ -244,6 +244,23 @@ _LIVE_TARGET_LEAF: str = "live_target.json"
 #: reason as ``_MD_NOTEBOOK_STAGING_LEAF`` / ``aws-control-staging``.
 _LIVE_TARGET_STAGING_LEAF: str = "live-target-staging"
 
+#: The masked DIRECTORY the gateway's own auth stores are staged in before they are
+#: published. ``token_signing.key`` and ``refresh_chains.json`` are masked as individual
+#: FILES, and a mask covers a PATH rather than an inode, so a temp staged BESIDE either of
+#: them sits in the data-home root -- which is writable in-sandbox -- under a name no mask
+#: covers. A same-uid agent that lists that root while a write is in flight can ``link(2)``
+#: the temp and keep reading the bytes after the publish rename, and the spawn-time
+#: :data:`_CREW_HARDLINK_REFUSED_LEAVES` check cannot see it: that check runs before a
+#: spawn, while this window opens during one. A crash between write and publish leaves the
+#: same unmasked file on disk holding the same bytes.
+#:
+#: A directory mask covers every name inside it, present and future, so both the staging
+#: window and a crash orphan are covered. Same shape and reason as
+#: :data:`_LIVE_TARGET_STAGING_LEAF`, :data:`_MD_NOTEBOOK_STAGING_LEAF` and
+#: ``aws-control-staging``; the gateway process is the only writer, so unlike md-notebook it
+#: needs no backend carve-out to hand the directory back to a sandboxed app.
+_AUTH_STORE_STAGING_LEAF: str = "auth-store-staging"
+
 #: The md-notebook builtin's name, and its own state files under the crew data home.
 #: Named so the mask, the backend carve-out that lifts it, and the materialiser that
 #: gives it a mount target cannot drift apart on a literal.
@@ -450,6 +467,10 @@ _CREW_HIDDEN_LEAVES: tuple[str, ...] = (
     # Auth stores and signing keys owned by the gateway web server alone.
     "token_signing.key",
     "refresh_chains.json",
+    # The staging directory those two publish through. Masked as a whole DIRECTORY so the
+    # in-flight temp -- which holds the same key and chain-state bytes as the two leaves
+    # above -- and any crash orphan are covered at every name, present and future.
+    _AUTH_STORE_STAGING_LEAF,
     "kas",
     "ops_mission_control_secrets.json",
     "ops_mission_control_policy.json",
@@ -1523,6 +1544,11 @@ _CREW_PRECREATE_HIDDEN_DIR_LEAVES: tuple[str, ...] = (
     # first spawn so the mask has a mount target, and the temp the materialiser stages
     # in it is never visible to a running namespace.
     _LIVE_TARGET_STAGING_LEAF,
+    # The auth stores' staging directory, by the same rule. Left to lazy creation, a sandbox
+    # spawned before the first key or chain-state write finds it absent, the ``SENSITIVE_DIRS``
+    # loop skips it, and the directory the gateway creates later shows up INSIDE that running
+    # sandbox -- with the signing-key staging window in it.
+    _AUTH_STORE_STAGING_LEAF,
     # ``crew-panels`` is the same requirement seen from the mirror side of the
     # ceilings above: a read-only ceiling is materialised so the SEAL can apply,
     # a hidden leaf so the MASK can. The skip lands precisely on a fresh install,
@@ -1767,6 +1793,72 @@ _CREW_ALIAS_TOLERATED_LEAVES: frozenset[str] = frozenset({".env"})
 #: exists for it: nothing withholds anything when ``apps/aws-control`` is a link, so the
 #: mask binds the referent while the writable alias name persists.
 _CREW_ALIAS_CHAIN_DEGRADE_LEAVES: frozenset[str] = frozenset(_MD_NOTEBOOK_PRECREATE_CONTENT)
+
+#: Masked leaves where an extra HARD LINK refuses the spawn rather than warning.
+#:
+#: The mask binds a PATH, so it does not follow the inode: a second name on the same inode
+#: is an unmasked way to the same bytes, for reading AND for writing, and no check on the
+#: masked name can see it. That is the same reasoning
+#: :func:`_refuse_unless_sole_regular_link` already applies to the live-target pointer,
+#: where ``st_nlink != 1`` refuses; this set carries it to the leaves whose bytes are
+#: themselves a usable secret.
+#:
+#: MEMBERSHIP RULE, so a leaf added later inherits a decision instead of silence: the
+#: leaf's bytes are usable off this host on their own -- a signing key, a bearer token, a
+#: session cookie, a password. A leaf masked for INTEGRITY instead, where the harm is an
+#: agent WRITING it, stays a warning: the write alias is real, but those leaves each have a
+#: reader that re-validates the content, and refusing on them would widen the spawn-failure
+#: surface past the bytes an attacker can simply walk away with.
+#:
+#: Only a REGULAR FILE can carry a second hard link -- ``link(2)`` refuses a directory --
+#: so every directory leaf is outside this decision by shape rather than by judgement, and
+#: no entry here needs to name one.
+#:
+#: * ``token_signing.key`` -- signs dashboard access and refresh tokens. The bytes forge
+#:   any session cookie, so a read is a full authentication bypass.
+#: * ``refresh_chains.json`` -- the refresh-token chain state that decides which refresh
+#:   presentations are still live; a read continues an operator's session.
+#: * the auth SQLite store and its WAL, SHM and journal sidecars -- its own entry in
+#:   :data:`_CREW_HIDDEN_LEAVES` states the reason this set needs: the bytes ARE a live
+#:   bearer token, and the sidecars hold the same bytes mid-transaction.
+#: * ``.env`` -- the operator's channel credentials, the live Slack, Discord and Telegram
+#:   tokens. It is TOLERATED for a symlink in :data:`_CREW_ALIAS_TOLERATED_LEAVES` and
+#:   deliberately NOT tolerated here: that tolerance exists for the layout a dotfile
+#:   manager produces, and chezmoi and stow produce a SYMLINK or a copy. A hard link on
+#:   this file is not that supported layout, and it is the highest-value secret in the home.
+#: * the Notes personal access token -- a live bearer credential for the operator's
+#:   repositories. Reachable from inside the sandbox rather than only by pre-planting: the
+#:   Notes backend is itself a sandboxed spawn holding a legitimate window on this leaf, so
+#:   one agent can create the second name and an ordinary session then reads the token.
+#: * ``ops_mission_control_secrets.json`` -- the app's credential store by name.
+#: * ``browser-cookies.txt``, ``playwright-storage-state.json`` and
+#:   ``playwright-extension-token`` -- browser session material: site cookies, the storage
+#:   state that carries them plus localStorage tokens, and the extension's bearer token.
+#:   Retired leaves with no reader left in the tree, kept here for the reason
+#:   ``.kiro_cli_binary_trust.json`` gives for being masked at all -- a backup restore can
+#:   resurrect one, and a restored cookie jar is a live credential again.
+#:
+#: The cost is stated rather than hidden: an extra hard link refuses EVERY agent spawn on
+#: the host, including when the second name sits outside the sandbox where it is harmless,
+#: because ``st_nlink`` reports that a second name exists and not where it is.
+#: :func:`masked_credential_leaf_aliases` is what keeps that from arriving as an
+#: unexplained outage -- ``kirocrew doctor`` reports the condition before a spawn refuses
+#: on it, the same answer the live-target pointer's own read already gives for the same
+#: shape, and the refusal names the ``find -samefile`` command that locates the other name.
+_CREW_HARDLINK_REFUSED_LEAVES: frozenset[str] = frozenset(
+    {
+        "token_signing.key",
+        "refresh_chains.json",
+        AUTH_SQLITE_DB,
+        *(f"{AUTH_SQLITE_DB}{suffix}" for suffix in AUTH_SQLITE_SIDECAR_SUFFIXES),
+        ".env",
+        f"workspace/{MD_NOTEBOOK_APP_NAME}/pat",
+        "ops_mission_control_secrets.json",
+        "browser-cookies.txt",
+        "playwright-storage-state.json",
+        "playwright-extension-token",
+    }
+)
 
 
 #: The tolerated leaves must BE masked leaves -- an entry naming something outside
@@ -2475,13 +2567,16 @@ def _refuse_aliased_masked_leaves() -> None:
     wording with ``kirocrew doctor`` and the md-notebook leaves name their own documents,
     and a generic message arriving first would replace both.
 
-    SYMLINKS refuse; an extra HARDLINK is WARNED, not refused. A hardlink does not make the
-    masked name replaceable, and ``rsync --link-dest`` and hardlinking snapshot tools leave
-    one behind on ordinary hosts, so refusing it would cost every sandboxed spawn on a
-    machine whose backups are working correctly. The warning is emitted HERE rather than
-    left to :func:`_warn_if_alias_backed`, which never runs over these leaves: without it
-    the alias really would be outside the mask with nothing said about it, which is the
-    silent-by-construction property this pass exists to end.
+    SYMLINKS refuse. An extra HARDLINK refuses for the leaves whose bytes are themselves a
+    usable secret and is WARNED for the rest -- :data:`_CREW_HARDLINK_REFUSED_LEAVES` is
+    that set and argues each entry. The split is where the cost sits: ``st_nlink`` says a
+    second name EXISTS and not where it is, so refusing also refuses a link that
+    ``rsync --link-dest`` or a snapshot tool left outside the sandbox, where it is
+    harmless. For a credential leaf that is the right trade and the same one
+    :func:`_refuse_unless_sole_regular_link` already makes for the live-target pointer; for
+    a leaf masked only so an agent cannot WRITE it, the reader re-validates the content and
+    a spawn-wide outage is not proportionate. Either way the warning is emitted HERE rather
+    than left to :func:`_warn_if_alias_backed`, which never runs over these leaves.
 
     A TOLERATED leaf is VISITED and WARNED, never skipped. Excluding it from the walk is the
     same silence one level along: a symlinked ``.env`` carries live channel tokens and is
@@ -2572,14 +2667,81 @@ def _refuse_aliased_masked_leaves() -> None:
                 "real directory or file under this name."
             )
         if stat.S_ISREG(info.st_mode) and info.st_nlink > 1:
+            if leaf in _CREW_HARDLINK_REFUSED_LEAVES:
+                raise SandboxCeilingUnsealable(_masked_leaf_multilink_detail(target, info.st_nlink))
             logger.warning(
                 "sandbox: the masked path %s has %d hardlinks. The mask covers this path "
                 "only, so a read or write through another name reaches the same inode. "
-                "Not refused, because a hardlinking snapshot tool leaves one behind on an "
-                "ordinary host -- remove the extra link to close it.",
+                "Not refused, because this leaf is masked so an agent cannot WRITE it and "
+                "its reader re-validates the content, while a hardlinking snapshot tool "
+                "leaves a link on an ordinary host -- remove the extra link to close it.",
                 target,
                 info.st_nlink,
             )
+
+
+def _masked_leaf_multilink_detail(target: str, links: int) -> str:
+    """The refusal sentence for a credential leaf reachable under more than one name.
+
+    Names the ``find`` invocation rather than only the condition, for the reason
+    :func:`_live_target_multilink_detail` gives: an ordinary snapshot run leaves a link, so
+    the operator who meets this has no reason to know which OTHER path shares the inode,
+    and without the command the remedy "remove the extra link" names no file to remove.
+
+    Its own sentence rather than the pointer's, which says "the live-target pointer" and
+    would name the wrong file here, and a module-level formatter rather than an inline
+    string so ``kirocrew doctor`` reports the condition in the same words BEFORE a spawn
+    refuses on it.
+    """
+    # ``shlex.quote`` per path for the reason the pointer's formatter states: a data home
+    # holding a space otherwise turns the remedy into a two-directory search that answers a
+    # different question without erroring, so it has to survive being pasted.
+    return (
+        f"cannot mask {safe_terminal_line(target)}: this leaf holds a credential and has "
+        f"{links} hard links, so a mask over this name would leave another path to the "
+        "same bytes readable and writable. List the names under the data home with the "
+        f"command find {shlex.quote(safe_terminal_line(os.path.dirname(target)))} "
+        f"-samefile {shlex.quote(safe_terminal_line(target))} "
+        "-- that searches the data home only, and the tools that leave a link here "
+        "(snapshot and backup runs) usually keep theirs somewhere else, so if it reports "
+        "just this leaf, run it again from the mount point holding it with -xdev added: a "
+        "hard link cannot cross a filesystem, but it can sit anywhere on this one. Then "
+        "remove the extra link(s) and restart."
+    )
+
+
+def masked_credential_leaf_aliases() -> list[tuple[str, int]]:
+    """Every masked CREDENTIAL leaf that is reachable under more than one name, for doctor.
+
+    The pre-spawn read that makes the refusal in :func:`_refuse_aliased_masked_leaves`
+    defensible, and the counterpart of :func:`live_target_pointer_unfitness` for the same
+    shape on the other leaves. The refusal is otherwise the operator's only notice, and it
+    arrives too late and in the wrong place: a hard link on a file in the home is ordinary
+    operation for a snapshot tool, so the condition appears without anybody doing anything
+    wrong, and the first symptom is that agents stop starting.
+
+    Read-only and total. It creates nothing, follows nothing, opens no file, and a data home
+    it cannot resolve or a leaf it cannot stat is reported as nothing rather than as a
+    fault, because doctor must not turn its own probe failure into a verdict about the host.
+    An absent leaf has no second name by construction.
+
+    Returns the leaf path and its link count, so the caller renders the same sentence the
+    spawn would refuse with instead of paraphrasing it.
+    """
+    try:
+        root = str(config_dir())
+    except Exception:
+        return []
+    found: list[tuple[str, int]] = []
+    for leaf in sorted(_CREW_HARDLINK_REFUSED_LEAVES):
+        target = os.path.join(root, leaf)
+        try:
+            info = os.lstat(target)
+        except OSError:
+            continue
+        if stat.S_ISREG(info.st_mode) and info.st_nlink > 1:
+            found.append((target, info.st_nlink))
+    return found
 
 
 def _materialize_live_target_mask_target() -> str | None:
@@ -3027,6 +3189,93 @@ def _open_dir_anchored(anchor: str, components: tuple[str, ...]) -> int | None:
         os.close(fd)
         fd = nxt
     return fd
+
+
+#: The name shape a pre-upgrade signing-key publish left in the crew data-home root:
+#: ``token_secret`` staged ``.<leaf>.<pid>.<hex>.tmp`` beside the key and published with
+#: ``os.link``, so a SIGKILL between that link and the cleanup unlink leaves a file holding
+#: the FULL signing key at a name no mask covers.
+#:
+#: Bounded to THIS prefix on purpose, and that bound is the load-bearing part. The
+#: md-notebook sweep can take every ``*.tmp`` in its directory because that directory holds
+#: nothing else; the data home root is shared, and ``atomic_write`` stages
+#: ``tmp<random>.tmp`` there for many unrelated stores. A blanket sweep would unlink another
+#: component's in-flight temp between its ``mkstemp`` and its rename and fail that write for
+#: no reason -- the same hazard ``_CEILING_TEMP_PREFIX`` is skipped for one directory down.
+#: A name carrying the leaf can only have come from this one publisher.
+_AUTH_STORE_LEGACY_TEMP_PREFIX: str = ".token_signing.key."
+
+
+def _sweep_legacy_auth_store_temps() -> list[str]:
+    """Remove pre-upgrade signing-key staging temps left in the crew data-home root.
+
+    The publisher stages inside :data:`_AUTH_STORE_STAGING_LEAF`, which is masked as a
+    whole directory. A temp written before that directory existed sits in the data-home
+    root instead, at a name no mask covers, holding the bytes that sign every dashboard
+    token -- so on an upgraded host it stays readable by a same-uid agent indefinitely.
+    Masking forward cannot reach it: the exposure is an artefact already on disk.
+
+    Swept on every launch path, Linux namespace and macOS Seatbelt alike, and across every
+    crew-home spelling rather than only the live one, for the reason
+    :func:`_sweep_legacy_md_notebook_temps` gives: a Seatbelt profile denies named paths,
+    never an arbitrary temp name, and a key already written under a rolled-back home stays
+    readable whichever home is live now.
+
+    Only regular files are removed, judged by ``lstat`` through a pinned descriptor so a
+    link is never followed. A root that cannot be opened is skipped rather than escalated:
+    skipping removes the deletion hazard entirely, while refusing would fail every spawn on
+    a host whose layout is merely unusual. A file that matches and cannot be removed DOES
+    refuse the spawn, naming the path -- launching would hand the agent the signing key.
+    """
+    removed: list[str] = []
+    roots: list[str] = []
+    try:
+        roots.append(str(config_dir()))
+    except Exception:  # pragma: no cover - defensive; a spawn must not fail on this
+        logger.debug("could not resolve the crew data home for the auth-store sweep", exc_info=True)
+    try:
+        home = Path.home()
+        roots.extend(str(home / Path(prefix)) for prefix in _CREW_HOME_PREFIXES)
+    except Exception:  # pragma: no cover - defensive
+        logger.debug("could not resolve $HOME for the auth-store sweep", exc_info=True)
+    for root in dict.fromkeys(roots):
+        dir_fd = _open_dir_anchored(root, ())
+        if dir_fd is None:
+            continue
+        try:
+            for name in os.listdir(dir_fd):
+                if not name.startswith(_AUTH_STORE_LEGACY_TEMP_PREFIX) or not name.endswith(".tmp"):
+                    continue
+                candidate = os.path.join(root, name)
+                try:
+                    if not stat.S_ISREG(os.lstat(name, dir_fd=dir_fd).st_mode):
+                        continue
+                except OSError:
+                    continue
+                try:
+                    os.unlink(name, dir_fd=dir_fd)
+                except FileNotFoundError:
+                    continue
+                except OSError as exc:
+                    raise SandboxCeilingUnsealable(
+                        f"cannot remove the legacy auth-store staging temp {candidate}: "
+                        f"{exc}. A pre-upgrade publish staged it beside the signing key, so "
+                        "it can hold the key that signs every dashboard token at a name no "
+                        "mask covers. Launching anyway would leave it readable inside every "
+                        "agent namespace -- delete it and retry."
+                    ) from exc
+                logger.warning(
+                    "SECURITY: removed a legacy auth-store staging temp at %s. A "
+                    "pre-upgrade publish staged it beside the signing key, where no sandbox "
+                    "mask covers it, so it may have held the token-signing key in "
+                    "cleartext. Treat that key as exposed to anything that ran as this "
+                    "user; restart the gateway to mint a fresh one if in doubt.",
+                    candidate,
+                )
+                removed.append(candidate)
+        finally:
+            os.close(dir_fd)
+    return removed
 
 
 def _sweep_one_md_notebook_state_dir(root: str) -> list[str]:
@@ -7040,6 +7289,7 @@ def namespace_argv(
     # target, and this one is not Linux-specific: see the sweep's own docstring for why
     # the macOS path calls it too.
     _sweep_legacy_md_notebook_temps()
+    _sweep_legacy_auth_store_temps()
 
     script = _build_launcher_script(
         sandbox_level,
@@ -7931,6 +8181,7 @@ def sandbox_exec_argv(
     # stays on the namespace path — a Seatbelt deny is a path rule that holds for a name
     # that does not exist yet — but an orphan already on disk needs sweeping here too.
     _sweep_legacy_md_notebook_temps()
+    _sweep_legacy_auth_store_temps()
 
     profile = _build_seatbelt_profile(
         sandbox_level,

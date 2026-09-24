@@ -528,17 +528,19 @@ class TestTheDeliberateAliasExceptions:
             "SYMLINK" in r.getMessage() and ".env" in r.getMessage() for r in caplog.records
         ), "a tolerated symlink must still be reported"
 
-    def test_an_extra_hardlink_is_tolerated(self, crew_home, tmp_path, caplog):
+    def test_an_extra_hardlink_on_an_integrity_LEAF_is_tolerated(self, crew_home, tmp_path, caplog):
         """``rsync --link-dest`` and snapshot tools leave one on a healthy host.
 
-        A hardlink does not make the masked NAME replaceable, which is why the shape is
-        tolerated for every leaf rather than per leaf. It is WARNED, though: nothing else
-        warns over these leaves, so staying silent would leave the alias outside the mask
-        with nothing said about it.
+        Tolerated for a leaf masked so an agent cannot WRITE it: the write alias is real,
+        but its reader re-validates the content and a spawn-wide outage is not proportionate
+        to it. A leaf whose BYTES are a credential refuses instead --
+        ``TestAMaskedCredentialLeafRefusesASecondHardLink`` covers that side. It is WARNED
+        either way: nothing else warns over these leaves, so staying silent would leave the
+        alias outside the mask with nothing said about it.
         """
-        target = crew_home / "token_signing.key"
+        target = crew_home / "ops_mission_control_policy.json"
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(b"key")
+        target.write_text("{}\n", encoding="utf-8")
         alias = tmp_path / "backup-hardlink"
         os.link(target, alias)
         assert target.stat().st_nlink == 2
@@ -546,7 +548,7 @@ class TestTheDeliberateAliasExceptions:
         with caplog.at_level("WARNING"):
             sandbox._refuse_aliased_masked_leaves()  # does not raise
         assert any(
-            "hardlinks" in r.getMessage() and "token_signing.key" in r.getMessage()
+            "hardlinks" in r.getMessage() and "ops_mission_control_policy.json" in r.getMessage()
             for r in caplog.records
         ), "the tolerated shape must still be reported"
 
@@ -562,6 +564,205 @@ class TestTheDeliberateAliasExceptions:
 
         assert sorted(p.name for p in crew_home.iterdir()) == before
         assert not (crew_home / "ledgers").exists(), "the retired root must stay absent"
+
+
+#: Masked FILE leaves deliberately left on the warning side, listed rather than derived so
+#: the boundary is asserted from both directions: a leaf moved into
+#: ``_CREW_HARDLINK_REFUSED_LEAVES`` without a decision here fails the test below.
+#:
+#: Each is masked so an agent cannot WRITE it, and its reader re-validates the content:
+#: the Notes vault registry and sync settings (the app's backend re-reads both), the Ops
+#: Mission Control policy, the retired kiro-cli binary-trust file with no reader left, and
+#: the two browser mode leaves that carry a setting rather than a secret.
+_HARDLINK_TOLERATED_FILE_LEAVES: tuple[str, ...] = (
+    f"workspace/{sandbox.MD_NOTEBOOK_APP_NAME}/vaults.json",
+    f"workspace/{sandbox.MD_NOTEBOOK_APP_NAME}/settings.json",
+    "ops_mission_control_policy.json",
+    ".kiro_cli_binary_trust.json",
+    "browser-mode-enabled",
+    "browser-engine",
+)
+
+
+@_POSIX_ONLY
+class TestAMaskedCredentialLeafRefusesASecondHardLink:
+    """A mask binds a PATH, so a second name on the inode is an unmasked way to the bytes.
+
+    ``lstat`` on the masked name cannot see it, and the second name is readable AND
+    writable, so for a leaf whose bytes are a usable secret the spawn refuses -- the rule
+    ``_refuse_unless_sole_regular_link`` already applies to the live-target pointer.
+    """
+
+    @pytest.mark.parametrize("leaf", sorted(sandbox._CREW_HARDLINK_REFUSED_LEAVES))
+    def test_a_credential_leaf_with_a_second_name_refuses(self, crew_home, leaf):
+        target = crew_home / leaf
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"secret")
+        os.link(target, crew_home / f"alias-{leaf.replace('/', '-')}")
+        assert target.stat().st_nlink == 2
+
+        with pytest.raises(sandbox.SandboxCeilingUnsealable) as caught:
+            sandbox._refuse_aliased_masked_leaves()
+        assert "hard links" in str(caught.value)
+        assert os.path.basename(leaf) in str(caught.value)
+
+    @pytest.mark.parametrize("leaf", sorted(sandbox._CREW_HARDLINK_REFUSED_LEAVES))
+    def test_one_link_is_accepted(self, crew_home, leaf):
+        """The ordinary case must not refuse, or the rule is a blanket outage."""
+        target = crew_home / leaf
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"secret")
+        assert target.stat().st_nlink == 1
+
+        sandbox._refuse_aliased_masked_leaves()  # does not raise
+
+    def test_a_second_name_OUTSIDE_the_data_home_also_refuses(self, crew_home, tmp_path):
+        """The accepted cost, pinned so it is a decision and not a surprise.
+
+        ``st_nlink`` reports that a second name exists, not where it is, so a snapshot
+        tool's link outside the sandbox -- where it is harmless -- refuses too. Locating the
+        alias would remove this, and is recorded as the layered follow-up rather than done
+        here: it needs a per-spawn walk of an agent-writable tree whose skip and cap policy
+        can fail open. The escape hatch is the tolerated set; the doctor read below is what
+        stops this arriving as an unexplained outage.
+        """
+        target = crew_home / "token_signing.key"
+        target.write_bytes(b"key")
+        os.link(target, tmp_path / "rsnapshot-daily-0")
+
+        with pytest.raises(sandbox.SandboxCeilingUnsealable) as caught:
+            sandbox._refuse_aliased_masked_leaves()
+        assert "find" in str(caught.value), "the remedy must name how to locate the other name"
+
+    def test_the_channel_dotfile_keeps_its_symlink_tolerance(self, crew_home, tmp_path, caplog):
+        """``.env`` refuses a hard link and still tolerates a SYMLINK.
+
+        The two shapes get different answers on purpose: the tolerance exists for the layout
+        a dotfile manager produces, and chezmoi and stow produce a symlink or a copy, never a
+        hard link.
+        """
+        real = tmp_path / "dotfiles-env"
+        real.write_text("SLACK_BOT_TOKEN=x\n", encoding="utf-8")
+        link = crew_home / ".env"
+        link.symlink_to(real)
+
+        with caplog.at_level("WARNING"):
+            sandbox._refuse_aliased_masked_leaves()  # does not raise
+        assert any("SYMLINK" in r.getMessage() and ".env" in r.getMessage() for r in caplog.records)
+
+    @pytest.mark.parametrize("leaf", _HARDLINK_TOLERATED_FILE_LEAVES)
+    def test_an_integrity_file_leaf_stays_on_the_warning_side(self, crew_home, caplog, leaf):
+        """The residual, per leaf: a write alias to these is real and is not refused."""
+        assert leaf in sandbox._CREW_HIDDEN_LEAVES, f"{leaf} is not masked at all"
+        assert leaf not in sandbox._CREW_HARDLINK_REFUSED_LEAVES
+        target = crew_home / leaf
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("{}\n", encoding="utf-8")
+        os.link(target, crew_home / f"alias-{leaf.replace('/', '-')}")
+
+        with caplog.at_level("WARNING"):
+            sandbox._refuse_aliased_masked_leaves()  # does not raise
+        assert any("hardlinks" in r.getMessage() for r in caplog.records)
+
+    def test_a_DIRECTORY_leaf_is_outside_the_decision_by_shape(self, crew_home):
+        """No directory entry is needed, because ``link(2)`` refuses a directory."""
+        target = crew_home / "diag"
+        target.mkdir()
+        with pytest.raises(OSError):
+            os.link(target, crew_home / "diag-alias")
+
+    def test_the_refused_set_names_only_masked_leaves(self):
+        """An entry outside ``_CREW_HIDDEN_LEAVES`` would refuse over a path nothing masks.
+
+        A test rather than a module-level ``assert``, for the reason the tolerated set's own
+        invariant gives: ``python -O`` strips an assert.
+        """
+        stray = sorted(sandbox._CREW_HARDLINK_REFUSED_LEAVES - set(sandbox._CREW_HIDDEN_LEAVES))
+        assert not stray, f"refused on a hard link but not masked: {stray}"
+
+    def test_the_sqlite_sidecars_come_from_the_shared_suffix_constant(self):
+        """Re-listing the suffixes is how one gets forgotten when a fourth is added."""
+        from kiro_crew.identity_stores import AUTH_SQLITE_DB, AUTH_SQLITE_SIDECAR_SUFFIXES
+
+        for suffix in AUTH_SQLITE_SIDECAR_SUFFIXES:
+            assert f"{AUTH_SQLITE_DB}{suffix}" in sandbox._CREW_HARDLINK_REFUSED_LEAVES
+        assert AUTH_SQLITE_DB in sandbox._CREW_HARDLINK_REFUSED_LEAVES
+
+    def test_every_refused_leaf_states_its_reason(self):
+        """A bare entry is how an unexplained subset rots; each one is argued in the source.
+
+        Scoped to the contiguous ``#:`` block directly above the set, not the module: a
+        whole-module search passes for any leaf named anywhere earlier, which is every masked
+        leaf, so it would assert nothing.
+        """
+        source = inspect.getsource(sandbox)
+        before = source.split("_CREW_HARDLINK_REFUSED_LEAVES: frozenset")[0]
+        block = []
+        for line in reversed(before.splitlines()):
+            if line.startswith("#:") or line == "#:":
+                block.append(line)
+            elif block:
+                break
+        doc = "\n".join(block)
+        assert doc, "the refused set has no doc-comment block above it"
+        for leaf in sandbox._CREW_HARDLINK_REFUSED_LEAVES:
+            base = os.path.basename(leaf)
+            named = base in doc or leaf in doc
+            # The sqlite sidecars are argued as a group by their own entry, which names the
+            # store rather than each suffix -- a per-suffix sentence would restate the
+            # constant they are derived from.
+            grouped = base.startswith(sandbox.AUTH_SQLITE_DB) or base == "pat"
+            assert named or grouped, f"{leaf} refuses with no reason recorded beside it"
+
+
+@_POSIX_ONLY
+class TestTheDoctorReadOfMaskedCredentialAliases:
+    """The refusal must not be an operator's first notice, so doctor reads it pre-spawn.
+
+    Same answer the live-target pointer already gives for the same shape: a hard link on a
+    file in the home is ordinary snapshot-tool operation, so the condition appears without
+    anybody doing anything wrong and the first symptom is that agents stop starting.
+    """
+
+    def test_it_reports_the_aliased_leaf_and_its_link_count(self, crew_home):
+        target = crew_home / "token_signing.key"
+        target.write_bytes(b"key")
+        os.link(target, crew_home / "alias")
+
+        found = sandbox.masked_credential_leaf_aliases()
+
+        assert [(p, n) for p, n in found if p.endswith("token_signing.key")] == [(str(target), 2)]
+
+    def test_it_is_quiet_on_a_healthy_home(self, crew_home):
+        (crew_home / "token_signing.key").write_bytes(b"key")
+
+        assert sandbox.masked_credential_leaf_aliases() == []
+
+    def test_it_creates_nothing(self, crew_home):
+        before = sorted(p.name for p in crew_home.iterdir())
+
+        assert sandbox.masked_credential_leaf_aliases() == []
+        assert sorted(p.name for p in crew_home.iterdir()) == before
+
+    def test_it_reports_the_same_sentence_the_spawn_refuses_with(self, crew_home):
+        """One diagnosis, not two: the operator reads the launcher's own words."""
+        target = crew_home / "token_signing.key"
+        target.write_bytes(b"key")
+        os.link(target, crew_home / "alias")
+
+        [(path, links)] = sandbox.masked_credential_leaf_aliases()
+        with pytest.raises(sandbox.SandboxCeilingUnsealable) as caught:
+            sandbox._refuse_aliased_masked_leaves()
+
+        assert sandbox._masked_leaf_multilink_detail(path, links) == str(caught.value)
+
+    def test_an_unresolvable_data_home_reports_nothing_rather_than_a_fault(self, monkeypatch):
+        """Doctor must not turn its own probe failure into a verdict about the host."""
+        monkeypatch.setattr(
+            sandbox, "config_dir", lambda: (_ for _ in ()).throw(RuntimeError("no home"))
+        )
+
+        assert sandbox.masked_credential_leaf_aliases() == []
 
     def test_an_unresolvable_data_home_refuses(self, monkeypatch):
         """Fail CLOSED, like every other reason on this path."""
@@ -1366,3 +1567,155 @@ class TestASymlinkMaskableLeafRefusesTheSpawn:
         # Must not raise: a real directory won the race.
         sandbox._materialize_maskable_dirs()
         assert target.is_dir() and not target.is_symlink()
+
+
+class TestTheAuthStoreStagingLeafIsSpelledOnceInEffect:
+    """The staging directory's name is written in three modules and must not drift.
+
+    ``sandbox`` masks and precreates it, ``security.paths`` fences it, and
+    ``dashboard.token_secret`` stages in it. Each spells the literal rather than
+    importing, deliberately -- ``token_secret`` and ``security.paths`` stay off the
+    ``sandbox`` import chain, the same trade ``service.live_target`` makes for
+    ``live-target-staging``. The cost of that choice is paid here: a rename in one module
+    that misses another silently leaves the temp unmasked or unfenced, which is the whole
+    exposure, so the equality is asserted instead of assumed.
+    """
+
+    def test_the_three_spellings_agree(self):
+        from kiro_crew.dashboard import token_secret as ts
+
+        assert sandbox._AUTH_STORE_STAGING_LEAF == ts._AUTH_STORE_STAGING_LEAF, (
+            "the sandbox masks one directory name and the publisher stages in another, "
+            "so the in-flight signing key is visible in every agent namespace"
+        )
+
+    def test_the_fence_names_the_same_directory(self):
+        from kiro_crew import security
+
+        assert any(
+            leaf == sandbox._AUTH_STORE_STAGING_LEAF for leaf in security.sensitive_home_dirs()
+        ) or any(
+            leaf.endswith("/" + sandbox._AUTH_STORE_STAGING_LEAF)
+            for leaf in security.sensitive_home_dirs()
+        ), (
+            "the staging directory is masked but not fenced, so the agent file tools can "
+            "still read a staged copy of the signing key"
+        )
+
+    def test_it_is_both_masked_and_precreated(self):
+        assert sandbox._AUTH_STORE_STAGING_LEAF in sandbox._CREW_HIDDEN_LEAVES
+        # Precreation is not cosmetic: a sandbox spawned before the first key write would
+        # otherwise find the directory absent, the mask loop would skip it, and the
+        # directory the gateway creates later would appear INSIDE that running namespace.
+        assert sandbox._AUTH_STORE_STAGING_LEAF in sandbox._CREW_PRECREATE_HIDDEN_DIR_LEAVES
+
+
+class TestTheLegacyAuthStoreTempSweep:
+    """Pre-upgrade signing-key temps in the data-home root are removed on spawn.
+
+    The bound is the interesting half. The md-notebook sweep may take every ``*.tmp`` in
+    its own directory because nothing else writes there; the data home root is shared, and
+    ``atomic_write`` stages ``tmp<random>.tmp`` in it for unrelated stores. So the control
+    test below -- an unrelated temp SURVIVES -- is what proves this sweep cannot unlink
+    another component's in-flight write between its ``mkstemp`` and its rename.
+    """
+
+    @pytest.fixture
+    def isolated_home(self, crew_home, monkeypatch, tmp_path):
+        """Keep the sweep's ``Path.home()`` arm inside the scratch tree.
+
+        The sweep deliberately visits both crew-home spellings under ``$HOME`` as well as
+        the live data home, so without this the test would reach the developer's real home.
+        """
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+        return crew_home
+
+    def _orphan(self, home: Path) -> Path:
+        return home / f"{sandbox._AUTH_STORE_LEGACY_TEMP_PREFIX}4242.deadbeefcafe0123.tmp"
+
+    def test_it_removes_a_signing_key_staging_orphan(self, isolated_home):
+        orphan = self._orphan(isolated_home)
+        orphan.write_bytes(b"k" * 32)
+
+        removed = sandbox._sweep_legacy_auth_store_temps()
+
+        assert not orphan.exists(), (
+            "a pre-upgrade staged copy of the signing key survived the sweep, so it stays "
+            "readable in every agent namespace"
+        )
+        assert str(orphan) in removed
+
+    def test_it_leaves_an_unrelated_atomic_write_temp_alone(self, isolated_home):
+        # atomic_write's own shape for ANY other store in this shared directory.
+        bystander = isolated_home / "tmpa1b2c3d4.tmp"
+        bystander.write_bytes(b"another store's in-flight write")
+
+        removed = sandbox._sweep_legacy_auth_store_temps()
+
+        assert bystander.exists(), (
+            "the sweep unlinked a temp belonging to another store; in the shared data "
+            "home that aborts an unrelated in-flight write for no reason"
+        )
+        assert removed == []
+
+    def test_it_leaves_the_published_key_alone(self, isolated_home):
+        key = isolated_home / "token_signing.key"
+        key.write_bytes(b"k" * 32)
+
+        sandbox._sweep_legacy_auth_store_temps()
+
+        assert key.exists(), "the sweep removed the live signing key"
+
+    @_POSIX_ONLY
+    def test_a_symlink_matching_the_shape_is_not_followed(self, isolated_home, tmp_path):
+        target = tmp_path / "outside-the-home"
+        target.write_bytes(b"not ours")
+        link = self._orphan(isolated_home)
+        link.symlink_to(target)
+
+        removed = sandbox._sweep_legacy_auth_store_temps()
+
+        assert target.exists(), "the sweep followed a link and deleted outside the home"
+        assert removed == []
+        assert link.is_symlink(), "the link itself was removed, which lstat should prevent"
+
+    def test_the_prefix_matches_the_name_the_publisher_really_stages(self, tmp_path, monkeypatch):
+        """Pin the sweep's pattern against the publisher's actual output, not a literal.
+
+        A rename on either side otherwise leaves the sweep matching a shape nothing
+        produces, which reads exactly like a clean home.
+        """
+        from kiro_crew.dashboard import token_secret as ts
+
+        captured: list[str] = []
+        real_link = os.link
+
+        def _spy_link(src_path, dst_path, **kwargs):
+            captured.append(os.path.basename(str(src_path)))
+            return real_link(src_path, dst_path, **kwargs)
+
+        monkeypatch.setattr("kiro_crew.config.loader.config_dir", lambda: tmp_path)
+        monkeypatch.setattr(os, "link", _spy_link)
+        ts._load_or_create_secret()
+
+        assert captured, "the publish never linked, so no staged name was observed"
+        staged_name = captured[0]
+        assert staged_name.startswith(sandbox._AUTH_STORE_LEGACY_TEMP_PREFIX), (
+            f"the publisher stages {staged_name!r}, which the sweep's prefix "
+            f"{sandbox._AUTH_STORE_LEGACY_TEMP_PREFIX!r} does not match, so a pre-upgrade "
+            "orphan of that shape would never be found"
+        )
+        assert staged_name.endswith(".tmp")
+
+    def test_both_launch_paths_sweep(self):
+        """Both launchers must call it: a Seatbelt profile names paths, never a temp shape.
+
+        Asserted against the real sources, so a launcher added or reordered later cannot
+        quietly drop the sweep on one platform.
+        """
+        for fn in (sandbox.namespace_argv, sandbox.sandbox_exec_argv):
+            src = inspect.getsource(fn)
+            assert "_sweep_legacy_auth_store_temps()" in src, (
+                f"{fn.__name__} does not sweep legacy auth-store temps, so an orphan "
+                "holding the signing key stays readable on that platform"
+            )

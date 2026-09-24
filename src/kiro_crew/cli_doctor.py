@@ -2563,6 +2563,64 @@ def _doctor_live_target_pointer(issues: list[str]) -> None:
         )
 
 
+def _doctor_masked_credential_aliases(issues: list[str]) -> None:
+    """Report a masked credential leaf that will refuse the next agent spawn.
+
+    The same job :func:`_doctor_live_target_pointer` does for the live-target pointer, for
+    the same shape on the leaves whose bytes are a credential: ``sandbox`` refuses a spawn
+    when one of them has a second hard link, because a mask binds a path and the second name
+    reaches the same bytes unmasked. A hard link on a file in the home is ordinary operation
+    for ``cp -al``, rsnapshot and other hard-link snapshot tools, so the condition appears
+    without anybody doing anything wrong and the first symptom is that agents stop starting.
+
+    Linux only, for the reason that section gives: the refusal is on the namespace
+    launcher's path, and a macOS Seatbelt profile denies by path rule without a mount
+    target, so naming it there would report an outage that will not happen.
+
+    The sentence is the launcher's own, not a paraphrase, so an operator who reads this line
+    and later meets the refusal reads one diagnosis rather than two.
+    """
+    if not sys.platform.startswith("linux"):
+        return
+    try:
+        aliased = sandbox.masked_credential_leaf_aliases()
+    except Exception as exc:  # noqa: BLE001 — doctor must survive a broken probe
+        print("\nMasked Credential Leaves")
+        print(f"  aliases:     ⚠️  could not check ({_safe_display(exc)})")
+        return
+    if not aliased:
+        return
+    # ``credential_mask_applies`` rather than a mode comparison of this module's own, for
+    # the reason the pointer's section states: it counts BOTH unwrapped outcomes, so a host
+    # that hands the command over unwrapped is not told it is about to lose every spawn.
+    try:
+        confined = sandbox.credential_mask_applies(sandbox.configured_sandbox_mode())
+    except Exception:  # noqa: BLE001 — an unreadable mode must not hide the leaf
+        confined = True
+    print("\nMasked Credential Leaves")
+    for path, links in aliased:
+        if confined:
+            print(f"  alias:       ❌ agent spawns will be REFUSED — {path} ({links} links)")
+        else:
+            print(f"  alias:       ⚠️  will refuse spawns once confined — {path} ({links} links)")
+        # Whole tokens: the remedy names a path and a ``find`` invocation the operator
+        # copies, and the default wrap splits both.
+        _print_wrapped(sandbox._masked_leaf_multilink_detail(path, links))
+    if confined:
+        _print_wrapped(
+            "Until this is fixed every agent spawn on this host fails closed, and the "
+            "only other notice is a warning in the gateway log."
+        )
+        issues.append("masked credential leaf alias")
+    else:
+        _print_wrapped(
+            "This is not what stops a spawn on this host yet: the launcher reaches the "
+            "mask only when it WRAPS a child, and this host hands the command over "
+            "unwrapped or refuses it for a different reason. Remove the extra link before "
+            "the host starts confining spawns, or the first one that does fails closed."
+        )
+
+
 def _linger_enabled(user: str) -> bool | None:
     """Whether ``user``'s systemd instance lingers past logout.
 
@@ -4546,6 +4604,7 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
     # who just read the backend verdict is the one who needs to know a spawn will be
     # refused for a reason the backend line cannot express.
     _doctor_live_target_pointer(issues)
+    _doctor_masked_credential_aliases(issues)
 
     # ── Memory pressure preparedness (swap / userspace OOM killer) ──
     _doctor_memory_pressure(issues)
