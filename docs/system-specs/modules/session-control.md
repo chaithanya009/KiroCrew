@@ -42,6 +42,44 @@ text. The re-check is not specific to this module — a human-typed message into
 busy session drains through the same path — which is why it lives at the drain
 rather than in each caller (#5911).
 
+**A dropped queued delivery is reported to its SENDER, not only its target.**
+`session_send` answers `started: false` when a busy target queues the message,
+which on its own says the message will run later; every signal of a later drop —
+the retracted queue card, the visible notice, the broadcast — lands on the
+target's transcript, which the sender does not read. So the queue entry also
+carries the sending slot (`send_origin_meta`, stamped at admission beside the
+containment snapshot), and the drop appends a notice to the sender's own
+transcript naming the target, the constraint that changed and an excerpt of the
+dropped text (`notify_send_origin_dropped`); the SEL row names the sender as the
+drop's `origin`. The stamp rides `meta` rather than a consumption callback
+because `meta` is one of the keys a queued prompt is persisted with while a
+callback-carrying entry is excluded from that write, so a callback would trade
+the relay's survival across a restart for a notice that cannot survive one
+either. A requeued steer keeps the stamp because the requeue copies the
+admission dict onto the new entry's meta. Four cases deliberately produce no
+notice: a human-typed entry carries no sender; a session that queued onto itself
+already reads the target's own notice; a sender closed while the message waited
+has no transcript left, and the SEL row is what keeps that outcome recoverable;
+and a structurally exempt entry is never dropped at all. The report is
+best-effort and does not gate the drop — withholding the message is the
+authorization decision, and it must not depend on the notice landing.
+
+**The stamp names a session, not a key, and does not survive a restart.** It
+carries the sender's `_tab_id` beside its slot key and is omitted unless both are
+present, because a slot key does not identify a session: a plain
+`get_or_create_slot(name)` mints a fresh slot object on a free key and the
+explicitly-named keys are deterministic (`cron-{job.id}`, `workflow-{run_id}`, a
+channel's own), so a closed sender's key is handed to the next occupant, whose
+link scope and audience are declared per creation. The notice therefore requires
+the live slot's tab to equal the stamped one and otherwise treats the sender as
+gone, which it is. `sanitize_restored_queue` strips the whole stamp, joining the
+containment snapshot and the turn actor: those are read, but this one names a
+WRITE TARGET, so a stamp carried back off the metadata line would append the
+entry's own text to a session the editor does not own, with nothing that retracts
+it. A delivery that outlives a restart and is then dropped reports to nobody while
+the delivery itself still survives, which is the price of the stamp living in
+`meta`.
+
 **`steer: true` asks for a third outcome on a busy target.** Instead of waiting
 for the running turn, the message cuts into it (`steer_into_running_turn`, the
 same path the dashboard composer's mid-turn steer uses), so a caller watching a

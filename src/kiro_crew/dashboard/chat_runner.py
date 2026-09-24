@@ -7269,6 +7269,17 @@ def _drop_stale_admissions(state: DashboardState, slot: _ChatSlot) -> None:
     is never silent: the queue card is retracted, a visible notice naming the
     changed constraint lands in the transcript, and the drop is written to the
     SEL.
+
+    A CROSS-SESSION delivery is reported in both directions. The entry carries
+    the sending session as a slot key plus that slot's tab identity
+    (`session_control.send_origin_meta`, stamped at admission beside the
+    containment snapshot), so the sender gets its own notice naming
+    the target and the changed constraint
+    (`session_control.notify_send_origin_dropped`) and the SEL row names it as
+    the drop's origin. Without that the sender's last word on the message is the
+    `started: False` receipt it got when the target queued it, and the outcome it
+    most needs — the message will never run — would reach only the target's
+    transcript. A human-typed entry carries no stamp and is unaffected.
     """
     if not slot._queue:
         return
@@ -7313,7 +7324,32 @@ def _drop_stale_admissions(state: DashboardState, slot: _ChatSlot) -> None:
             + " after it was queued, so the authorization that admitted it no longer holds.",
             "msg msg-info",
         )
-        _sc.audit_queued_drop(slot, q["id"], changed)
+        # A cross-session delivery has a SENDER waiting on it, and the notice
+        # above is on the target's transcript, which that sender does not read.
+        # It was told at admission that the message was queued, so without this
+        # the one outcome it most needs — the message will never run — is the one
+        # it is never told. Read off the entry's own stamp, which is empty for a
+        # human-typed entry and for an entry restored after a restart: the
+        # restore path strips the stamp deliberately, because it names a write
+        # target and the metadata line is editable, so a delivery that outlives a
+        # restart is dropped without a report rather than reported to whoever an
+        # edited stamp named.
+        #
+        # The stamp's TAB identity rides along so the notice can only reach the
+        # slot object that sent the message. Named slot keys are reused, and the
+        # notifier refuses a key whose current occupant is a different tab.
+        _meta = q.get("meta")
+        _origin = _sc.send_origin_slot(_meta)
+        _sc.notify_send_origin_dropped(
+            state,
+            origin=_origin,
+            origin_tab=_sc.send_origin_tab(_meta),
+            target_slot=slot,
+            text=q.get("content") or "",
+            constraints=changed,
+            mirror_unverified=_mirror_unverified,
+        )
+        _sc.audit_queued_drop(slot, q["id"], changed, origin=_origin)
         _log = logger.warning if _mirror_unverified and "mirrored" in changed else logger.info
         _log(
             "Dropped queued entry %s for slot %s at drain re-validation " "(newly held: %s%s)",

@@ -4506,6 +4506,8 @@ class _ChatSlot:
         prompt: str,
         run_chat_coro: Callable[[DashboardState, _ChatSlot, str], Coroutine[Any, Any, None]],
         state: DashboardState,
+        *,
+        extra_meta: dict[str, Any] | None = None,
     ) -> bool:
         """Queue *prompt* if busy, otherwise start an agent turn.
 
@@ -4516,6 +4518,15 @@ class _ChatSlot:
         Returns ``True`` if the prompt started an agent turn, ``False`` if
         it was queued. Lets callers gate UI-visible side-effects (notifications,
         SSE pushes) on whether the prompt actually ran.
+
+        *extra_meta* is merged onto the queued entry's ``meta`` beside the
+        containment stamp, for a producer that must record something about the
+        ADMISSION for the drain to read later -- ``session_control.send_to_target``
+        stamps the sending session there (``send_origin_meta``) so a drop can be
+        reported back to it. Ignored on the run arm: a prompt that starts its turn
+        immediately has no queue entry and no later drain to tell anything to. The
+        containment keys win a collision, since the drain's own authorization
+        decision must not be overwritable by a caller's extra fields.
 
         Busy is ``running or _in_stage_execution``, not ``running`` alone. A
         multi-stage plan closes each stage's own turn before opening the next, so
@@ -4549,7 +4560,13 @@ class _ChatSlot:
             # queue drain can re-assert them at delivery: a target
             # that gains a channel/mirror link while this prompt waits must not
             # execute it under the weaker constraints that admitted it.
-            self.queue_append(prompt, meta=containment_meta(state, self))
+            #
+            # *extra_meta* rides alongside, applied FIRST so the containment keys
+            # win a collision: a caller's extra fields are descriptive, and the
+            # drain's authorization input must not be replaceable from here.
+            _meta: dict[str, Any] = dict(extra_meta or {})
+            _meta.update(containment_meta(state, self))
+            self.queue_append(prompt, meta=_meta)
             # Returning False IS the receipt that the prompt was accepted onto the
             # queue, and until the drain writes its transcript row the queue is the
             # prompt's only record -- so a restart inside the periodic flush
