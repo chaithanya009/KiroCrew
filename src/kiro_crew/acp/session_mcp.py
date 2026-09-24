@@ -335,7 +335,9 @@ def _project_spec_path_for(agent: str, work_dir: str | Path | None) -> Path | No
     if not work_dir:
         return None
     try:
-        for spec in project_agent_files(work_dir):
+        for spec in project_agent_files(
+            work_dir, operation="session_mcp_project_agent", source="unknown"
+        ):
             if project_agent_name(spec) == agent:
                 return spec
     except OSError:

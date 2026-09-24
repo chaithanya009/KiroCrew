@@ -423,6 +423,25 @@ in the child's environment AND on that errno). Everything else, including the
 gateway's own spawns and any other audit failure, keeps the log-and-proceed
 posture above. `test_sandbox_cron_child_audit.py` pins both halves.
 
+The converse rule covers refusals, and it runs the other way: **a denial's audit
+is best-effort**. Once a guard has refused -- a sensitive canonical target, a
+project directory inside a protected tree -- the refusal already stands on its
+own, so a failed SEL write must never be allowed to turn it into permission.
+Denial sites therefore pass no `critical=True` and degrade to a WARNING naming
+the operation, because for some surfaces the refusal is the process's first SEL
+use and an unwritable log would otherwise abort the caller on exactly the hostile
+path the guard exists to handle. `agent_discovery._audit_denied` is the pattern;
+`test_agent_spec_hardened_reads.py` pins that every denial path in that module
+keeps its never-raise promise under a broken SEL.
+
+Best-effort does not excuse the row's absence when SEL is healthy, which is the
+other half of the rule. Every refusal path emits one, and the caller names itself
+through `operation`/`source` so the trail attributes the probe to the request
+that made it rather than to the helper that caught it; a call-site ratchet
+enumerates those labels so a new caller cannot land silently behind the callee's
+defaults. A refusal that emits no audit call at all is the defect this rule
+names. A refusal whose audit call failed is the rule working.
+
 ## Governance: the enterprise ceiling
 
 Governance is a second, orthogonal axis to the layers above:

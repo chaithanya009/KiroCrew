@@ -1097,7 +1097,9 @@ def _get_agent_for_session(session_key: str) -> str:
     return _thread_agents.get(session_key) or _get_default_agent()
 
 
-def _discover_project_agents(project_dir: str | None) -> list[Path]:
+def _discover_project_agents(
+    project_dir: str | None, *, operation: str = "slack_project_agents"
+) -> list[Path]:
     """Return agent JSON files from <project_dir>/.kiro/ and .kiro/agents/.
 
     Delegates to :func:`agent_discovery.project_agent_files`, the one implementation
@@ -1106,8 +1108,14 @@ def _discover_project_agents(project_dir: str | None) -> list[Path]:
     ``*.agent-spec.json`` convention predates ``.kiro/agents/`` and is kept for
     continuity, but kiro-cli cannot activate such a name, so no dispatch surface may
     offer it.
+
+    *operation* names the Slack request whose scan this is, so a sensitive-project-dir
+    denial is attributed to the listing or the name resolution rather than to this
+    shared helper. The channel is fixed: every route here is Slack.
     """
-    return project_agent_files(project_dir, include_legacy=True)
+    return project_agent_files(
+        project_dir, include_legacy=True, operation=operation, source="slack"
+    )
 
 
 def _resolve_agent_name(name: str, project_dir: str | None = None) -> str | None:
@@ -1122,7 +1130,7 @@ def _resolve_agent_name(name: str, project_dir: str | None = None) -> str | None
     # but reading every spec to compare its declared name would still make a
     # checkout with many agents or slow storage slow to answer. At most the one
     # matching file is read, to return the name it declares.
-    for spec in _discover_project_agents(project_dir):
+    for spec in _discover_project_agents(project_dir, operation="slack_resolve_agent"):
         stem = spec.stem.removesuffix(".agent-spec")
         if stem != name and spec.stem != name:
             continue
@@ -2313,7 +2321,9 @@ async def _handle_slash_command(
         await sessions.remove(session_key)
         # Discover project-local agents: a directory listing of the checkout,
         # so off the loop like the metadata write above.
-        project_agents = await asyncio.to_thread(_discover_project_agents, resolved)
+        project_agents = await asyncio.to_thread(
+            _discover_project_agents, resolved, operation="slack_list_agents"
+        )
         agent_info = ""
         if project_agents:
             names = ", ".join(

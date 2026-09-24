@@ -3805,7 +3805,9 @@ def markdown_spec_for_agent(agent: str, work_dir: str | Path | None = None) -> P
     project_markdown: Path | None = None
     try:
         if work_dir:
-            for spec in project_agent_files(work_dir):
+            for spec in project_agent_files(
+                work_dir, operation="markdown_spec_lookup", source="unknown"
+            ):
                 if project_agent_name(spec) != agent:
                     continue
                 if not is_markdown_spec(spec):
@@ -8809,7 +8811,9 @@ def _project_shadow_of(
     if not work_dir:
         return None
     try:
-        for spec in project_agent_files(work_dir):
+        for spec in project_agent_files(
+            work_dir, operation="agent_project_shadow", source="unknown"
+        ):
             if not markdown_specs and is_markdown_spec(spec):
                 continue
             if dispatchable_only:

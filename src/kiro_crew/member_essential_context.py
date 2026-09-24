@@ -284,7 +284,9 @@ def resolve_template_path(template: str, project: str | None = None) -> Path | N
         admitted = validate_file_path(project)
         if admitted is None:
             raise MemberEssentialContextError(f"Essential project {project}: cannot be read safely")
-        for path in project_agent_files(Path(admitted)):
+        for path in project_agent_files(
+            Path(admitted), operation="member_essentials", source="context"
+        ):
             spec = _read_agent_spec(path, operation="member_essentials", source="context")
             if spec is None and path.stem == template:
                 raise MemberEssentialContextError(
