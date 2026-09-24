@@ -3,12 +3,14 @@
 **Local page, not a mirror.** Part of the [crew log reference](README.md), which is
 marked as a named exception in [the Reference index](../README.md).
 
-> **No crew emitter exists.** The families and the two contracts on this page are
-> the specified shape a crew writer must produce. The `crew/dispatch` and
-> `crew/report` contracts are defined here and in
-> [`crew-log-core.md`](../../system-specs/modules/crew-log-core.md); a validator that
-> refuses a malformed one is pending. Treat every field rule below as the
-> agreement, not as something the code enforces today.
+> **No crew emitter exists yet.** The families on this page are the specified
+> shape a crew writer must produce, and most of them are still only that. The two
+> contracts are narrower: `crew/dispatch` and `crew/report` are declared in
+> `kiro_crew.crew_log.entry_types` as `CREW_ENTRY_TYPES`, and the append path
+> checks every entry of those two types against the declaration, so a malformed
+> one is refused with [`bad_data_field`](errors.md#bad_data_field) rather than
+> written. A field rule under any OTHER family is the agreement, not something
+> the code enforces.
 
 A crew's log uses the same file layout, the same header rules and the same eight
 envelope fields as a session's log — [envelope.md](envelope.md) covers all of
@@ -126,7 +128,7 @@ A dispatched party reported back on one work item.
 | Field | Type | Required | Meaning | Enum |
 |---|---|---|---|---|
 | `item` | string | required | The work item's id, matching the dispatch. | |
-| `status` | string | required | Where the item stands. | `done`, `blocked`, `failed`, `progress` |
+| `status` | string | required | Where the item stands. | `done`, `blocked`, `failed`, `progress`, `question` |
 | `credits` | number | optional | What the work cost. | |
 | `summary` | string | optional | What was done. | |
 
@@ -141,6 +143,15 @@ constrains the envelope as well as `data`:
 
 **Invariants** — A report without a `ref` is invalid. `status: "progress"` may
 appear several times for one dispatch; a terminal status appears once.
+
+**Where the status vocabulary comes from** — The enum is the four statuses this
+page names plus every status the conductor work board's worker half can commit,
+read off that writer's own tuple (`work_vocab.WORK_WORKER_STATUSES`) rather than
+restated. A closed enum narrower than its writer would turn a status the board
+gains into a refused entry counted as a write loss, which destroys a record
+instead of catching a mistake. `question` is therefore carried under its own name
+rather than folded into `blocked`: the two differ by WHICH party must act, and a
+conductor reading the fold acts on that difference.
 
 ```json
 {"type":"crew/report","seq":58,"time":1789000004000,"src":"crew:qa","thread":41,"ref":{"unit":"session","id":"s-7f3a","from":12,"to":40},"data":{"item":"WI-4","status":"done","credits":1.42,"summary":"six pages and a test"}}

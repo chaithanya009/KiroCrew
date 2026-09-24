@@ -98,7 +98,7 @@ The families, from the RFC:
 | knowledge | `crew/finding`, `crew/summary`, `crew/note-*`, `crew/link` | the segment covered |
 | memory | `memory/bound\|copied\|forgotten\|restored` | -- |
 
-Two of these families carry a contract with REQUIRED fields. **Required here is a contract on the writer, and what enforces it is a declaration rather than a branch:** a per-type `data` requirement belongs to the type registry, next to that type's own `data` shape, not to `check_ownership`, which answers who may write a type rather than what the type must contain. `kiro_crew.crew_log.entry_types` now declares and enforces the session kind only; these two crew-kind contracts remain held by review against this section until that module's `ENTRY_TYPES` registry gains crew declarations.
+Two of these families carry a contract with REQUIRED fields. **Required here is a contract on the writer, and what enforces it is a declaration rather than a branch:** a per-type `data` requirement belongs to the type registry, next to that type's own `data` shape, not to `check_ownership`, which answers who may write a type rather than what the type must contain. `kiro_crew.crew_log.entry_types` declares both kinds: `SESSION_ENTRY_TYPES` for the session families and `CREW_ENTRY_TYPES` for these two contracts, keyed into `ENTRY_TYPES` by kind, so `validate_data` answers for the unit the entry is being written into and a crew's `data` is checked on the same append path a session's is. What the registry cannot state stays a writer's obligation: a CONDITIONAL requirement has no spelling in a declaration, so `target`'s exclusive `slot`-or-`name` pairing and `crew/report`'s required `ref` are enforced where the entry is built, and a field one legitimate form omits is declared optional rather than refusing a valid entry.
 
 **`crew/dispatch`** -- a parent asking for an item to be worked.
 
@@ -126,7 +126,7 @@ Two of these families carry a contract with REQUIRED fields. **Required here is 
 | Field | Required | Meaning |
 |---|---|---|
 | `data.item` | yes | The item being reported on. |
-| `data.status` | yes | One of `done`, `blocked`, `failed`, `progress`. |
+| `data.status` | yes | One of `done`, `blocked`, `failed`, `progress`, `question`. The last is the work board's, and the enum is derived from that writer's own tuple so a status it gains cannot become a refused entry; [crew-types.md](../../reference/crew-log/crew-types.md#crewreport) states why `question` is not folded into `blocked`. |
 | `data.credits` | no | Credits the child spent. Absent is not zero. |
 | `data.summary` | no | One sentence. |
 | `ref` | yes | A segment of the child's crew log: the evidence. |

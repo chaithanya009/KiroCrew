@@ -10,8 +10,8 @@ in a spec table describing it, and two statements of one fact drift.
 below is read off the site that produces it (:mod:`kiro_crew.crew_log.emit`
 for the ordinary entries, ``store._closer_entries`` for the crash-repair closers).
 A type earns a declaration by having a writer, so the types declared here are
-exactly the session types something writes today, whether or not the writer marks
-the entry ignorable. An ignorable write is not exempt: a folding reader SKIPS an
+exactly the types something writes today, whether or not the writer marks the
+entry ignorable. An ignorable write is not exempt: a folding reader SKIPS an
 undeclared ignorable entry, a skip is a gap in the sequence the fold receives, and
 the class fold reads a gap as damage. So ``plan/updated`` is declared like the
 rest, and its write keeps ``ignorable=True`` untouched. A type nothing writes at
@@ -52,10 +52,11 @@ because enforcing them converts "the upstream vocabulary grew" into "the entry i
 refused and counted as a write loss" -- the registry would then destroy records
 instead of catching mistakes.
 
-Types with no declaration pass through untouched. That is what keeps the crew
-crew log, whose own type families have no emitter, and every guest namespace
-(``crew:<name>/…``, ``app:<name>/…``) writable while this covers the session
-families that are written today.
+Types with no declaration pass through untouched. Two kinds are declared here --
+the session families and the crew kind's two dispatch contracts -- and everything
+else is left open on purpose: the crew kind's other six domains, the member
+kind's whole vocabulary (owned by the member event log), and every guest
+namespace (``app:<name>/…``) are writable without a registry entry.
 """
 
 from __future__ import annotations
@@ -66,7 +67,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from kiro_crew.crew_log.errors import CODE_BAD_DATA_FIELD, CrewLogError
-from kiro_crew.crew_log.schema import KIND_SESSION
+from kiro_crew.crew_log.schema import KIND_CREW, KIND_SESSION
 
 # The ledger subsystem owns the event vocabulary its own writer clamps to, so the
 # declaration below reads it from there instead of restating it. Importing the
@@ -1686,10 +1687,118 @@ _SESSION_TYPES: tuple[EntryType, ...] = (
 #: The session types that have a writer. Keyed by ``type`` for the append path.
 SESSION_ENTRY_TYPES: dict[str, EntryType] = {item.type: item for item in _SESSION_TYPES}
 
+#: Which sort of party a dispatch went to. Closed: the writer builds the object,
+#: so no caller can produce a third kind.
+CREW_TARGET_KINDS: tuple[str, ...] = ("session", "crew")
+
+#: The statuses the crew kind's own spec names for a report.
+_SPEC_REPORT_STATUSES: tuple[str, ...] = ("done", "blocked", "failed", "progress")
+
+#: What a ``crew/report`` may say about an item: the spec's four, plus every
+#: status the work ledger's worker half can commit. Derived from that writer's
+#: own vocabulary rather than restated, because it is the one producer of this
+#: type: a closed enum narrower than its writer turns "the ledger gained a
+#: status" into a refused entry counted as a write loss, which is the posture
+#: this module's docstring rejects. ``question`` reaches the log under its own
+#: name rather than folded into ``blocked``: the two differ by WHICH party must
+#: act, and a conductor reading the fold acts on that difference.
+CREW_REPORT_STATUSES: tuple[str, ...] = _SPEC_REPORT_STATUSES + tuple(
+    value for value in WORK_WORKER_STATUSES if value not in _SPEC_REPORT_STATUSES
+)
+
+#: The crew kind's declared types: the dispatch contract and the report contract.
+#: Only these two, because only these two have a writer -- the same rule the
+#: session table follows. The other six crew domains
+#: (``member``, ``activity``, ``slot``, ``patrol``, ``message``, ``memory``) and
+#: the remaining ``crew``/``item`` actions stay undeclared and pass through, so a
+#: guest app and a future family are writable without a registry change.
+_CREW_TYPES: tuple[EntryType, ...] = (
+    EntryType(
+        type="crew/dispatch",
+        summary="A crew handed one work item to a target.",
+        fields=(
+            Field("item", JSON_STRING, required=True, note="The work item's id."),
+            Field(
+                "target",
+                JSON_OBJECT,
+                required=True,
+                fields=(
+                    Field(
+                        "kind",
+                        JSON_STRING,
+                        required=True,
+                        enum=CREW_TARGET_KINDS,
+                        enum_closed=True,
+                        note="Which sort of target this item went to.",
+                    ),
+                    Field(
+                        "slot",
+                        JSON_STRING,
+                        note="The slot key, carried when the target is a session.",
+                    ),
+                    Field(
+                        "name",
+                        JSON_STRING,
+                        note="The crew name, carried when the target is a crew.",
+                    ),
+                ),
+                note="Who the item went to. A dispatch with no target names nobody.",
+            ),
+            Field("brief", JSON_STRING, note="The brief handed over."),
+        ),
+        note=(
+            "The opener of the dispatch family: one or more reports thread onto its "
+            "seq. Two invariants the declaration cannot state are the writer's and "
+            "are enforced where the entry is built -- ``target.kind`` decides which "
+            "of ``slot`` or ``name`` is carried, and the two forms are exclusive, so "
+            "a target names a session slot or a crew and never both. A conditional "
+            "requirement has no spelling here, and a field marked required that one "
+            "legitimate form omits would refuse a valid dispatch."
+        ),
+    ),
+    EntryType(
+        type="crew/report",
+        summary="A dispatched party reported back on one work item.",
+        fields=(
+            Field(
+                "item",
+                JSON_STRING,
+                required=True,
+                note="The work item's id, matching the dispatch.",
+            ),
+            Field(
+                "status",
+                JSON_STRING,
+                required=True,
+                enum=CREW_REPORT_STATUSES,
+                enum_closed=True,
+                note="Where the item stands.",
+            ),
+            Field("credits", JSON_FLOAT, note="What the work cost. Absent is not zero."),
+            Field("summary", JSON_STRING, note="What was done."),
+        ),
+        note=(
+            "The one type that constrains the ENVELOPE as well as ``data``: ``ref`` "
+            "is required, citing the span of the reporting session's log that holds "
+            "the work, and ``thread`` is the answered dispatch's seq. Neither is a "
+            "``data`` key, so neither is declarable here -- the writer carries both, "
+            "and a report built without a ``ref`` is refused where it is built. A "
+            "``progress`` status may appear several times for one dispatch; a "
+            "terminal status appears once."
+        ),
+    ),
+)
+
+#: The crew types that have a writer. Keyed by ``type`` for the append path.
+CREW_ENTRY_TYPES: dict[str, EntryType] = {item.type: item for item in _CREW_TYPES}
+
 #: Per kind, because the question "what does this type carry" is asked of a unit.
-#: A crew registry drops in beside this one when a crew emitter lands; until then
-#: a crew's log's types are simply undeclared and pass through.
-ENTRY_TYPES: dict[str, dict[str, EntryType]] = {KIND_SESSION: SESSION_ENTRY_TYPES}
+#: The member kind declares nothing here: its vocabulary, writers and projections
+#: are owned by the member event log, and an undeclared type passes through.
+ENTRY_TYPES: dict[str, dict[str, EntryType]] = {
+    KIND_SESSION: SESSION_ENTRY_TYPES,
+    KIND_CREW: CREW_ENTRY_TYPES,
+}
 
 
 def declaration_for(kind: str, entry_type: str) -> EntryType | None:
@@ -1764,8 +1873,14 @@ def validate_data(kind: str, entry_type: str, data: Any) -> None:
 
     Raises ``bad_data_field`` naming the offending path when a required field is
     absent, a value is of the wrong JSON type, a key is not declared, or a value
-    falls outside a CLOSED enum. Returns silently for a type with no declaration,
-    which is every crew type and every guest namespace.
+    falls outside a CLOSED enum. Returns silently for a type with no declaration
+    -- the member kind, a crew domain outside the two dispatch contracts, and
+    every guest namespace.
+
+    The declaration is selected by KIND as well as by type, so it cannot answer
+    for the wrong unit: a ``crew/report`` reaching a session's log finds no
+    session declaration and is refused one layer up, by ``check_ownership``, with
+    ``event_type_not_owned``.
 
     A refusal is a :class:`~kiro_crew.crew_log.errors.CrewLogError`, so the
     write-behind emitter already treats it the way it treats an oversize entry: a
