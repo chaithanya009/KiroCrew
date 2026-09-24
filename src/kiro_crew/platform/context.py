@@ -877,6 +877,42 @@ def redact_via_context(text: str) -> str:
         return _security_redact(text)
 
 
+def binary_content_is_flagged(raw: bytes) -> bool:
+    """Whether non-UTF-8 *raw* carries credential material the scanner finds.
+
+    The ONE binary-content scan for every file-delivery gate. A credential can
+    sit inside an allow-listed media type -- base64 key material in a PDF, an
+    exported token in image metadata -- and a UTF-8 decode raises before the text
+    pass ever runs, so those bytes need a pass of their own. ``latin-1`` is the
+    decode used because it is total: every byte maps to a code point, so no input
+    can escape the scan by failing to decode.
+
+    Four gates guard the ``file_send`` delivery path -- the MCP tool before any
+    byte is copied, ``POST /api/outbox/notify``, ``GET /api/outbox/{filename}``,
+    and the ``_gate_upload_file`` shared by the Slack and channel upload legs. All
+    four must agree on what counts as flagged content, for two different reasons.
+    The three owner-facing gates each read the one durable grant
+    :mod:`kiro_crew.file_delivery_consent` records, so a disagreement among them
+    turns that grant into "delivered, card rendered, download refused". The upload
+    legs read no grant at all and refuse regardless, so a disagreement there
+    splits one file's verdict across two delivery legs instead. Agreement is why
+    this lives here as one function rather than as the same three lines written
+    out four times.
+
+    Routed through :func:`redact_via_context`, so a loaded companion's extra
+    credential regexes apply here exactly as they do on the text path. What a
+    gate DOES with a positive answer is the gate's own decision, and differs:
+    the owner-facing three honour the owner's recorded grant, the upload legs
+    refuse unconditionally.
+
+    Synchronous, and deliberately: the scan is CPU work over up to the 50 MB read
+    cap, so an async gate must call it through ``asyncio.to_thread`` rather than
+    on the event loop.
+    """
+    text = raw.decode("latin-1")
+    return redact_via_context(text) != text
+
+
 #: Substituted for a log line's text when redaction could not be composed. Names
 #: the cause, because on the host where this fires the operator's real problem is
 #: the failed companion composition, not the missing line.

@@ -34,6 +34,13 @@ per-invocation grant would report "delivered", render a card, and then refuse th
 download -- worse than today's clean refusal. A durable record is readable at
 every gate, which is why the grant is configuration-time and lives on disk.
 
+Both content kinds reach that rule. UTF-8 text goes through ``security.redact``;
+bytes that fail to decode go through ``platform.binary_content_is_flagged``, the
+one binary scan all four gates share, because a credential can sit inside an
+allow-listed media type just as easily as in a text file. What differs between the
+gates is only what a positive result DOES: the three owner-facing ones consult the
+grant recorded here, the upload legs refuse regardless.
+
 Which destinations a grant can EVER cover
 -----------------------------------------
 ``GRANTABLE_CLASSES`` has exactly one member, and that is a security property

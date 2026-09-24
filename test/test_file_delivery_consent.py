@@ -52,6 +52,17 @@ def _synth_aws_key() -> str:
     return prefix + body
 
 
+def _synth_flagged_media() -> bytes:
+    """Allow-listed media bytes carrying the same synthetic key material.
+
+    ``\\xff\\xfe`` is what makes the UTF-8 decode raise, which routes the file down
+    the binary branch of every gate; the caller names it ``.png`` so the guessed
+    MIME type sits inside ``BINARY_MIME_ALLOWLIST`` and the bytes reach the content
+    scan instead of stopping at the type check.
+    """
+    return b"\x89PNG\r\n\x1a\n\xff\xfe" + _synth_pem().encode() + b"\x80\x81"
+
+
 @pytest.fixture(autouse=True)
 def _isolated_store(tmp_path, monkeypatch):
     """Point the consent store at a tmp dir so no test touches the real one."""
@@ -77,6 +88,14 @@ class TestSynthesizedMaterialActuallyTrips:
     def test_synth_pem_is_detected(self):
         pem = _synth_pem()
         assert security.redact(pem) != pem
+
+    def test_synth_flagged_media_is_detected_through_the_binary_scan(self):
+        from kiro_crew.platform import binary_content_is_flagged
+
+        raw = _synth_flagged_media()
+        with pytest.raises(UnicodeDecodeError):
+            raw.decode("utf-8")
+        assert binary_content_is_flagged(raw)
 
     def test_synth_aws_key_is_detected(self):
         key = _synth_aws_key()
@@ -309,9 +328,35 @@ class TestConsentedDownloadRequiresOwnerIdentity:
         from kiro_crew.dashboard.handlers import files as files_handlers
 
         src = inspect.getsource(files_handlers.api_outbox_download)
-        window = src[src.index("is_granted") : src.index("is_granted") + 400]
+        # Anchored on the conjunction itself rather than on the store read: the
+        # grant is resolved off the event loop at each call site, so the
+        # conjunction lives in the closure and not in the store-read expression.
+        window = src[src.index("return granted") : src.index("return granted") + 200]
         assert " and is_owner_dashboard_request(request)" in window
         assert " or is_owner_dashboard_request(request)" not in window
+
+    def test_consent_store_is_never_read_on_the_event_loop(self):
+        """Every grant read in this coroutine is handed to a thread.
+
+        ``is_granted`` ends in a synchronous store read, and this route is a
+        coroutine on the gateway event loop, so a direct call would hold the loop
+        for the store's full contention window. Asserted on real source because
+        the cost only appears with a second reader on the same home, which a unit
+        test does not reproduce.
+        """
+        import inspect
+
+        from kiro_crew.dashboard.handlers import files as files_handlers
+
+        for fn in (files_handlers.api_outbox_download, files_handlers.api_outbox_notify):
+            src = inspect.getsource(fn)
+            for idx, line in enumerate(src.splitlines()):
+                if "is_granted" not in line or line.lstrip().startswith("#"):
+                    continue
+                preceding = "\n".join(src.splitlines()[max(0, idx - 2) : idx + 1])
+                assert (
+                    "asyncio.to_thread" in preceding
+                ), f"{fn.__name__}: consent read not offloaded -- {line.strip()}"
 
 
 def _consent_request(*, app: str = "", user: str = "owner-1", owner: str = "owner-1", query=None):
@@ -1112,6 +1157,131 @@ class TestFileSendHonoursTheGrant:
         # even ATTEMPTED for content the owner scoped to their own dashboard.
         assert "/api/outbox/notify" in posted
         assert not any("upload-file" in p for p in posted)
+
+    def test_without_a_grant_a_flagged_MEDIA_file_is_refused_too(self, tmp_path):
+        """The same credential inside a PNG gets the same answer as inside text.
+
+        An allow-listed media type says the browser can render the bytes safely,
+        not that no secret is sitting in them, so the type check cannot stand in
+        for the content scan.
+        """
+        src = tmp_path / "shot.png"
+        src.write_bytes(_synth_flagged_media())
+        out = self._call(src)
+        assert "sensitive data" in out and "aborted" in out
+
+    def test_with_a_grant_a_flagged_MEDIA_file_also_skips_both_upload_legs(self, tmp_path):
+        from kiro_crew import mcp_core
+
+        src = tmp_path / "shot.png"
+        src.write_bytes(_synth_flagged_media())
+        _grant()
+        posted: list[str] = []
+
+        def _fake_post(path, *a, **kw):
+            posted.append(path)
+            return {"ok": True}
+
+        with patch.object(mcp_core, "_post", side_effect=_fake_post):
+            out = self._call(src)
+        assert "File sent" in out
+        assert "Slack and channel upload skipped" in out
+        assert not any("upload-file" in p for p in posted)
+
+    def test_a_failed_outbox_copy_records_no_consented_delivery(self, tmp_path):
+        """A delivery record must not outlive the copy it claims.
+
+        A full outbox or a read-only workspace is an ordinary operational
+        condition, and only ``FileExistsError`` is recovered, so any other write
+        error leaves the tool without a delivery. Recording the release of flagged
+        content that never left is the one direction an incident review cannot
+        correct: there is no retraction entry.
+        """
+        import pathlib
+
+        from kiro_crew import file_delivery_consent as fdc
+        from kiro_crew import mcp_core
+
+        src = tmp_path / "device.conf"
+        src.write_text(_synth_pem())
+        _grant()
+        outbox = tmp_path / "outbox"
+        outbox.mkdir()
+        recorded: list[str] = []
+        real_open = pathlib.Path.open
+
+        def _no_space(self, *a, **kw):
+            if outbox in self.parents:
+                raise OSError(28, "No space left on device")
+            return real_open(self, *a, **kw)
+
+        with (
+            patch.object(mcp_core, "outbox_dir", return_value=outbox),
+            patch.object(pathlib.Path, "open", _no_space),
+            patch.object(
+                fdc, "audit_decision", side_effect=lambda *a, **kw: recorded.append(kw["outcome"])
+            ),
+        ):
+            with pytest.raises(OSError):
+                self._call(src)
+        assert "delivered" not in recorded
+
+    def test_a_clean_media_file_still_needs_no_grant(self, tmp_path):
+        """The scan must not turn ordinary media into a consent prompt."""
+        from kiro_crew import mcp_core
+
+        src = tmp_path / "clean.png"
+        src.write_bytes(b"\x89PNG\r\n\x1a\n\xff\xfe" + b"\x00" * 200)
+        with patch.object(mcp_core, "_post", return_value={"ok": True}):
+            out = self._call(src)
+        assert "File sent" in out
+        assert "consent" not in out
+
+
+class TestOneBinaryScanForEveryGate:
+    """All four gates read one scanner, so none can drift from the others again.
+
+    The gate this module's docstring calls structural -- the upload leg that no
+    grant can reach -- carried the only binary content scan, and the three
+    owner-facing ones skipped it, so a credential inside an allow-listed media type
+    was refused on one leg and accepted on the other three. Sharing the function is
+    what makes that state unreachable rather than merely fixed once.
+    """
+
+    def test_no_gate_hand_rolls_its_own_binary_decode(self):
+        from kiro_crew.dashboard.handlers import files as files_handlers
+        from kiro_crew.mcp_tools import messaging
+
+        gates = (
+            messaging.file_send,
+            files_handlers.api_outbox_notify,
+            files_handlers.api_outbox_download,
+            files_handlers._gate_upload_file,
+        )
+        for gate in gates:
+            src = inspect.getsource(gate)
+            assert "binary_content_is_flagged" in src, gate.__name__
+            # A second decode here would be a second answer to the same question.
+            assert 'decode("latin-1")' not in src, gate.__name__
+
+    def test_the_shared_scan_routes_through_the_context_shim(self):
+        """A companion's extra credential regexes must apply to binary too."""
+        from kiro_crew.platform import context as platform_context
+
+        src = inspect.getsource(platform_context.binary_content_is_flagged)
+        assert "redact_via_context" in src
+
+    def test_the_upload_leg_still_refuses_flagged_media_outright(self):
+        """Sharing the scanner must not have softened the unconditional refusal.
+
+        Whether that gate can read the store at all is pinned separately, on the
+        same source, by ``TestThirdPartyLegsCanNeverBeGranted``.
+        """
+        from kiro_crew.dashboard.handlers import files as files_handlers
+
+        src = inspect.getsource(files_handlers._gate_upload_file)
+        assert "binary_credential_detected" in src
+        assert "is_granted" not in src
 
 
 class TestAuditDecisionRedactsBeforeTruncate:
