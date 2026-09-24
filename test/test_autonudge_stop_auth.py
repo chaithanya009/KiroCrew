@@ -410,7 +410,7 @@ def test_applier_ack_discloses_the_gated_cadence(monkeypatch):
             {"message": "watch https://github.com/acme/widgets/pull/42", "idle_secs": 300},
         )
     )
-    assert "only when it changes" in result, "the ack must state the gated cadence"
+    assert "only on a wake from it" in result, "the ack must state the gated cadence"
     assert "acme/widgets#42" in result, "and name the subject it is watching"
     assert "message re-injects every 300s" not in result, "not the plain promise"
 
@@ -433,7 +433,7 @@ def test_applier_ack_keeps_the_plain_promise_for_an_ungated_loop(monkeypatch):
         )
     )
     assert "re-injects every 300s" in result
-    assert "only when it changes" not in result
+    assert "only on a wake from it" not in result
 
 
 def test_applier_monitor_start_arms_via_the_session_binding_key(monkeypatch):

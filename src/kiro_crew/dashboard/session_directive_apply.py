@@ -58,6 +58,7 @@ from kiro_crew.autonudge import (
     is_channel_key,
 )
 from kiro_crew.messaging.link import is_channel_session_key
+from kiro_crew.probes.gh_pr import wake_set_phrase
 from kiro_crew.session_surface import has_dashboard_surface
 
 logger = logging.getLogger(__name__)
@@ -474,7 +475,10 @@ async def _monitor_start(
     if armed_monitor is not None and getattr(loop, "gate", False):
         cadence = (
             f"observing {armed_monitor.target} every {idle_secs}s and re-injecting the "
-            "message only when it changes, so quiet cycles cost no turn"
+            "message only on a wake from it -- "
+            f"{wake_set_phrase()} -- so a lane finishing while others still "
+            "run costs no turn, and a raised wake lands up to about one "
+            "interval after the tick that saw it"
         )
     else:
         cadence = f"the message re-injects every {idle_secs}s"

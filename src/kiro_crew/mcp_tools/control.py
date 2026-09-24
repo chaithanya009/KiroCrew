@@ -55,6 +55,7 @@ from kiro_crew.monitoring.registry import (
     publicly_armable_objectives,
 )
 from kiro_crew.monitoring.targets import normalize_pull_request_target
+from kiro_crew.probes.gh_pr import terminal_set_phrase, wake_set_phrase
 from kiro_crew.security import (
     redact_and_truncate,
     redact_credentials,
@@ -164,6 +165,12 @@ def _prefers_structured_arming() -> bool:
     except Exception:
         logger.debug("monitoring.prefer_structured_arming unreadable; using off", exc_info=True)
         return False
+
+
+def _ending_clause() -> str:
+    """The watch-ending set, capitalised to open a sentence."""
+    phrase = terminal_set_phrase()
+    return phrase[:1].upper() + phrase[1:]
 
 
 def schemas() -> list[dict[str, Any]]:
@@ -500,9 +507,15 @@ def schemas() -> list[dict[str, Any]]:
                 "only real signals. "
                 "COST: naming exactly ONE GitHub pull request BY ITS FULL URL "
                 "(https://github.com/<owner>/<repo>/pull/<N>) makes the loop "
-                "observe it each interval and re-inject your message only when "
-                "it actually changed, so a cycle where nothing changed costs no "
-                "model turn and max_cycles then counts the turns actually "
+                "observe it each interval and re-inject your message only on a "
+                f"wake from it: {wake_set_phrase()}. Progress outside that set "
+                "raises no wake and costs no model turn -- one lane of many "
+                "finishing, a pending count shrinking, a check going green "
+                "while others still run -- and a raised wake is held briefly, "
+                "so it lands up to about one interval after the tick that "
+                f"observed it. {_ending_clause()} ends the watch rather than "
+                "waking you. "
+                "max_cycles then counts the turns actually "
                 "DELIVERED to you -- wakes, plus the periodic delivery that "
                 "breaks a long quiet streak and any tick that could not observe "
                 "the subject -- rather than intervals elapsed. If your loop must "
@@ -538,15 +551,17 @@ def schemas() -> list[dict[str, Any]]:
                         "description": (
                             "Default true. Pass false to opt this loop OUT of "
                             "observation-gating, so it is re-injected every "
-                            "interval even when the pull request it names has "
-                            "not changed. Use it for a loop whose duty is to act "
+                            "interval even when the pull request it names raises "
+                            "no wake. Use it for a loop whose duty is to act "
                             "WHILE the subject is quiet -- refresh a heartbeat "
                             "file, chase a reviewer who still has not replied, "
                             "keep a branch rebased on a moving base -- since the "
                             "observation watches the pull request and continued "
-                            "silence is invisible to it. A gated loop is never "
-                            "starved (it is delivered anyway after enough quiet "
-                            "intervals) so reach for this only when every "
+                            "silence is invisible to it. Pass it too for a loop "
+                            "that must see lanes land one at a time, since "
+                            "per-lane progress raises no wake. A gated loop is "
+                            "never starved (it is delivered anyway after enough "
+                            "quiet intervals) so reach for this only when every "
                             "interval genuinely has work"
                         ),
                     },
@@ -1416,8 +1431,10 @@ def monitor_start(name: str, args: dict[str, Any]) -> str:
             "Monitor loop requested on this session: "
             + (
                 f"observing {gated.target} every {interval_secs}s and "
-                "re-injecting the message only when it changes, so quiet cycles "
-                "cost no turn"
+                "re-injecting the message only on a wake from it -- "
+                f"{wake_set_phrase()} -- so a lane finishing while others "
+                "still run costs no turn, and a raised wake lands up to about "
+                "one interval after the tick that saw it"
                 + (f" and the {max_cycles} cap counts delivered turns" if max_cycles else "")
                 if gated is not None
                 else f"the message will re-inject every {interval_secs}s"
