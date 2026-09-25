@@ -3,7 +3,13 @@
 This fork tracks `kirodotdev/KiroCrew` as `upstream` and
 `chaithanya009/KiroCrew` as `origin`. Its local changes are intentional product
 requirements. Read this file and the repository's `AGENTS.md` before every
-upstream sync.
+upstream sync or publication.
+
+`upstream` is **fetch-only**. Never push a branch, tag, or release there, and
+never open a pull request with `kirodotdev/KiroCrew` as its base repository.
+Publish this fork's commits only to `chaithanya009/KiroCrew`. For a pull
+request, set both the head and base repository to Chaithanya's fork; name the
+fork explicitly in GitHub CLI commands instead of relying on its default.
 
 ## Required behavior
 
@@ -50,8 +56,9 @@ prompt, or skill surfaces.
    memory features remain absent from the product. Run the smallest relevant
    validation for the merged changes, including the docs gate when docs change.
    Do not claim checks passed if they were skipped or failed.
-5. Commit the sync if clean. Push `main` to `origin` only when explicitly
-   authorized by the user; never force-push. Report what changed and any
+5. Commit the sync if clean. When publication is authorized, push only to
+   `origin`; never force-push. Any PR goes to `chaithanya009/KiroCrew`, never
+   to the upstream repository. Report what changed and any
    unresolved conflict or validation failure. Do not install or restart the app
    unless separately authorized.
 
