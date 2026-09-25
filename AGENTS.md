@@ -1,5 +1,8 @@
 # Rules for AI Assistants
 
+This checkout is Chaithanya's customized fork. Before syncing upstream, read
+[`FORK_MAINTENANCE.md`](FORK_MAINTENANCE.md) and preserve its fork invariants.
+
 **This file is a ROUTER, not a manual.** It carries only the rules whose violation
 causes damage before a pointer could be read. Everything else is a link you MUST
 open before touching that subsystem: see
