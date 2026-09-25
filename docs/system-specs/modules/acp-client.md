@@ -107,12 +107,26 @@ this agents directory sees the same eviction-then-republish rather than the
 home-scoped skip a recorded alias gets. Every other gate still applies to it:
 this run's own set, live in-process projections and held leases are all checked
 first, and removal is identity-checked against the bytes and inode just read.
-Reclaims are capped PER RUN rather than per candidate examined: the first prune
-after an upgrade faces the whole accumulated backlog, and it runs while the
-publication lock is held, whose own acquisition ceiling is 2s — draining
-thousands of files in one sweep would make a concurrent spawn fail to acquire and
-fall back to authored agents. The backlog is bounded and shrinking, so spreading
-it over successive spawns reclaims it just as completely. Projected agent JSON contains only fields accepted by Kiro's strict
+The prune runs while the publication lock is held, which is what keeps a deletion
+from landing on an alias a publisher that takes the same lock is writing. That
+lock's acquisition ceiling is fixed, so one call's classification work carries a
+time budget. It is a BETWEEN-candidate budget, not a bound on the section: it is
+read before each candidate, so it limits how many are walked and not how long any
+single one takes, and the directory enumeration that precedes the walk is outside
+it. Reclaims are capped per run as well, but that cap is a ceiling and never a
+floor, and it bounds no part of the section — a candidate that is kept, active or
+leased costs a full classification and never increments it, so a backlog of
+entirely unreclaimable entries was walked in full while the lock was held.
+Per-candidate cost is not flat either, since the lease probe rescans the lease
+directory for every candidate. Each call starts at a rotating offset into the
+candidate list: a budgeted walk from a fixed start examines the same prefix every
+time, so entries that are kept, active or leased at the front of the directory's
+own order would hide the whole reclaimable remainder behind them permanently. The
+offset is drawn per call rather than remembered, since the workload this bounds
+spawns a fresh process per run and a process-local cursor would restart at zero
+every time. Drawing it makes reach across successive spawns probabilistic rather
+than scheduled: the backlog is bounded and shrinking, and every entry is reached
+in expectation, but no single spawn is promised any particular entry. Projected agent JSON contains only fields accepted by Kiro's strict
 schema; lifecycle ownership lives in the non-spec
 `.kirocrew-skill-projection-metadata` directory. Each sidecar records the alias's
 exact byte digest, so a stale or replaced sidecar cannot authorize deletion of a
@@ -152,6 +166,41 @@ every alias and the current settings file byte-for-byte, then falls back to the
 authored native agent rather than risking a stale-snapshot overwrite or blocking
 startup. Active, foreign-home, unmarked, malformed, unreadable, oversized or
 otherwise uncertain alias files remain on disk.
+
+`kirocrew doctor`'s Agents Directory section reports the census read-only,
+through `census_projected_aliases` in this module, reached over the
+`agent_sdk.drivers.acp` seam like the doctor's other backend reads, so the
+record shapes stay here; the lease record itself is parsed by the one
+`_read_lease_record` the liveness probe also uses, and the data-home identity
+the `foreign_home` split is judged against is resolved inside the census with
+the publisher's own spelling, so no caller can hand it a differently normalised
+id. It counts how many `kirocrew-skill-view-*.json` aliases the directory
+holds, how many a lease record names, how many -- among the named and the
+unnamed separately -- an ownership sidecar attributes to another Kiro Crew data
+home (two homes share this directory whenever they share `~/.kiro`), and how
+many lease records are unreadable; a record nested past the interpreter limit
+reads as unreadable rather than aborting, for the probe and the census alike.
+What the census retains is bounded (`_CENSUS_MAX_ALIASES`,
+`_CENSUS_MAX_LEASES`, the diagnostic's own memory and I/O budget) and a hit
+bound is reported as `truncated`: the measured counts are then floors, the
+derived ones (not-named, this home's share) are not printed, and because an
+unscanned record could be the unreadable one that stops the reclaim, the report
+says reclaimability is unknown rather than promising a drain. A backlog left by a build that predates the reclaim is
+thereby visible without `ls`, and its drain can be watched across spawns. Above
+`_SKILL_VIEW_BACKLOG_WARN` (2,000; a healthy host carries live sessions x
+authored agents, a few hundred) it warns and says exactly which share the
+reclaim covers: this home's unreferenced aliases, a bounded number per spawn;
+this home's lease-named aliases are described as kept while their lease is
+held (the census probes no lock, so a crash-stale record is indistinguishable
+from a held one and is reclaimed on the next spawn's probe); aliases another
+data home owns, leased or not, never drain here; and while a lease record is
+unreadable nothing is reclaimed, which the report states instead of promising a
+drain. The manual fallback -- moving the aliases and their metadata directory
+out with the gateway stopped, or with every gateway that uses the directory
+stopped once another home's aliases are present -- is named without being
+performed and without suggesting a delete: the doctor
+cannot prove who authored a file that merely carries the prefix, and a move is
+undoable.
 
 Windows runtime teardown records the reaped return code after the owned-handle
 drain, before dropping the process reference, just as POSIX teardown does. The
@@ -279,7 +328,7 @@ cancelled caller still lets the worker settle).
   "params": { "sessionId": "...", "options": [PermissionOption], "toolCall": ToolCallUpdate } }
 ```
 
-**Unknown server→client requests are answered, never dropped.** `session/request_permission` is the only inbound *request* Kiro Crew implements. Any other server→client request (method **and** id — e.g. `fs/read_text_file`, `terminal/create`) is classified by `_process_message` as `"server_request_unknown"`. Every prompt dispatch site (`send_message_stream`, `_dispatch_events`, `_read_prompt_response`) handles that action by calling `_reject_unknown_server_request`, which replies with a JSON-RPC `-32601` (`JSONRPC_METHOD_NOT_FOUND`, "Method not found") error via `_send_error`. Without this, JSON-RPC semantics leave the agent blocked forever on an unanswered request — the turn hangs. Notifications (method, no id) are unaffected and still classified `"skip"`.
+**Unknown server→client requests are answered, never dropped.** `session/request_permission` is the only inbound *request* `AcpClient` implements. `AcpSessionHandle` serves two more, both read-only and both KAS-specific: `_kiro/hooks/list` and `_kiro/hooks/sessionStart`, answered from `acp/kas_wire.py` (see agent-host-contract.md). They are matched in that handle's own dispatch loop, ahead of the shared classifier, precisely so the classifier keeps reporting them as unknown on the `AcpClient` path — which serves no hooks surface, and where naming an action no branch handles would leave the request unanswered instead of refused. `_kiro/hooks/executeHook` is implemented nowhere, so it is refused like any other unknown request. Any other server→client request (method **and** id — e.g. `fs/read_text_file`, `terminal/create`) is classified by `_process_message` as `"server_request_unknown"`. Every prompt dispatch site (`send_message_stream`, `_dispatch_events`, `_read_prompt_response`) handles that action by calling `_reject_unknown_server_request`, which replies with a JSON-RPC `-32601` (`JSONRPC_METHOD_NOT_FOUND`, "Method not found") error via `_send_error`. Without this, JSON-RPC semantics leave the agent blocked forever on an unanswered request — the turn hangs. Notifications (method, no id) are unaffected and still classified `"skip"`.
 
 `PermissionOption` field names differ between backends — kiro-cli uses `id`/`label`, claude-agent-acp uses `optionId`/`name` (per the public ACP spec). `_build_permission_event` reads both and remembers the optionIds keyed by `kind` (`allow_once`/`allow_always`/`reject_once`/`reject_always`) on the request id — recording an entry when **either** an allow option (for `approve_tool`) **or** a reject option (for a clean `reject_tool`) was advertised. `approve_tool(request_id, *, always=False)` echoes the matching allow id back, so the host doesn't need to know whether it's talking to kiro (`"allow_once"`/`"allow_always"`) or claude-agent-acp (`"allow"`/`"allow_always"`). `reject_tool` prefers a **clean reject**: if a reject optionId was advertised it sends `outcome: "selected"` with that id. Both backends advertise one — claude-agent-acp as `{kind:"reject_once", optionId:"reject"}` (→ `behavior:"deny"`), kiro-cli as `{kind:"reject_once", optionId:"reject_once"}` — and the fallback to `outcome: "cancelled"` therefore only applies to a backend that advertises no reject option at all. The distinction is load-bearing, not cosmetic: a clean reject resolves the tool call to `status:"failed"` with kiro-cli's fixed content `"User denied tool execution"` and the turn continues to the next model-inference boundary (`stopReason: "end_turn"`), whereas `cancelled` ends the turn immediately with `stopReason: "refusal"` and no text — and drops any queued `_session/steer` as `AgentExecutionUserMessageCleared`. That is why the host's in-band deny notice (`_steer_policy_notice`) can only be folded in on the clean-reject path, and why `stopReason: "refusal"` is NOT by itself evidence of a model-side content refusal.
 
@@ -1434,14 +1483,17 @@ The `audit_source` constructor param of `AcpClient` (default `None`) tags a clie
 `_send_prompt()` auto-detects image file paths in messages (`.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`, `.bmp`) via regex. When a valid image path is found:
 
 1. Reads the file (paths over `MAX_IMAGE_BYTES` = 10 MB stay as text, not inlined)
-2. Downscales so the longest edge is <= `MAX_IMAGE_EDGE_PX` (2000 px), preserving aspect ratio and re-encoding to the same format (an oversized GIF becomes a PNG still frame)
-3. Shrinks further while the base64 payload still exceeds `MAX_IMAGE_B64_BYTES` (5 MiB), stopping at `MIN_IMAGE_EDGE_PX` (256 px)
-4. Base64-encodes the (possibly downscaled) bytes
-5. Appends an image content block: `{"type": "image", "data": "<base64>", "mimeType": "image/png"}`
-6. Replaces the path in the text with `[image: filename.png]`
-7. Sends both text and image blocks in the `prompt` array
+2. Identifies the raster type from its leading bytes; unsupported or truncated content stays as a path
+3. Downscales so the longest edge is <= `MAX_IMAGE_EDGE_PX` (2000 px), preserving aspect ratio and re-encoding according to the decoded format (an oversized GIF becomes a PNG still frame)
+4. Shrinks further while the base64 payload still exceeds `MAX_IMAGE_B64_BYTES` (5 MiB), stopping at `MIN_IMAGE_EDGE_PX` (256 px)
+5. Base64-encodes the (possibly downscaled) bytes
+6. Appends an image content block with the content-derived `mimeType`
+7. Replaces the path in the text with `[image: filename.png]`
+8. Sends both text and image blocks in the `prompt` array
 
 This leverages kiro-cli's `promptCapabilities.image: true` capability. The LLM receives the image inline — no tool call needed.
+
+The suffix selects only which paths are candidates. `messaging.raster.sniff_raster_mime` derives the wire media type from the file content, and Pillow verifies the complete container when available. A real image with a misleading name is still inlined with truthful metadata; non-raster, unsupported, or truncated content fails closed and remains a path that a tool-capable agent can inspect.
 
 **Dimension backstop** (`build_prompt_blocks` in `acp/prompt_blocks.py`). This shared builder is the single funnel every channel's images cross before reaching kiro-cli, so the `MAX_IMAGE_EDGE_PX` (2000 px) downscale runs for all of them — dashboard upload/paste/screenshot, Slack, Discord. Anthropic rejects the ENTIRE request when a many-image conversation (>20 images) carries any image over 2000 px on a side; because kiro-cli replays the full message history every turn, one oversized image would otherwise sit at a fixed history index and wedge the session permanently (a follow-up resize cannot evict the original). The browser's client-side resize (1568 px, `website/src/utils/resizeImage.ts`) is a token-cost optimization on top; this server-side cap is the correctness guarantee that still holds when that resize is skipped or bypassed (e.g. the native `/api/screenshot` capture, or non-dashboard channels).
 

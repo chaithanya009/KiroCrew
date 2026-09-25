@@ -3131,12 +3131,13 @@
       "sensitive": false,
       "tags": [],
       "label": "Provider",
-      "help": "Where speech is recognised. `local` runs on this machine and needs no account (it downloads one model the first time you dictate), `apple` uses the on-device recogniser built into macOS 26 and later, and `transcribe` sends your audio to AWS Transcribe, which bills your AWS account.",
+      "help": "Where speech is recognised. `local` runs on this machine and needs no account (it downloads one model the first time you dictate), `apple` uses the on-device recogniser built into macOS 26 and later, and `transcribe` sends your audio to AWS Transcribe, which bills your AWS account. `off` runs no recogniser at all, the same as turning speech input off.",
       "hasChildren": false,
       "enumValues": [
         "local",
         "apple",
-        "transcribe"
+        "transcribe",
+        "off"
       ],
       "defaultValue": "local"
     },
@@ -4172,7 +4173,8 @@
         },
         "nudge_wake": {
           "provider": "auto",
-          "llm_model": ""
+          "llm_model": "",
+          "quiet_streak_floor": 0
         }
       }
     },
@@ -4320,12 +4322,13 @@
       "sensitive": false,
       "tags": [],
       "label": "Wake judge",
-      "help": "Per-point settings for nudge.wake: which judge answers, and the model id for the small-model lane. The Jev lane still needs this point's consent scope on the Decisions card; the small-model lane needs no consent row, because it sends to the model provider your sessions already use, so picking it here is what runs it.",
+      "help": "Per-point settings for nudge.wake: which judge answers, the model id for the small-model lane, and how long a judge may keep a loop quiet before one fires anyway. The Jev lane still needs this point's consent scope on the Decisions card; the small-model lane needs no consent row, because it sends to the model provider your sessions already use, so picking it here is what runs it.",
       "hasChildren": true,
       "enumValues": null,
       "defaultValue": {
         "provider": "auto",
-        "llm_model": ""
+        "llm_model": "",
+        "quiet_streak_floor": 0
       }
     },
     {
@@ -4355,6 +4358,20 @@
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": ""
+    },
+    {
+      "path": "decisions.nudge_wake.quiet_streak_floor",
+      "kind": "core",
+      "type": "integer",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Quiet ticks before firing anyway",
+      "help": "How many QUIET verdicts in a row end the run of skipped turns. The Nth consecutive QUIET tick FIRES regardless of its own verdict, so this many quiet verdicts skip one fewer turn than the number suggests, and a judge that is wrong about a subject costs a late turn rather than silence. 0, the default, means inherit the shipped floor -- the same number the typed probe path uses, spelled once in the loop engine so the two cannot drift. A negative value also reads as inherit. This knob only ever SHORTENS the silence window: the shipped floor is the ceiling, and a larger value is clamped back down to it, because config.json is writable by an auto-approved agent shell and a raised floor would silence a watch with no new code, only a number.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": 0
     },
     {
       "path": "watchdog",
@@ -6921,6 +6938,7 @@
           "keep_awake": true
         },
         "restore_sessions": false,
+        "crewmate_threads": false,
         "qr_session_until_restart": true,
         "qr_session_persist_across_restart": false,
         "restore_window_minutes": 30,
@@ -6962,6 +6980,7 @@
         "onboarded": false,
         "import_onboarded": false,
         "privacy_acked": false,
+        "crewmates_onboarded": false,
         "user_role": "",
         "user_role_other": "",
         "user_technical_level": "",
@@ -7133,6 +7152,20 @@
       "enumValues": null,
       "defaultValue": false,
       "requiresRestart": true
+    },
+    {
+      "path": "dashboard.crewmate_threads",
+      "kind": "core",
+      "type": "boolean",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Reply threads on crewmate chat messages",
+      "help": "Let any message in a crewmate's chat carry its own reply thread, opened in the side panel while the main chat stays visible. Off by default: the thread routes answer not-found, no thread frame is sent, and the dashboard draws no Reply in thread control. Takes effect on the next request; no restart.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": false
     },
     {
       "path": "dashboard.qr_session_until_restart",
@@ -7803,6 +7836,20 @@
       "defaultValue": false
     },
     {
+      "path": "dashboard.crewmates_onboarded",
+      "kind": "core",
+      "type": "boolean",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Crewmates Onboarded",
+      "help": "Whether the user has finished or dismissed the first-run Meet CrewMates flow (the four-step introduction that creates the first crewmate). Server-backed like the other first-run flags so a second machine does not replay it. Also set when the flow is re-run from the Crewmates page.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": false
+    },
+    {
       "path": "dashboard.user_role",
       "kind": "core",
       "type": "string",
@@ -8444,6 +8491,20 @@
       "tags": [],
       "label": "Reasoning Effort",
       "help": "Default reasoning effort for sessions on this crew. Empty inherits: the global agent.reasoning_effort (or, for a background worker crew, its role effort). A per-session pick still overrides this. Only reasoning-capable models accept a level; on any other model the pin is ignored, exactly as the global default is.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": ""
+    },
+    {
+      "path": "agents.*.display_name",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Display Name",
+      "help": "Optional label the dashboard shows instead of the agent's name. Purely presentational: the name stays the immutable identity — it keys this record, addresses /api/agents/{name}, and is what dispatch, crons and spawn resolve — so renaming the label never breaks a binding. Empty means the dashboard shows the name itself.",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": ""

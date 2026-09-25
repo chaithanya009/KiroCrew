@@ -19,8 +19,12 @@ generic drain re-asserts the target-side containment before the entry becomes a
 turn: producers stamp the constraints that held at admission
 (:func:`containment_meta`), and ``chat_runner``'s drain drops — with a visible
 notice and an SEL record — any entry for which a constraint holds at delivery
-that did not hold at admission. A human-typed queued message shares the same
-window and the same re-check.
+that did not hold at admission. A dropped CROSS-SESSION delivery is reported back
+to its sender too, since the target's own notice is on a transcript the sender
+does not read: the entry also carries the sending session, as a slot key plus
+that slot's tab identity (:func:`send_origin_meta`), and the drop appends a
+notice there (:func:`notify_send_origin_dropped`). A human-typed queued message
+shares the same window and the same re-check, and carries no sender to report to.
 
 Authorization is deny-by-default and checked in one place
 (:func:`authorize_target`) for the three operations that take a target — stop,
@@ -82,6 +86,8 @@ from kiro_crew.execution_context import (
 )
 from kiro_crew.history import metadata_now_iso, transcript_stem
 from kiro_crew.memory_stores import named_store_or_empty
+from kiro_crew.messaging.link import CHAT_TYPE_DIRECT, ChannelLink, parse_session_key
+from kiro_crew.messaging.transport import DM_TARGET_PREFIX, sole_direct_target
 from kiro_crew.security import redact, redact_and_truncate
 from kiro_crew.sel import sel
 from kiro_crew.validation import MAX_ACP_SESSION_ID_LEN, MAX_LONG_STRING
@@ -140,6 +146,23 @@ CRON_LINK_PREFIX = "cron:"
 # module sits below the apps package, and the value is a persisted data format
 # rather than something that package exports.
 APP_CRON_OWNER_PREFIX = "app:"
+
+# The channels whose 1:1 DM session can be recognised as the configured owner's
+# own conversation by :func:`audience_is_owner`. Membership asserts two facts
+# that were VERIFIED against the transport, and a surface is added only by
+# verifying both again for it:
+#
+# * the dispatcher mints its DM key as ``{surface}:{agent}:direct:{peer}``
+#   (``build_dm_session_key`` with ``chat_type=direct``), so the key names the one
+#   human in the conversation and a thread, group, forum or unified key does not
+#   parse as one; and
+# * ``configured_targets()`` advertises exactly that peer as ``user:{peer}`` and
+#   draws from CONFIGURED state alone -- never from identities learned off inbound
+#   traffic, which is the gap ``constants.CHANNEL_OWNER_DM_NAMESPACES`` names for
+#   Weixin and WeCom and the reason this set is a subset of it.
+#
+# Every other channel fails closed here and keeps its full containment.
+OWNER_DM_CONDUCTOR_SURFACES: frozenset[str] = frozenset({"discord", "telegram"})
 
 
 def _member_caller(state: "DashboardState", caller_key: str) -> bool:
@@ -282,12 +305,20 @@ def _cron_caller(caller_key: str) -> bool:
 def _caller_is_ownership_fenced(state: "DashboardState", caller_key: str) -> bool:
     """Whether *caller_key* may only reach slots it created itself.
 
-    Three populations, one predicate, so the fence and the admissions that depend
+    Four populations, one predicate, so the fence and the admissions that depend
     on it cannot drift apart:
 
     * a crew member's DM slot, which bypasses the config switch;
     * a cron job's own slot, which bypasses the unattended refusal;
-    * **anything either of them created**, which is the part a key prefix cannot
+    * a channel-born slot admitted as the owner's own DM (:func:`audience_is_owner`),
+      which bypasses the channel-link refusals. Every non-cron link is fenced, not
+      only the admitted ones: the only linked caller that gets past those refusals
+      is an owner DM, and fencing on the link rather than on the admission keeps
+      the fence readable without the transport roster or the session store. What
+      it buys is the bound on a wrong audience inference: the DM reaches the
+      workers it dispatched and never the person's own tabs, the same reach a
+      crew member has;
+    * **anything any of them created**, which is the part a key prefix cannot
       see. A created child is minted with a plain ``chat-`` key and INHERITS the
       creator's agent, so a fenced caller running a session-control agent would
       otherwise get an unfenced deputy for free: create a child, seed it, and the
@@ -295,7 +326,7 @@ def _caller_is_ownership_fenced(state: "DashboardState", caller_key: str) -> boo
       reports back through the transcript its creator is allowed to read. The
       fence has to follow authority, not spelling.
 
-    ``_created_by`` is the marker for that third population and needs no lineage
+    ``_created_by`` is the marker for that last population and needs no lineage
     walk: :func:`create_session` is its ONLY writer (a person's own tab and a fork
     reach ``get_or_create_slot`` directly and stay unattributed), so a non-empty
     value means "an agent made this session" at any depth. A grandchild carries
@@ -317,7 +348,22 @@ def _caller_is_ownership_fenced(state: "DashboardState", caller_key: str) -> boo
     slot = state.get_slot(caller_key)
     if slot is None:
         return False
+    if _channel_link_of(slot):
+        return True
     return bool(getattr(slot, "_created_by", ""))
+
+
+def _channel_link_of(slot: Any) -> str:
+    """*slot*'s channel link, or ``""`` for an unlinked slot and for a cron tab.
+
+    The one reading of "this slot is channel-born" the caller-side gates share: a
+    ``cron:<job_id>`` link names the job's own run transcript and republishes to
+    nobody, so it is not a channel link (see ``CRON_LINK_PREFIX``).
+    """
+    link = str(getattr(slot, "linked_session_key", "") or "")
+    if not link or link.startswith(CRON_LINK_PREFIX):
+        return ""
+    return link
 
 
 def _created_by_other(slot: Any, caller_key: str) -> bool:
@@ -734,6 +780,152 @@ def _has_channel_mirror(
     return on_probe_failure if probed is None else bool(probed)
 
 
+def audience_is_owner(state: "DashboardState", slot: "_ChatSlot") -> bool:
+    """Whether every surface *slot*'s turns reach is the configured owner's own DM.
+
+    The ONE predicate the three channel-containment gates consult -- the creator
+    gate and the target gate here, the ledger gate in ``handlers/work_ledger.py``
+    -- so they cannot drift: a gate keying on the live link, one on the key prefix
+    and one on the mirror store would each admit and refuse different slots, and
+    a key prefix can never be cleared while a link can. That containment exists
+    because a channel session acts on words from a thread other people are in,
+    and what it reads lands in front of them. For a 1:1 DM whose only human is
+    the operator, the "audience" being protected is the operator themself, and
+    refusing it makes every Discord and Telegram conversation a session that can
+    dispatch nothing.
+
+    Every clause is a positive fact, and any that cannot be established answers
+    ``False``. In order:
+
+    * *slot* is channel-born: its ``linked_session_key`` is a channel key (a cron
+      tab's link is not, see ``CRON_LINK_PREFIX``). A dashboard-born slot is not
+      this predicate's subject even when it mirrors to a DM -- its own
+      conversation is the dashboard, and the mirror refusal keeps judging it.
+    * The key parses under the canonical grammar as a DIRECT conversation with
+      exactly one peer, on a surface in :data:`OWNER_DM_CONDUCTOR_SURFACES`. A
+      thread, group or forum key names a wider audience; a ``unified`` bucket
+      names no peer; the legacy two-segment Slack shape does not parse; a surface
+      not verified for this fails closed by construction.
+    * The channel's LIVE transport names exactly one owner and it is that peer:
+      :func:`~kiro_crew.messaging.transport.sole_direct_target` over
+      ``configured_targets()``, the same one-identity rule ``/sessions`` and the
+      proactive owner DM apply, and the same reasoning -- an allow-list is a list
+      of people permitted to talk to the agent, not a claim that any of them is
+      the operator, so several entries name nobody. Read off the transport rather
+      than the config record because it is the roster in force NOW (reloaded live,
+      the very set that admits the peer's turns) and an in-memory read, which
+      keeps this callable from ``close_target``'s no-suspension re-check. An
+      absent transport means the channel is not running, and a session nobody can
+      drive is not admitted on the strength of a stale key.
+    * The outbound mirror, if any, IS the conversation the session lives in. The
+      dispatcher binds the DM as its own mirror on every turn, and that mirror is
+      the same audience -- but the dashboard can retarget a mirror at any thread
+      or channel, and a retargeted DM republishes what it reads to people who
+      are not the owner. So the mirror must equal the ORIGIN conversation the
+      dispatcher recorded (``SessionManager.get_origin_link``, written on every
+      inbound turn beside the mirror bind); an unknown origin, an unreadable
+      store or a mirror that names anywhere else refuses. Compared as a whole
+      :class:`ChannelLink` because the DM channel id is not the peer id on every
+      surface (Discord's is the id ``create_dm_channel`` returned), so no
+      derivation from the key could stand in for the recorded truth.
+
+    What this deliberately does NOT establish is unfenced reach: an admitted DM is
+    creator-fenced by :func:`_caller_is_ownership_fenced`, so a wrong inference
+    costs the sessions the DM created and never the person's own tabs. Group and
+    thread sessions, every other channel, and ``channel.CHANNEL_AGENT_BLOCKED_TOOLS``
+    are untouched.
+
+    The clause walk itself is :func:`owner_dm_refusal`, which names the first fact
+    that fails; this is its boolean face.
+    """
+    return not owner_dm_refusal(state, slot)
+
+
+ORIGIN_NOT_ON_RECORD = (
+    "this conversation's origin is not on record -- the channel dispatcher records "
+    "it on each inbound message and it is not kept across a gateway restart, so "
+    "send a message from the DM and retry"
+)
+"""The refusal an owner DM meets between a gateway restart and its next inbound turn.
+
+The origin (``SessionManager.get_origin_link``) is held in memory only, while the
+slot and its mirror are persisted and re-surfaced at boot -- so a monitor-loop cycle
+or a dashboard-tab turn that runs before the owner's next channel message finds
+every other clause satisfied and this one not. Naming it keeps a caller from
+hunting for a link it cannot clear; the exemption itself stays withheld, because a
+mirror without the recorded origin cannot be told from a retarget.
+"""
+
+
+def owner_dm_refusal(state: "DashboardState", slot: "_ChatSlot") -> str:
+    """Why *slot* is not the owner's own DM -- ``""`` when it is.
+
+    The clause-by-clause body of :func:`audience_is_owner`, kept as ONE function so
+    a gate that refuses can say which positive fact was missing without a second
+    walk that could disagree with the first. Every reason is generic -- a surface
+    name at most, never an id -- because it is rendered into the refusal the
+    caller reads in its own channel.
+    """
+    link = _channel_link_of(slot)
+    if not link:
+        return "the session is not channel-born"
+    parsed = parse_session_key(link)
+    if parsed is None:
+        return "the session key does not name a channel conversation"
+    if parsed.surface not in OWNER_DM_CONDUCTOR_SURFACES:
+        return f"{parsed.surface} is not a verified owner-DM surface"
+    if parsed.chat_type != CHAT_TYPE_DIRECT or len(parsed.scope) != 1:
+        return "the conversation is not a 1:1 direct message"
+    transport = state.get_channel_transport(parsed.surface)
+    if transport is None:
+        return f"the {parsed.surface} channel is not running"
+    try:
+        owner = sole_direct_target(transport.configured_targets())
+    except Exception:
+        logger.debug("owner-DM check: %s targets unreadable", parsed.surface, exc_info=True)
+        return f"the {parsed.surface} roster is unreadable"
+    if not owner or owner != f"{DM_TARGET_PREFIX}{parsed.scope[0]}":
+        return "the channel's roster does not name this conversation's peer as its sole owner"
+    sessions = getattr(state, "sessions", None)
+    if sessions is None:
+        return "the session store is unavailable"
+    try:
+        origin = sessions.get_origin_link(link)
+        mirror = sessions.get_mirror_link(link)
+    except Exception:
+        logger.debug("owner-DM check: session store unreadable for %s", link, exc_info=True)
+        return "the session store is unreadable"
+    if not isinstance(origin, ChannelLink):
+        return ORIGIN_NOT_ON_RECORD
+    if mirror is None or (isinstance(mirror, ChannelLink) and mirror == origin):
+        return ""
+    return "the outbound mirror points somewhere other than this conversation"
+
+
+def session_audience_is_owner(state: "DashboardState", session_key: str) -> bool:
+    """:func:`audience_is_owner` for a caller known only by its session key.
+
+    The ledger gate holds an ``X-Session-Key`` and no slot, so it resolves the
+    slot the way every session-control verb does -- :func:`caller_slot_key`, the
+    identity ``list_sessions`` reports -- and judges THAT slot. Resolving through
+    the same function is what makes "the ledger gate and session control agree on
+    the same slot" true by construction rather than by two lookups happening to
+    coincide; a key that resolves to no open slot is refused, as
+    :func:`authorize_target` refuses an unidentifiable caller.
+    """
+    return not session_owner_dm_refusal(state, session_key)
+
+
+def session_owner_dm_refusal(state: "DashboardState", session_key: str) -> str:
+    """:func:`owner_dm_refusal` over the slot *session_key* resolves to; see
+    :func:`session_audience_is_owner` for why it resolves the way it does."""
+    slot_key = caller_slot_key(state, session_key)
+    slot = state.get_slot(slot_key) if slot_key else None
+    if slot is None:
+        return "the session key resolves to no open slot"
+    return owner_dm_refusal(state, slot)
+
+
 # ── Drain-time re-validation of queued prompts ──
 #
 # Authorization is decided when a prompt is ADMITTED — `authorize_target` for
@@ -748,6 +940,20 @@ def _has_channel_mirror(
 
 # Queue-entry meta key carrying the admission-time containment snapshot.
 QUEUED_CONTAINMENT_META_KEY = "queued_containment"
+
+# Queue-entry meta key naming the slot that SENT a cross-session delivery, so a
+# drain-time drop can be reported back to it. It rides ``meta`` rather than a
+# consumption callback because ``meta`` is one of the keys a queued prompt is
+# persisted with, while an entry carrying a callback is excluded from that write
+# (``slot_queue_repository._is_durable_queue_entry``): recording the sender as a
+# callback would trade a relay's survival across a restart for a notice that
+# cannot survive one either. A requeued steer keeps it for free — the requeue
+# copies the admission dict onto the new entry's meta.
+SEND_ORIGIN_META_KEY = "send_origin_slot"
+
+# How much of a dropped delivery's own text the sender's notice quotes back, so
+# a caller holding several deliveries in flight can tell which one went.
+SEND_DROP_EXCERPT_CHARS = 120
 
 # Transcript-notice phrasing per snapshot field, for the drop notice a reader
 # of the session must be able to understand without knowing this module.
@@ -845,6 +1051,107 @@ def containment_meta(state: "DashboardState", slot: "_ChatSlot") -> dict[str, An
     return {QUEUED_CONTAINMENT_META_KEY: containment_snapshot(state, slot, on_probe_failure=False)}
 
 
+def send_origin_meta(state: "DashboardState", sender_slot_key: str) -> dict[str, Any]:
+    """Queue-entry ``meta`` naming the slot a cross-session delivery came FROM.
+
+    Stamped by the delivery paths that admit one session's text onto another
+    session's queue, so a drain-time drop can be reported back to the sender
+    (:func:`notify_send_origin_dropped`). The sender is told at admission that
+    the message was queued rather than started; the drop itself is visible only
+    on the target's transcript and in the audit trail, neither of which the
+    sender reads.
+
+    The stamp carries the sender's TAB IDENTITY beside its key, and both must be
+    present or nothing is stamped. A slot key does not identify a session: the
+    explicitly-named keys are deterministic (``cron-{job.id}``,
+    ``workflow-{run_id}``, a channel's own), so a closed slot's key is handed to
+    the next occupant, whose ``app``, ``origin`` and link scope are declared per
+    creation and need not match the sender's. Resolving the notice from the key
+    alone therefore appends one session's text to a DIFFERENT session's
+    transcript once the sender closes and the key is reused. ``_tab_id`` is
+    minted per slot object and is the identity the neighbouring save and close
+    paths already compare on (``chat_persistence._slot_still_ours``).
+
+    Empty for a caller with no slot of its own, and the key is then omitted
+    rather than stamped blank: absent must mean "nobody to report to", which a
+    blank string cannot be told apart from. A caller whose slot carries no tab
+    identity is omitted the same way, because a stamp whose identity cannot be
+    checked later is the one shape that must not produce a write.
+    """
+    key = str(sender_slot_key or "")
+    if not key:
+        return {}
+    sender = state.get_slot(key)
+    tab = str(getattr(sender, "_tab_id", "") or "")
+    if not tab:
+        return {}
+    return {SEND_ORIGIN_META_KEY: {"slot": key, "tab": tab}}
+
+
+def send_origin_slot(entry_meta: Any) -> str:
+    """The sending slot key stamped on a queue entry, or ``""``.
+
+    Pairs with :func:`send_origin_tab`: the key says where to write and the tab
+    says which occupant of that key is owed the notice, so a caller that resolves
+    a recipient needs BOTH to agree with the live slot.
+
+    *entry_meta* is plumbing of any shape, so a missing, non-dict or malformed
+    value reads as no sender and the drop proceeds exactly as it did before the
+    stamp existed.
+
+    A stamp this reads is one THIS process admitted. The restore path drops the
+    key (:func:`~kiro_crew.dashboard.slot_queue_repository.sanitize_restored_queue`)
+    because the value names a write target rather than being merely read: the
+    drop resolves the recipient of its notice from this stamp and appends the
+    entry's own text there, so a stamp carried back off an editable line would
+    put attacker-chosen text in a session the editor does not own. The price is
+    one notice: a delivery that outlives a restart and is then dropped reports to
+    nobody, while the delivery itself still survives.
+    """
+    return _send_origin_field(entry_meta, "slot")
+
+
+def send_origin_tab(entry_meta: Any) -> str:
+    """The sending slot's tab identity stamped on a queue entry, or ``""``.
+
+    The notice is owed to the slot OBJECT that sent the message, not to whatever
+    currently answers to its key, so this is what tells a reused key apart from
+    the original sender. See :func:`send_origin_meta` for why a key alone is not
+    an identity.
+    """
+    return _send_origin_field(entry_meta, "tab")
+
+
+def _send_origin_field(entry_meta: Any, field: str) -> str:
+    """One string field of the sender stamp, or ``""`` for any other shape.
+
+    Both readers fail closed through here on the same shapes, so a half-written
+    or hand-edited stamp cannot answer one question and not the other -- which is
+    what would let a key be trusted while its identity check silently passed.
+    """
+    if not isinstance(entry_meta, dict):
+        return ""
+    stamp = entry_meta.get(SEND_ORIGIN_META_KEY)
+    if not isinstance(stamp, dict):
+        return ""
+    value = stamp.get(field)
+    return value if isinstance(value, str) else ""
+
+
+def send_drop_excerpt(text: Any) -> str:
+    """The dropped message's own opening, for the notice the sender reads.
+
+    A caller can have several deliveries in flight to several targets, and the
+    target's key alone does not say WHICH message went. Whitespace is collapsed
+    so a multi-line prompt stays one line in the notice, and the cut is marked
+    with an ellipsis so a truncated quote is never mistaken for the whole text.
+    """
+    flat = " ".join(str(text or "").split())
+    if len(flat) <= SEND_DROP_EXCERPT_CHARS:
+        return flat
+    return flat[:SEND_DROP_EXCERPT_CHARS].rstrip() + "…"
+
+
 def newly_held_constraints(
     now: dict[str, Any], entry_meta: Any, *, directive_user_origin: bool = False
 ) -> list[str]:
@@ -936,16 +1243,101 @@ def describe_containment_change(constraints: list[str], *, mirror_unverified: bo
     return "; ".join(labels.get(c, c) for c in constraints)
 
 
-def audit_queued_drop(slot: "_ChatSlot", queue_id: str, constraints: list[str]) -> None:
+def notify_send_origin_dropped(
+    state: "DashboardState",
+    *,
+    origin: str,
+    origin_tab: str = "",
+    target_slot: "_ChatSlot",
+    text: Any,
+    constraints: list[str],
+    mirror_unverified: bool = False,
+) -> bool:
+    """Tell the SENDING session that its queued delivery was dropped at the drain.
+
+    ``send_to_target`` answers ``started: False`` when a busy target queues the
+    message, and on its own that receipt says the message will run later. The
+    drop notice, the retracted queue card and the broadcast all land on the
+    TARGET, which the sender does not read, so the outcome a caller most needs —
+    the message will never run — is the one it cannot see, and a caller polling
+    the target's transcript waits for a reply that cannot come. This notice is
+    what closes that.
+
+    Returns whether a notice was appended. Four cases answer False and are not
+    failures:
+
+    * no stamp (``origin`` empty) — a human typed this into the composer, and
+      there is no peer session waiting on it;
+    * ``origin`` equals the target — a session that queued onto itself already
+      has the target's own notice in the transcript it is reading, and a second
+      row would report one drop twice;
+    * the sending slot is gone — it was closed while the message waited, so
+      there is no transcript left to write to. The SEL row still records the
+      drop against the sender (:func:`audit_queued_drop`), which is what makes
+      the outcome recoverable after the session is gone;
+    * the key is live but holds a DIFFERENT occupant — ``origin_tab`` does not
+      match the slot's ``_tab_id``. Named slot keys are deterministic and get
+      reused, so this is the same case as the one above wearing the previous
+      tenant's name, and writing anyway would put the sender's text on a session
+      that never sent it. Treated as "the sender is gone", because it is.
+
+    An absent ``origin_tab`` answers False whenever a slot is found, so a stamp
+    that cannot be identity-checked never writes: the check is not skippable by
+    omitting its input.
+
+    Best-effort, like the target-side notice: a failure here is logged and the
+    drop still proceeds. Withholding the message is the authorization decision,
+    and it must not depend on the report landing.
+    """
+    if not origin:
+        return False
+    target_key = str(getattr(target_slot, "key", ""))
+    if origin == target_key:
+        return False
+    sender = state._slots.get(origin)
+    if sender is None:
+        return False
+    if str(getattr(sender, "_tab_id", "") or "") != str(origin_tab or ""):
+        return False
+    try:
+        excerpt = send_drop_excerpt(text)
+        sender.append(
+            "notice",
+            f"⚠️ Message you sent to {target_key} was dropped before it ran: "
+            + describe_containment_change(constraints, mirror_unverified=mirror_unverified)
+            + " after it was queued, so the authorization that admitted it no "
+            + "longer holds. It was not delivered and will not run."
+            + (f' Text: "{excerpt}"' if excerpt else ""),
+            "msg msg-info",
+        )
+    except Exception:  # pragma: no cover - reporting must not block the drop
+        logger.exception(
+            "Failed to report a dropped delivery to its sender (origin=%s, target=%s)",
+            origin,
+            target_key,
+        )
+        return False
+    return True
+
+
+def audit_queued_drop(
+    slot: "_ChatSlot", queue_id: str, constraints: list[str], *, origin: str = ""
+) -> None:
     """Record one drain-time drop in the SEL, best-effort and off the loop.
 
     Logged as a denied tool invocation on the TARGET's EFFECTIVE session — a
     linked slot's turns run under ``linked_session_key``, so filing under the
     slot key would hide exactly the drops this feature exists to record. The
-    slot key stays in ``resources``/``metadata``. The admission-time caller may
-    be long gone, so there is no caller identity to attribute the drop to.
+    slot key stays in ``resources``/``metadata``.
+
+    *origin* is the sending slot for a cross-session delivery, read from the
+    entry's own stamp (:data:`SEND_ORIGIN_META_KEY`), so the trail names who was
+    waiting on the dropped message. A human-typed entry carries no stamp and the
+    field is omitted rather than recorded empty.
     """
-    _audit_queue_drain(slot, outcome="denied", queue_ids=[queue_id], newly_held=constraints)
+    _audit_queue_drain(
+        slot, outcome="denied", queue_ids=[queue_id], newly_held=constraints, origin=origin
+    )
 
 
 def audit_queued_allow(slot: "_ChatSlot", queue_ids: list[str]) -> None:
@@ -963,7 +1355,12 @@ def audit_queued_allow(slot: "_ChatSlot", queue_ids: list[str]) -> None:
 
 
 def _audit_queue_drain(
-    slot: "_ChatSlot", *, outcome: str, queue_ids: list[str], newly_held: list[str] | None
+    slot: "_ChatSlot",
+    *,
+    outcome: str,
+    queue_ids: list[str],
+    newly_held: list[str] | None,
+    origin: str = "",
 ) -> None:
     slot_key = str(getattr(slot, "key", ""))
     session_key = effective_session_key(slot)
@@ -973,6 +1370,11 @@ def _audit_queue_drain(
     }
     if newly_held is not None:
         metadata["newly_held"] = ",".join(newly_held)
+    if origin:
+        # Omitted rather than recorded empty: absent means "no sending slot was
+        # stamped" (a human typed it), which a reader must be able to tell from a
+        # cross-session delivery whose sender happens to be unnamed.
+        metadata["origin"] = origin
 
     def _do() -> None:
         sel().log_tool_invocation(
@@ -987,6 +1389,35 @@ def _audit_queue_drain(
         )
 
     _sel_off_loop(_do, "queue-drain revalidation audit")
+
+
+def _refuse_moved_caller_identity(
+    state: "DashboardState",
+    caller_key: str,
+    caller_slot: "_ChatSlot",
+    identity: tuple[str, str, str],
+) -> None:
+    """Refuse a caller whose memory identity differs from *identity*.
+
+    *identity* is the ``(history key, agent, memory store)`` triple
+    :func:`create_session` captured before its first suspension point; the live
+    slot is re-read and compared here, at every later point that derives a
+    verdict from the caller. A caller that is gone, or whose key has been
+    re-minted onto another session, is refused as not open; one that survived
+    but changed what it is -- a channel link landing on it changes its history
+    key, a reassignment changes its store or agent -- is refused as the identity
+    change it is, so the decisions taken on the earlier identity are never
+    applied to the new one and the refusal names the cause rather than whichever
+    downstream gate happened to read the new identity first.
+    """
+    live = state.get_slot(caller_key)
+    if live is None or live is not caller_slot:
+        raise SessionControlError("caller session is not open", code="caller_not_open", status=404)
+    if (slot_history_key(live), live.agent, live.memory_store) != identity:
+        raise SessionControlError(
+            "caller session changed memory assignment while the session was being created",
+            code="caller_memory_changed",
+        )
 
 
 def _refuse_ineligible_creator(state: "DashboardState", caller_slot: "_ChatSlot") -> None:
@@ -1026,19 +1457,30 @@ def _refuse_ineligible_creator(state: "DashboardState", caller_slot: "_ChatSlot"
             "incognito and temporary sessions cannot create sessions",
             code="ephemeral_caller",
         )
-    caller_link = getattr(caller_slot, "linked_session_key", "")
-    if caller_link and not caller_link.startswith(CRON_LINK_PREFIX):
-        # A cron tab's link is its own run transcript, not a channel thread, and
-        # is exempt -- see CRON_LINK_PREFIX. Everything else is a channel link.
-        raise SessionControlError(
-            "channel-linked sessions cannot create sessions",
-            code="linked_session_caller",
-        )
-    if _has_channel_mirror(state, caller_slot):
-        raise SessionControlError(
-            "sessions mirrored to a channel cannot create sessions",
-            code="mirrored_caller",
-        )
+    # The channel link and mirror refusals share ONE exemption with
+    # `authorize_target`'s caller half: :func:`audience_is_owner`, a 1:1 DM whose
+    # only human is the configured owner and whose mirror (if any) is that same
+    # DM. It waives both together, because the predicate has already established
+    # that the mirror IS the DM -- waiving the link alone would refuse every owner
+    # DM on the origin mirror its dispatcher binds each turn. The refusal names
+    # the clause that failed (:func:`owner_dm_refusal`): the code stays the same,
+    # but a DM that lost its origin to a gateway restart is told to send a message
+    # rather than left hunting for a link it cannot clear.
+    if why := owner_dm_refusal(state, caller_slot):
+        if _channel_link_of(caller_slot):
+            # A cron tab's link is its own run transcript, not a channel thread,
+            # and is exempt -- see CRON_LINK_PREFIX. Everything else is a channel
+            # link.
+            raise SessionControlError(
+                "channel-linked sessions cannot create sessions; the owner-DM "
+                f"exemption is withheld because {why}",
+                code="linked_session_caller",
+            )
+        if _has_channel_mirror(state, caller_slot):
+            raise SessionControlError(
+                "sessions mirrored to a channel cannot create sessions",
+                code="mirrored_caller",
+            )
 
 
 def _resolve_slot(state: "DashboardState", target: str) -> "_ChatSlot | None":
@@ -1415,6 +1857,14 @@ async def create_session(
             # touched, so the only thing it changes is which entry is dropped.
             refresh_vouched_session_execution(caller_memory_identity[0])
         else:
+            # The fence is read LIVE, and it reads the caller's channel link (an
+            # owner-DM caller is fenced), so a caller whose identity moved during
+            # the awaits above -- a link landing on it, a store or agent change --
+            # must be named as such HERE, before any verdict is derived from its
+            # new identity. The re-gate before allocation exists precisely to name
+            # that case, and a link landing mid-resolution must surface as the
+            # identity change it is, not as a delegation refusal.
+            _refuse_moved_caller_identity(state, caller_key, caller_slot, caller_memory_identity)
             # Off-loop: the inline predicate reads the config record. Only reached
             # when the carried verdict is absent, and only for a private selection,
             # so an ordinary create pays nothing.
@@ -1535,15 +1985,7 @@ async def create_session(
             "caller session changed workspace while the session was being created",
             code="caller_workspace_changed",
         )
-    if (
-        slot_history_key(live_caller),
-        live_caller.agent,
-        live_caller.memory_store,
-    ) != caller_memory_identity:
-        raise SessionControlError(
-            "caller session changed memory assignment while the session was being created",
-            code="caller_memory_changed",
-        )
+    _refuse_moved_caller_identity(state, caller_key, caller_slot, caller_memory_identity)
     _refuse_ineligible_creator(state, live_caller)
     # The child's origin tag, read off the caller that is live NOW -- see the
     # reasoning above the folder gate. `_cron_caller` covers a cron's own tab;
@@ -2401,34 +2843,44 @@ def authorize_target(
             "incognito and temporary sessions cannot control other sessions",
             "ephemeral_caller",
         )
-    caller_link = getattr(caller_slot, "linked_session_key", "")
-    if caller_link and not caller_link.startswith(CRON_LINK_PREFIX):
-        # The exfiltration direction, and the reason this is not merely the
-        # mirror of the target-side check: a linked caller's own conversation is
-        # a channel thread, so anything it reads lands in front of whoever is in
-        # that channel. `session_read_message` would hand a private dashboard
-        # transcript to Slack/Discord readers who were never party to it.
-        #
-        # `CHANNEL_AGENT_BLOCKED_TOOLS` already blocks these tools for channel
-        # AGENTS, but that guard keys on the agent identity; a linked SLOT is a
-        # second route to the same surface and has to be closed on its own.
-        #
-        # A cron tab's link is exempt because it is not a channel: it names the
-        # job's own run transcript and republishes to nobody, so a read through it
-        # reaches no audience the caller did not already have. See
-        # CRON_LINK_PREFIX.
-        raise deny(
-            "channel-linked sessions cannot control other sessions",
-            "linked_session_caller",
-        )
-    if _has_channel_mirror(state, caller_slot):
-        # The exfiltration direction again, via the outbound mechanism: a mirrored
-        # caller republishes its own turns to a channel, so a peer's transcript it
-        # reads lands in front of that channel's audience.
-        raise deny(
-            "sessions mirrored to a channel cannot control other sessions",
-            "mirrored_caller",
-        )
+    # The one exemption from both caller-side channel refusals below, shared with
+    # `_refuse_ineligible_creator` so the two halves cannot drift on WHO is exempt:
+    # :func:`audience_is_owner`, a 1:1 DM whose only human is the configured owner
+    # and whose mirror (if any) is that same DM. It waives both refusals together,
+    # because it has already established that the mirror IS the DM -- waiving the
+    # link alone would refuse every owner DM on the origin mirror its dispatcher
+    # binds each turn. An admitted DM is creator-fenced further down. The refusal
+    # names the clause that failed (:func:`owner_dm_refusal`), code unchanged.
+    if why := owner_dm_refusal(state, caller_slot):
+        if _channel_link_of(caller_slot):
+            # The exfiltration direction, and the reason this is not merely the
+            # mirror of the target-side check: a linked caller's own conversation
+            # is a channel thread, so anything it reads lands in front of whoever
+            # is in that channel. `session_read_message` would hand a private
+            # dashboard transcript to Slack/Discord readers who were never party
+            # to it.
+            #
+            # `CHANNEL_AGENT_BLOCKED_TOOLS` already blocks these tools for channel
+            # AGENTS, but that guard keys on the agent identity; a linked SLOT is
+            # a second route to the same surface and has to be closed on its own.
+            #
+            # A cron tab's link is exempt because it is not a channel: it names
+            # the job's own run transcript and republishes to nobody, so a read
+            # through it reaches no audience the caller did not already have. See
+            # CRON_LINK_PREFIX.
+            raise deny(
+                "channel-linked sessions cannot control other sessions; the owner-DM "
+                f"exemption is withheld because {why}",
+                "linked_session_caller",
+            )
+        if _has_channel_mirror(state, caller_slot):
+            # The exfiltration direction again, via the outbound mechanism: a
+            # mirrored caller republishes its own turns to a channel, so a peer's
+            # transcript it reads lands in front of that channel's audience.
+            raise deny(
+                "sessions mirrored to a channel cannot control other sessions",
+                "mirrored_caller",
+            )
 
     if getattr(slot, "workspace", "default") != getattr(caller_slot, "workspace", "default"):
         # Workspaces are the memory boundary; reaching across one would let a
@@ -2468,11 +2920,13 @@ def authorize_target(
         # from the agent-created wording needs ``_member_caller``, which can read
         # config — the ``close_target`` re-check runs in a no-suspension window and
         # MUST NOT reach it. So on a carried verdict the text names the rule
-        # rather than a class it cannot see; the cron prefix is still readable
-        # without config, and the inline path keeps the three-way wording since
-        # it is already reading config anyway.
+        # rather than a class it cannot see; the cron prefix and the channel link
+        # are still readable without config, and the inline path keeps the
+        # per-class wording since it is already reading config anyway.
         if _cron_caller(caller_key):
             fence_reason = "a scheduled run can only control sessions it created itself"
+        elif _channel_link_of(caller_slot):
+            fence_reason = "an owner-DM channel session can only control sessions it created itself"
         elif precomputed_ownership_fenced is not None:
             fence_reason = "this session can only control sessions it created itself"
         elif _member_caller(state, caller_key):
@@ -3215,7 +3669,7 @@ async def close_target(
     Reuses the dashboard's own close path (:func:`chat_handlers.close_slot`), so
     a controlled close and a human ✕ share the identical nudge-retirement and
     app-notification ordering that keeps a dismissed tab from being resurrected.
-    Its three failure modes surface as their own ``SessionControlError`` codes
+    Its four failure modes surface as their own ``SessionControlError`` codes
     rather than a generic 500, so a caller can tell "the app refused the
     dismissal" from "history could not be saved".
     """
@@ -3308,9 +3762,9 @@ async def close_target(
     except SlotCloseError as exc:
         # The close path already rolled back every partial step and logged the
         # cause; re-raise it as the surface's own error so the caller sees the
-        # specific reason (nudge/app/history) rather than a bare failure. Audited
-        # as a denied operation so the trail shows the close was attempted and did
-        # not take.
+        # specific reason (write-in-flight/nudge/app/history) rather than a bare
+        # failure. Audited as a denied operation so the trail shows the close was
+        # attempted and did not take.
         _audit(
             caller_session_key=caller_session_key,
             operation="close",
@@ -3361,7 +3815,10 @@ async def send_to_target(
     A queued delivery is re-validated at the drain: the entry
     carries the containment that held here, and a constraint newly held at
     delivery time drops it with a visible notice instead of executing it under
-    the weaker authorization that admitted it.
+    the weaker authorization that admitted it. The entry also carries THIS
+    caller's slot, so that drop appends a notice to the caller's own transcript
+    as well: ``started: False`` says the message will run later, and a caller
+    told only that would otherwise wait for a reply that can never come.
 
     ``steer`` asks for a THIRD outcome on a busy target: the message cuts into
     the turn already running (``steer_into_running_turn``) instead of waiting for
@@ -3492,7 +3949,13 @@ async def send_to_target(
         # separates `authorize_target` from here -- so this IS the containment the
         # authorization cleared, recorded in the drain's own vocabulary so the
         # comparison below is the same one queued prompts get.
-        admission = containment_meta(state, slot)
+        #
+        # The sending slot rides the same dict because the REQUEUE copies it onto
+        # the entry verbatim, so a steer that falls back to the queue and is then
+        # dropped at the drain reports back to us like any queued delivery. Inert
+        # for the two other readers: `newly_held_constraints` reads only the
+        # containment key, and so does the audience fence below.
+        admission = {**containment_meta(state, slot), **send_origin_meta(state, caller_key)}
 
         # Which turn this steer is going into. `_turn_generation` increments on every
         # task assignment, so it identifies a turn even if a later task object reuses
@@ -3672,7 +4135,18 @@ async def send_to_target(
         # function can reach is ever unattended, and a wrapper would only add a
         # never-taken timeout arm. The composer's own queued path does the same
         # (`server.py` passes `_run_chat` directly).
-        started = bool(slot.enqueue_or_run_prompt(prompt, _run_chat, state))
+        started = bool(
+            slot.enqueue_or_run_prompt(
+                prompt,
+                _run_chat,
+                state,
+                # Only the QUEUE arm keeps it (the run arm has no entry): a
+                # delivery that waits is the one a later drain can drop, and this
+                # stamp is what lets that drop be reported back to us instead of
+                # ending at the target's own transcript.
+                extra_meta=send_origin_meta(state, caller_key),
+            )
+        )
     try:
         state.push_slots_update()
     except Exception:  # pragma: no cover - sidebar refresh is best-effort

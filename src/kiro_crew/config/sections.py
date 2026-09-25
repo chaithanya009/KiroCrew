@@ -3145,6 +3145,17 @@ class DashboardConfig:
             restart=True,
         ),
     )
+    crewmate_threads: bool = field(
+        default=False,
+        metadata=_meta(
+            "Reply threads on crewmate chat messages",
+            "Let any message in a crewmate's chat carry its own reply thread, "
+            "opened in the side panel while the main chat stays visible. Off by "
+            "default: the thread routes answer not-found, no thread frame is sent, "
+            "and the dashboard draws no Reply in thread control. Takes effect on "
+            "the next request; no restart.",
+        ),
+    )
     qr_session_until_restart: bool = field(
         default=True,
         metadata=_meta(
@@ -3647,6 +3658,16 @@ class DashboardConfig:
             "opt-out, and a ping sent before the offer makes the offer meaningless.",
         ),
     )
+    crewmates_onboarded: bool = field(
+        default=False,
+        metadata=_meta(
+            "Crewmates Onboarded",
+            "Whether the user has finished or dismissed the first-run Meet CrewMates "
+            "flow (the four-step introduction that creates the first crewmate). "
+            "Server-backed like the other first-run flags so a second machine does "
+            "not replay it. Also set when the flow is re-run from the Crewmates page.",
+        ),
+    )
     user_role: str = field(
         default="",
         metadata=_meta(
@@ -3834,6 +3855,17 @@ class KiroCrewAgentConfig:
             "its role effort). A per-session pick still overrides this. Only "
             "reasoning-capable models accept a level; on any other model the pin "
             "is ignored, exactly as the global default is.",
+        ),
+    )
+    display_name: str = field(
+        default="",
+        metadata=_meta(
+            "Display Name",
+            "Optional label the dashboard shows instead of the agent's name. "
+            "Purely presentational: the name stays the immutable identity — it "
+            "keys this record, addresses /api/agents/{name}, and is what "
+            "dispatch, crons and spawn resolve — so renaming the label never "
+            "breaks a binding. Empty means the dashboard shows the name itself.",
         ),
     )
     description: str = field(
@@ -4663,10 +4695,24 @@ class ChannelConfig:
         )
 
 
-#: The provider an unusable ``stt.provider`` degrades to, and the default. It is
-#: the only one with no precondition: recognition runs in this process on every
-#: supported OS, with no account, no platform floor, and no separate install.
+#: The default provider, and the one a RETIRED ``stt.provider`` degrades to. It is
+#: the only recogniser with no precondition: recognition runs in this process on
+#: every supported OS, with no account, no platform floor, and no separate install.
 STT_PROVIDER_LOCAL = "local"
+
+#: No recogniser at all. Selectable, so that "turn speech off" has a value a user
+#: can write from the CLI, and the value an UNKNOWN ``stt.provider`` degrades to.
+#: The distinction from ``enabled=False`` is only where it is set: both leave
+#: every speech path answering "disabled", nothing is loaded and nothing bills.
+#:
+#: Degrading an unknown value onto ``local`` instead would put a typo, or a value
+#: a bot guessed at, onto the one provider that links a native library into this
+#: process: a user told to set ``stt.provider off`` while that library is
+#: crashing on model load gets the crashing engine back, and learns it only from
+#: a WARNING line (kirodotdev/KiroCrew#13179). A value the loader cannot honour
+#: fails closed: whatever was meant, "run nothing" is the one reading that cannot
+#: make things worse.
+STT_PROVIDER_OFF = "off"
 
 #: Local Whisper can detect the spoken language; forcing English corrupts
 #: multilingual dictation before the recogniser can choose the right tokens.
@@ -4677,7 +4723,9 @@ STT_LANGUAGE_FALLBACK = "en-US"
 #: ``apple`` uses macOS 26+ on-device recognition, and ``transcribe`` sends audio
 #: to AWS Transcribe (billed, and gated on the AWS consent prompt). All three
 #: produce partial results, so streaming is not a per-provider capability.
-_VALID_STT_PROVIDERS = (STT_PROVIDER_LOCAL, "apple", "transcribe")
+#: ``off`` selects no recogniser; it is deliberately absent from
+#: ``stt_stream._STREAMING_PROVIDERS``, which grants by positive membership.
+_VALID_STT_PROVIDERS = (STT_PROVIDER_LOCAL, "apple", "transcribe", STT_PROVIDER_OFF)
 
 #: Providers a stored config may still name. Each of these needed an out-of-band
 #: install the user had to perform themselves (a whisper CLI on ``PATH``, or an
@@ -4715,24 +4763,47 @@ def stt_provider_is_coerced(value: object) -> bool:
     return value not in _VALID_STT_PROVIDERS
 
 
+def stt_provider_resolution(value: object) -> str:
+    """The provider a stored ``stt.provider`` of *value* runs as. Pure; never logs.
+
+    Where an unusable value degrades TO depends on what is known about it. A
+    retired name lands on ``local``: that user had local recognition and keeps
+    it. Anything else lands on :data:`STT_PROVIDER_OFF`: a value nobody can
+    account for must not select the provider that links a native library into
+    the gateway. A JSON ``null`` names nothing, so it is the ABSENT key, not a
+    wrong one: it takes the default the way a missing key does.
+
+    Separate from :func:`_validated_stt_provider` so a surface that only needs
+    the answer -- ``kirocrew config defaults --adopt`` deciding what to write --
+    can ask without triggering, or having to suppress, the load-time notice.
+    """
+    if value in _VALID_STT_PROVIDERS:
+        return str(value)
+    if value is None or value in _RETIRED_STT_PROVIDERS:
+        return STT_PROVIDER_LOCAL
+    return STT_PROVIDER_OFF
+
+
 def _validated_stt_provider(value: object) -> str:
-    """Return *value* if it is selectable, else degrade to ``local`` with a reason.
+    """:func:`stt_provider_resolution`, with the load-time notice for a degrade.
 
     Degrades and logs; never raises. This value arrives from ``config.json``, so
-    an unusable one must leave voice input working the way
+    an unusable one must leave the load working the way
     :func:`_normalize_acp_backend` degrades an unusable persisted backend, rather
     than failing the load that read it.
 
     The notice names the command that removes the dead value. A load never writes,
     so without that pointer the line repeats on every invocation forever -- and
     unlike a superseded default there is nothing here to preserve, since the stored
-    value cannot take effect either way.
+    value cannot take effect either way. A ``null`` says nothing: it is the absent
+    key, not a wrong one.
     """
-    if value in _VALID_STT_PROVIDERS:
-        return str(value)
+    resolved = stt_provider_resolution(value)
+    if value in _VALID_STT_PROVIDERS or value is None:
+        return resolved
     seen = repr(value)
     if seen in _WARNED_STT_PROVIDERS:
-        return STT_PROVIDER_LOCAL
+        return resolved
     _WARNED_STT_PROVIDERS.add(seen)
     if value in _RETIRED_STT_PROVIDERS:
         logger.warning(
@@ -4741,17 +4812,19 @@ def _validated_stt_provider(value: object) -> str:
             "recognising the same speech. Run 'kirocrew config defaults --adopt' "
             "to drop the stored value and this notice.",
             value,
-            STT_PROVIDER_LOCAL,
+            resolved,
         )
     else:
         logger.warning(
-            "Unknown STT provider %r; using %r instead. Selectable providers: %s. "
-            "Run 'kirocrew config defaults --adopt' to drop the stored value.",
+            "Unknown STT provider %r; using %r instead, so no recogniser runs until "
+            "the value is fixed. Selectable providers: %s. Run "
+            "'kirocrew config set stt.provider <provider>' to choose one, or "
+            "'kirocrew config defaults --adopt' to drop the stored value.",
             value,
-            STT_PROVIDER_LOCAL,
+            resolved,
             ", ".join(_VALID_STT_PROVIDERS),
         )
-    return STT_PROVIDER_LOCAL
+    return resolved
 
 
 def _validated_stt_model(value: object) -> str:
@@ -5089,7 +5162,8 @@ class SttConfig:
             "account (it downloads one model the first time you dictate), `apple` "
             "uses the on-device recogniser built into macOS 26 and later, and "
             "`transcribe` sends your audio to AWS Transcribe, which bills your AWS "
-            "account.",
+            "account. `off` runs no recogniser at all, the same as turning speech "
+            "input off.",
             enum=list(_VALID_STT_PROVIDERS),
         ),
     )
@@ -6007,6 +6081,24 @@ class NudgeWakeConfig:
         ),
     )
 
+    quiet_streak_floor: int = field(
+        default=0,
+        metadata=_meta(
+            "Quiet ticks before firing anyway",
+            "How many QUIET verdicts in a row end the run of skipped turns. The Nth "
+            "consecutive QUIET tick FIRES regardless of its own verdict, so this many "
+            "quiet verdicts skip one fewer turn than the number suggests, and a judge "
+            "that is wrong about a subject costs a late turn rather than silence. 0, "
+            "the default, means inherit the shipped floor -- the same number the typed "
+            "probe path uses, spelled once in the loop engine so the two cannot drift. "
+            "A negative value also reads as inherit. This knob only ever SHORTENS the "
+            "silence window: the shipped floor is the ceiling, and a larger value is "
+            "clamped back down to it, because config.json is writable by an "
+            "auto-approved agent shell and a raised floor would silence a watch with "
+            "no new code, only a number.",
+        ),
+    )
+
     @classmethod
     def from_raw(cls, section: object) -> "NudgeWakeConfig":
         """Normalize rather than reject, the posture the whole section takes.
@@ -6029,6 +6121,12 @@ class NudgeWakeConfig:
             # cannot use would make the saved config disagree with what the operator
             # wrote, and the bound that matters is at the call that names a model.
             llm_model=raw_model.strip() if isinstance(raw_model, str) else "",
+            # Absent, malformed and negative all read as 0, which the engine resolves
+            # to its shipped floor. The ceiling is NOT clamped here: it is the engine's
+            # own constant, and importing it would invert this module's dependency on
+            # the loop engine (which imports ``config.loader`` at module scope). The
+            # engine clamps on every read, so an over-large value never takes effect.
+            quiet_streak_floor=_safe_int(section.get("quiet_streak_floor", 0), 0, 0),
         )
 
 
@@ -6156,8 +6254,9 @@ class DecisionsConfig:
         default_factory=NudgeWakeConfig,
         metadata=_meta(
             "Wake judge",
-            "Per-point settings for nudge.wake: which judge answers, and the model "
-            "id for the small-model lane. The Jev lane still needs this point's "
+            "Per-point settings for nudge.wake: which judge answers, the model "
+            "id for the small-model lane, and how long a judge may keep a loop "
+            "quiet before one fires anyway. The Jev lane still needs this point's "
             "consent scope on the Decisions card; the small-model lane needs no "
             "consent row, because it sends to the model provider your sessions "
             "already use, so picking it here is what runs it.",

@@ -85,7 +85,11 @@ from kiro_crew.messaging.renderer import (
     display_safe_for,
     format_overflow,
 )
-from kiro_crew.messaging.transport import delivery_confirmed
+from kiro_crew.messaging.transport import (
+    DM_TARGET_PREFIX,
+    delivery_confirmed,
+    sole_direct_target,
+)
 from kiro_crew.notifications.bus import (
     NotificationPayload,
     NotificationValidationError,
@@ -2019,8 +2023,9 @@ _CHANNEL_TYPE_RE = re.compile(r"^[a-z][a-z0-9_]{1,31}$")
 
 #: The ``configured_targets()`` prefix every transport gives a DIRECT
 #: conversation (``user:<identity>``). A ``thread:`` or room target is a
-#: different audience and is never the owner's DM.
-_DM_TARGET_PREFIX = "user:"
+#: different audience and is never the owner's DM. The one spelling lives in
+#: ``messaging.transport``, beside the owner inference that reads it.
+_DM_TARGET_PREFIX = DM_TARGET_PREFIX
 
 #: Request fields that only exist in Slack's protocol. Combined with a channel
 #: ``session`` they are refused rather than dropped: a caller that asked for a
@@ -2055,25 +2060,31 @@ def _owner_dm_target(transport: Any) -> str:
     would deliver a message the agent decided to send once N times. With no single
     answer the caller degrades to the dashboard notification, which reaches the
     operator without guessing who they are.
+
+    The inference itself is :func:`~kiro_crew.messaging.transport.sole_direct_target`,
+    shared with session control's owner-DM audience predicate so the two surfaces
+    name the same human as the owner; this wrapper adds only the enumeration guard
+    and the send-path logging.
     """
     try:
         targets = list(transport.configured_targets())
     except Exception:
         logger.warning("send_message: could not enumerate channel targets", exc_info=True)
         return ""
-    direct = [
-        str(getattr(target, "target_id", "") or "")
-        for target in targets
-        if str(getattr(target, "target_id", "") or "").startswith(_DM_TARGET_PREFIX)
-        and getattr(target, "available", False)
-    ]
-    if len(direct) == 1:
-        return direct[0]
-    if direct:
+    target = sole_direct_target(targets)
+    if target:
+        return target
+    direct_count = sum(
+        1
+        for candidate in targets
+        if str(getattr(candidate, "target_id", "") or "").startswith(_DM_TARGET_PREFIX)
+        and getattr(candidate, "available", False)
+    )
+    if direct_count:
         logger.info(
             "send_message: %d configured DM targets and no owner field, so no single "
             "recipient can be inferred; degrading to the dashboard notification",
-            len(direct),
+            direct_count,
         )
     return ""
 
@@ -5885,7 +5896,23 @@ async def api_teams_activity(request: web.Request) -> web.Response:
     # no-dashboard-imports property. ``on_activity`` reads the parsed dict from
     # the request mapping, so the body is parsed exactly once and never past the
     # cap.
-    body, cap_error = await read_bounded_json(request, max_bytes=TEAMS_MAX_ACTIVITY_BYTES)
+    #
+    # ``require_json_content_type=False`` is what KEEPS that true here, and is not
+    # a relaxation of this route's perimeter. The shared helper's 415 returns
+    # before a single byte is read; the ``status == 413`` filter below then drops
+    # it, because a verdict derived from body CONTENT must not precede the JWT
+    # check. The body would therefore reach ``on_activity`` unstashed and be
+    # re-parsed by its bare ``request.json()`` fallback on a stream nobody has
+    # read -- bounded only by the app-wide ``client_max_size``, not by
+    # ``TEAMS_MAX_ACTIVITY_BYTES``. Opting out means the capped read runs, so an
+    # over-cap activity is still refused 413 whatever media type it declared.
+    # Whether to REFUSE a non-JSON media type from the Connector is a separate
+    # decision about an external contract; see ``read_bounded_json``.
+    body, cap_error = await read_bounded_json(
+        request,
+        max_bytes=TEAMS_MAX_ACTIVITY_BYTES,
+        require_json_content_type=False,
+    )
     if cap_error is not None and cap_error.status == 413:
         return cap_error
     if body is not None:

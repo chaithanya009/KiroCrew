@@ -529,11 +529,24 @@ _REGISTER_TIMEOUT_SECS = 5.0
 #                    ``rejected`` frames carry a ``class``. A stub that did not
 #                    see this capability never receives ``queued`` (its
 #                    single-response pre-flight would read it as a rejection).
+#   tenant_nonce   — every registered connection is given a per-connection nonce,
+#                    forwarded in ``params._meta`` on each request, including the
+#                    requests whose caller this daemon cannot name. A stub that
+#                    asked to POOL a server separating unnamed co-tenants by that
+#                    nonce (``POOLING_REQUIRES_TENANT_NONCE``) has no other way to
+#                    tell, and the backend has none either: for an unnamed caller,
+#                    an absent tenant block is equally what a 1:1 topology with no
+#                    gateway looks like, and the two need opposite answers — the
+#                    per-process fallback separates sessions exactly right in the
+#                    first and collapses every co-tenant onto one namespace in the
+#                    second. Same reachability as ``poolable_ack``: a daemon that
+#                    outlived a package upgrade is adopted and serves new stubs.
 REGISTERED_CAPABILITIES: tuple[str, ...] = (
     "ensure_backend",
     "bridge_ping",
     "poolable_ack",
     "spawn_queue",
+    "tenant_nonce",
 )
 
 # Rejection classes carried on ``rejected`` frames. The stub runs
@@ -4501,7 +4514,7 @@ async def _acquire_backend(
         for _sk in _secret_keys:
             spawn_env.pop(_sk, None)
         backend.control_plane = control_plane
-        backend.control_plane_denial = "" if control_plane else (denial[0] if denial else "")
+        backend.control_plane_denial = denial[0] if not control_plane and denial else ""
         # Start the stdout pump immediately so replies to the first
         # forwarded message can route back. The task is owned by the
         # Backend and cancelled at shutdown().

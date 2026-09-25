@@ -61,6 +61,7 @@ from kiro_crew.acp import seed_provenance
 from kiro_crew.acp._dispatch import (
     ACP_BACKENDS_META_IDENTITY,
     DRAIN_YIELD_AFTER_S,
+    _dumps_degraded,
     _measure_tool_output,
     agent_version_from_init,
     build_permission_event,
@@ -3064,6 +3065,13 @@ class AcpError(Exception):
         # is a session-expiry / rejected-credential answer, so the dashboard's
         # error row can offer the Kiro sign-in card instead of a retry.
         self.auth_required: bool = False
+        # Spent-allowance tag, set by :func:`_raise_acp_error` when the raw
+        # frame is a usage-limit answer ("The monthly usage limit has been
+        # reached"), so the dashboard's error row can offer a route that needs
+        # no inference where one exists (the feature-request form) instead of a
+        # retry that reproduces the rejection. Terminal like ``auth_required``
+        # and, like it, decided from the raw frame rather than the prose.
+        self.usage_limit: bool = False
         # Structural-rejection tag, set by :func:`_raise_acp_error` when the raw
         # frame is a malformed-request answer ("Improperly formed request"). A
         # DETERMINISTIC rejection of the payload's SHAPE: unlike a transient
@@ -3720,6 +3728,12 @@ _RE_USAGE_LIMIT = re.compile(
 # boilerplate, and scoping to `data` keeps a stray echo in `message` from
 # flipping an otherwise-terminal error.
 _RE_GENERATE_FAILED = re.compile(r"failed to generate a response", re.IGNORECASE)
+# kiro-cli's sibling wrapper for the same class of backend failure, observed
+# AFTER tool results had landed and carrying a request_id: "The service failed
+# to process the request (request_id: ...)". Same momentary-blip reasoning and
+# the same `data`-only scoping as _RE_GENERATE_FAILED; kept as its own pattern
+# so the two branches can word their guidance for the moment each one fails.
+_RE_PROCESS_FAILED = re.compile(r"failed to process the request", re.IGNORECASE)
 
 # kiro-cli's structural rejection of a payload the backend could not parse:
 # "Improperly formed request". This string has NO source-side handling and
@@ -3889,6 +3903,7 @@ def _is_transient_raw_error(error: object, available_models: Sequence[str] | Non
         or _RE_5XX_STATUS.search(haystack)
         or _RE_5XX_HINT.search(haystack)
         or _RE_GENERATE_FAILED.search(data)
+        or _RE_PROCESS_FAILED.search(data)
     )
 
 
@@ -3968,6 +3983,7 @@ def classify_provider_error(haystack: str, *, data: str | None = None) -> Provid
         or _RE_5XX_STATUS.search(text)
         or _RE_5XX_HINT.search(text)
         or _RE_GENERATE_FAILED.search(data_field)
+        or _RE_PROCESS_FAILED.search(data_field)
     )
     if match:
         return ProviderErrorClass(PROVIDER_ERROR_HTTP_5XX, True, match.group(0))
@@ -4592,6 +4608,19 @@ def _format_acp_error(
                 "to a different model in the picker."
                 f"{req_id_suffix}"
             )
+        elif _RE_PROCESS_FAILED.search(data):
+            # kiro-cli's sibling wrapper ("The service failed to process the
+            # request (request_id: ...)"): the backend call failed after the
+            # turn was under way, so a request_id exists but no error class.
+            # Same momentary-blip guidance as the branch above, scoped to
+            # `data` for the same reason. The phrase is kept in the rewrite so
+            # the string classifier in llm_helpers matches either form.
+            formatted = (
+                "The model backend failed to process the request (transient error, "
+                "usually a momentary capacity blip). Retry in a moment; if it keeps "
+                "happening, switch to a different model in the picker."
+                f"{req_id_suffix}"
+            )
         elif _RE_MALFORMED_REQUEST.search(data):
             # Structural rejection: the backend refused the payload
             # because of its shape, not a momentary fault. Retrying the same
@@ -4761,6 +4790,15 @@ def _raise_acp_error(
         and not _RE_USAGE_LIMIT.search(raw_data)
     ):
         err.auth_required = True
+    # Tag a spent plan allowance the same way: from the raw frame, and only when
+    # the formatter reached its usage-limit branch -- an entitlement rejection
+    # that happens to carry limit wording keeps its own (served-model) remedy.
+    # The sign-in tag above already withholds itself for this wording, so the
+    # two tags are exclusive and the row's kind is unambiguous.
+    if _RE_USAGE_LIMIT.search(raw_data) and not _model_is_unentitled(
+        raw_data_field, available_models
+    ):
+        err.usage_limit = True
     raise err
 
 
@@ -13351,7 +13389,7 @@ class AcpClient:
             input_str = ""
             if tool_call_id and raw_input:
                 input_str = (
-                    json.dumps(raw_input, indent=2)
+                    _dumps_degraded(raw_input, indent=2)
                     if isinstance(raw_input, (dict, list))
                     else str(raw_input)
                 )
@@ -13542,7 +13580,7 @@ class AcpClient:
                             if "stdout" in j and j.get("stdout"):
                                 output_parts.append(str(j["stdout"]))
                             else:
-                                output_parts.append(json.dumps(j, default=str))
+                                output_parts.append(_dumps_degraded(j, default=str))
                 # Path 3: an object that is not that envelope at all. Mirrors
                 # ``_dispatch._build_tool_result_event`` -- ``rawOutput`` is
                 # unstructured passthrough, so ``items[]`` is one producer's
@@ -13557,7 +13595,7 @@ class AcpClient:
                 # method, because a cut taken before redaction can split a
                 # credential into fragments no pattern matches.
                 if raw_output and "items" not in raw_output:
-                    output_parts.append(json.dumps(raw_output, default=str))
+                    output_parts.append(_dumps_degraded(raw_output, default=str))
 
         tool_status = str(update.get("status") or "")
         if not output_parts:
@@ -13633,10 +13671,7 @@ class AcpClient:
         # the merged toolLog entry / message meta lines up across both events.
         input_str = ""
         if isinstance(raw_input, (dict, list)) and raw_input:
-            try:
-                input_str = json.dumps(raw_input, indent=2)
-            except (TypeError, ValueError):
-                input_str = str(raw_input)
+            input_str = _dumps_degraded(raw_input, indent=2)
         elif isinstance(raw_input, str):
             input_str = raw_input
         # Edit-style diff content blocks: prefer the rendered unified diff over
@@ -13737,7 +13772,12 @@ class AcpClient:
                         continue
                     try:
                         entry = json.loads(line)
-                    except json.JSONDecodeError:
+                    # A line past the decoder's recursion ceiling raises
+                    # ``RecursionError``, which is a ``RuntimeError`` and not a
+                    # ``JSONDecodeError``: unlisted, it reaches the method's
+                    # catch-all arm and costs every LATER line's results too,
+                    # since the saved offset has already moved past this one.
+                    except (json.JSONDecodeError, RecursionError):
                         continue
                     if entry.get("kind") != "ToolResults":
                         continue
@@ -13759,7 +13799,7 @@ class AcpClient:
                                     if out:
                                         output_parts.append(out[:4000])
                                 else:
-                                    output_parts.append(json.dumps(d, indent=2)[:4000])
+                                    output_parts.append(_dumps_degraded(d, indent=2)[:4000])
                             elif rc.get("kind") == "text":
                                 output_parts.append(str(rc.get("data", ""))[:4000])
                         if output_parts:

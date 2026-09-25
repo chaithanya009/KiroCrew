@@ -29,11 +29,21 @@ from pathlib import Path
 from typing import NoReturn
 from zoneinfo import ZoneInfo
 
-from kiro_crew import __version__, app_lifecycle_client, beacon, model_registry, platform_compat
+from kiro_crew import (
+    __version__,
+    app_lifecycle_client,
+    beacon,
+    crew_teams,
+    model_registry,
+    platform_compat,
+)
 from kiro_crew.agent import reset_agent_model
+from kiro_crew.apps.backend import recorded_backend_port
 from kiro_crew.apps.bridges import (
+    SessionPointerCleanup,
     deregister_app,
     deregister_app_crons_from_service,
+    discard_app_session_pointers,
     register_app,
     register_app_crons_with_service,
 )
@@ -41,6 +51,7 @@ from kiro_crew.apps.manager import (
     disable_app,
     enable_app,
     get_app,
+    get_app_manifest,
     install_app,
     list_apps,
     trust_grant_removal_blocked,
@@ -418,7 +429,9 @@ class _CliConflict(Exception):
     """
 
 
-def _locked_config_write(mutate, *, cleanup_conflict=None, cleanup_failure=None) -> None:
+def _locked_config_write(
+    mutate, *, cleanup_conflict=None, cleanup_failure=None, after_write=None
+) -> None:
     """Run one config delta under the sidecar flock; exit(1) on a conflict.
 
     A load -> mutate dataclass -> ``cfg.save()`` shape cannot be used here: its
@@ -432,11 +445,13 @@ def _locked_config_write(mutate, *, cleanup_conflict=None, cleanup_failure=None)
     ``cleanup_conflict`` runs before the exit(1) on a refused precondition;
     ``cleanup_failure`` runs when the write itself fails -- the workspace
     create passes its staging-drop / install-rollback handlers here.
+    ``after_write`` runs inside the lock once the write has committed (see
+    ``update_config_locked``).
     """
     from kiro_crew.config import loader as _loader
 
     try:
-        _loader.update_config_locked(_loader.config_path(), mutate=mutate)
+        _loader.update_config_locked(_loader.config_path(), mutate=mutate, after_write=after_write)
     except _CliConflict as exc:
         if cleanup_conflict is not None:
             cleanup_conflict()
@@ -772,10 +787,12 @@ def _handle_workspace(args: argparse.Namespace) -> None:
         print("Usage: kirocrew workspace {list|create|update|delete}")
 
 
-def _run_app_action_through_gateway(action: str, app_name: str) -> bool:
+def _run_app_action_through_gateway(
+    action: str, app_name: str, *, payload: dict[str, object] | None = None
+) -> bool:
     """Return true when a live gateway handled an app lifecycle request."""
     try:
-        result = app_lifecycle_client.toggle_app(app_name, action)
+        result = app_lifecycle_client.toggle_app(app_name, action, payload=payload)
     except app_lifecycle_client.AppGatewayTimeout as exc:
         # The outcome is unknown, not negative: the gateway may still be applying
         # the action, so this is neither a refusal nor an invitation to retry.
@@ -801,6 +818,44 @@ def _print_file_only_app_result(app_name: str, *, enabled: bool) -> None:
         "this takes effect at the next gateway start (on Windows and in sandboxed "
         "shells the CLI always uses this path). If a gateway is running now, apply "
         "it live from the dashboard."
+    )
+
+
+def _app_declares_backend(app_name: str) -> bool:
+    """Whether *app_name*'s manifest declares a backend process.
+
+    One of the two positive signals the file-only uninstall's warning fires on, and
+    sound only as one of two. A DECLARATION is a positive property of the app, so
+    record-absence must not silence the warning: an app with no persisted record is
+    exactly the case where nothing may be concluded. But this answer is read from
+    the app's own ``app.json``, writable by any app trusted to run code, so
+    manifest-absence must not silence it either — an app that drops its
+    ``entryPoint`` would otherwise hide the process it is still running. The caller
+    therefore also reads the gateway-owned recorded port, which the app cannot
+    reach, and warns on either. An unreadable or missing manifest answers ``True``
+    for the same reason both halves exist: not knowing is not the same as knowing
+    there is nothing to stop.
+    """
+    try:
+        manifest = get_app_manifest(app_name)
+    except Exception:  # noqa: BLE001 - a malformed manifest must not fail an uninstall
+        return True
+    if manifest is None:
+        return True
+    return bool(getattr(getattr(manifest, "backend", None), "entryPoint", ""))
+
+
+def _warn_backend_not_stopped(app_name: str) -> None:
+    """Report that a file-only uninstall could not stop the app's backend."""
+    print(
+        f"⚠️  No running gateway was reached, so {app_name}'s backend was not "
+        "stopped: signalling a process another gateway started is not something "
+        "the CLI can do from out here (on Windows and in sandboxed shells the CLI "
+        "always uses this path, so a gateway may well be running). If one is still "
+        "running it holds its port until the next gateway start, which terminates "
+        "backends left behind by a previous generation. To stop it now, restart the "
+        "gateway, or uninstall from the dashboard instead.",
+        file=sys.stderr,
     )
 
 
@@ -1026,6 +1081,47 @@ def _handle_app_import(args: argparse.Namespace) -> None:
     print(f"\n   Run: kirocrew app enable {result.name}")
 
 
+def _app_already_gone(result: object) -> bool:
+    """Whether an uninstall failed only because the app is not installed.
+
+    Matched on the message `uninstall_app` produces for that case rather than on a
+    code, because `AppResult` carries no code; kept narrow on purpose — every other
+    failure leaves the app whole, and clearing the pointers its slots are still
+    entitled to resume would be the bug this whole path exists to prevent.
+    """
+    return "is not installed" in str(getattr(result, "error", "") or "")
+
+
+def _print_pointer_cleanup(name: str, cleanup: SessionPointerCleanup) -> None:
+    """Say what happened to the app's resume pointers, including nothing.
+
+    A clear that did not happen cannot stay quiet, whether it declined or failed.
+    Either way it leaves a pointer keyed by a name a reinstall reuses, so the next
+    installation's first turn resumes the removed app's transcript — and the
+    operator who would have to notice that is standing right here, at a command
+    that otherwise printed a success tick. The two get different text because they
+    need different actions: stop the gateway, versus fix the storage error.
+    """
+    if cleanup.dropped:
+        print(f"   dropped {cleanup.dropped} conversation pointer(s) — a reinstall starts fresh")
+    elif cleanup.declined:
+        print(
+            f"   ⚠️  left {name}'s conversation pointers in place: a running gateway owns "
+            f"session_map.json, and a second writer would drop rows it has not flushed. "
+            f"Reinstalling under this name may resume the removed app's transcript. "
+            f"Stop the gateway and run `kirocrew app uninstall {name}` again to clear them.",
+            file=sys.stderr,
+        )
+    elif cleanup.failed:
+        print(
+            f"   ⚠️  could not clear {name}'s conversation pointers: the session map "
+            f"could not be read or written (see the log for the error). Reinstalling "
+            f"under this name may resume the removed app's transcript. Fix the cause "
+            f"and run `kirocrew app uninstall {name}` again to clear them.",
+            file=sys.stderr,
+        )
+
+
 def _handle_app(args: argparse.Namespace) -> None:
     """Dispatch app subcommands: install, list, enable, disable, uninstall, info."""
     action = getattr(args, "app_action", None)
@@ -1117,6 +1213,24 @@ def _handle_app(args: argparse.Namespace) -> None:
             sys.exit(1)
 
     elif action == "uninstall":
+        # Ask a running gateway first, exactly as enable and disable do above.
+        # Uninstall has to stop the app's backend, and out here it cannot: the
+        # gateway is a DIFFERENT process and holds the only live handle on that
+        # child. Doing the whole uninstall locally deleted the app's files while
+        # its backend kept running -- holding its port, its app secret and its
+        # proxied routes -- and still printed success. The gateway's own handler
+        # runs the same trust-grant and cron preconditions before anything
+        # destructive, so nothing is skipped by handing the work over.
+        #
+        # The purge flag travels in the body because the handler defaults an
+        # absent one to "preserve data"; without it a delegated `--purge-data`
+        # would quietly keep the data it was told to destroy.
+        if _run_app_action_through_gateway(
+            "uninstall",
+            args.name,
+            payload={"purge_data": bool(getattr(args, "purge_data", False))},
+        ):
+            return
         # Precondition before anything destructive: the same reason the dashboard
         # handler checks here rather than inside uninstall_app. deregister_app()
         # below is irreversible, so a grant that cannot be dropped has to abort
@@ -1135,10 +1249,38 @@ def _handle_app(args: argparse.Namespace) -> None:
         _cleanup_app_crons_from_scheduler(args.name)
         deregister_app(args.name)
         keep_data = not getattr(args, "purge_data", False)
+        # Read BEFORE the uninstall, and read BOTH: either one alone can be made to
+        # say "no backend here" when there is one. The declaration is the app's own
+        # `app.json`, writable by any app trusted to run code, so an app that drops
+        # its `entryPoint` would silence the warning about the process it is still
+        # running. The recorded port is gateway-owned -- the pidfile lives under
+        # KIROCREW_HOME, not in the app directory -- but its ABSENCE proves nothing,
+        # since a backend this gateway never tracked leaves no row. So the warning
+        # fires on either positive signal, and stays quiet only when neither says a
+        # backend exists.
+        declares_backend = _app_declares_backend(args.name)
+        recorded_port = recorded_backend_port(args.name)
         result = uninstall_app(args.name, keep_data=keep_data)
         if result.ok:
+            # AFTER success, matching this function's trust-grant reasoning: a
+            # failed uninstall leaves nothing changed, so a still-installed app
+            # keeps the pointers its slots are still entitled to resume.
+            cleanup = discard_app_session_pointers(args.name)
             print(f"✅ {result.message}")
+            _print_pointer_cleanup(args.name, cleanup)
+            if declares_backend or recorded_port is not None:
+                _warn_backend_not_stopped(args.name)
         else:
+            # The pointers outlive the app, so "already gone" is the one failure
+            # whose bookkeeping half is still worth doing. It is also the residual's
+            # only self-correction: the clear runs under `GatewayLock` and declines
+            # while a gateway owns `session_map.json`, so an uninstall done with the
+            # gateway up leaves pointers behind — and re-running this command with
+            # the gateway stopped is what clears them. That recovery only exists if
+            # the clear does not require the app to still be installed, which is why
+            # it runs here rather than only on the success path.
+            if _app_already_gone(result):
+                _print_pointer_cleanup(args.name, discard_app_session_pointers(args.name))
             print(f"❌ {result.error}", file=sys.stderr)
             sys.exit(1)
 
@@ -1281,6 +1423,11 @@ def _handle_agent(args: argparse.Namespace) -> None:
                 file=sys.stderr,
             )
             sys.exit(1)
+        # A crew that carried this name before may still be listed on a team
+        # (every removal path drops it best-effort). persist_member_config
+        # purges that INSIDE the registry's locked mutation, right before the
+        # name is registered, on every create path; a purge that cannot be made
+        # refuses the create (TeamsUnavailable, answered below).
         cfg.agents[args.name] = KiroCrewAgentConfig(
             kiro_agent=args.kiro_agent,
             workspace=args.workspace,
@@ -1302,6 +1449,15 @@ def _handle_agent(args: argparse.Namespace) -> None:
                     previous_store=previous_store,
                     previous_member_id=previous_member_id,
                 )
+            if isinstance(exc, crew_teams.TeamsUnavailable):
+                print(
+                    f"Error: cannot create agent '{args.name}': a previous crew of that "
+                    f"name may still be on a team and the crew-teams store is unavailable "
+                    f"({exc}); fix or remove {crew_teams.teams_path()} (an absent file "
+                    "reads as no teams), then retry",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
             if not isinstance(exc, (OSError, UnknownMemoryStore)):
                 raise
             print(f"Error: {exc}", file=sys.stderr)
@@ -1368,8 +1524,20 @@ def _handle_agent(args: argparse.Namespace) -> None:
             del agents[args.name]
             return doc
 
+        # Same best-effort drop as the dashboard delete route, and in the same
+        # place: AFTER the registry write has committed and still INSIDE its
+        # lock. After the commit, so a config write that fails leaves the
+        # membership as it was (the crew stays, on its team); inside the lock,
+        # so a same-name create in another process (which needs this lock)
+        # cannot land between the delete and the drop. A stale team entry is
+        # hidden by every reader and never turns a committed delete into a
+        # failure; the recreate-under-the-same-name harm is closed on the
+        # create path (release_name), not here.
+        def _drop_from_team() -> None:
+            crew_teams.drop_member(args.name)
+
         with memory_store_namespace_lock():
-            _locked_config_write(_mutate_agent_delete)
+            _locked_config_write(_mutate_agent_delete, after_write=_drop_from_team)
         print(f"Deleted agent: {args.name}")
 
     elif action == "reset-model":
@@ -1621,6 +1789,13 @@ def _cron_add(svc: CronService, args: argparse.Namespace) -> None:
             _cron_add_fail(found.error)
         folder_id = found.folder_id
 
+    if script:
+        kind = "script"
+    elif command:
+        kind = "command"
+    else:
+        kind = "agent"
+
     # ── Governance: the capabilities.cron on/off gate, at authoring time ──
     # The gateway re-vets every job at fire time, so a job authored under a
     # disabled capability can never run -- but without this fail-fast the CLI
@@ -1630,8 +1805,6 @@ def _cron_add(svc: CronService, args: argparse.Namespace) -> None:
     # the cron surface (sel._infer_source), so the profile that governs cron
     # jobs decides authoring too -- a CLI-surface bind does not, by design:
     # what is being gated is the cron capability, not the CLI as a whole.
-
-    kind = "script" if script else ("command" if command else "agent")
     cap_err = _vet_cron_capability_governance("cron:cli_add")
     if cap_err:
         _cron_add_fail(cap_err, audit_kind=kind)
@@ -2218,18 +2391,44 @@ def _security(args: argparse.Namespace) -> None:
             print(f"No security events recorded{window}.")
             return
         print(f"📋 Last {len(events)} security event(s){window}:\n")
+
+        def _safe(key: str, default: str = "") -> str:
+            """One row field, coerced to text and stripped of live controls.
+
+            Two separate hazards meet here. The row can hold CALLER text: SEL's own
+            ``_REDACTED_TEXT_FIELDS`` names ``operation``, ``resources`` and
+            ``error``, and ``log_api_access`` documents ``outcome`` the same way
+            because an installed app reaches it through ``ctx.audit``. Those passes
+            police credentials and length, never control sequences, so an ESC/OSC
+            payload would execute in the owner's terminal -- the one place this
+            trail is read. And the row need not be a string at all: the log is
+            sandbox read-write (``_CREW_SANDBOX_VISIBLE_LEAVES``) while ``recent()``
+            validates only that each line is a dict, so a forged line with a
+            non-string field would abort the whole command inside ``re.sub``.
+            Coercing before sanitizing answers both, and keeps one field's bad
+            value from hiding every other event.
+            """
+            value = e.get(key, default)
+            return safe_terminal_line(value if isinstance(value, str) else str(value))
+
         for e in events:
-            ts = e.get("timestamp", "?")[:19]
-            etype = e.get("event_type", "?")
-            op = e.get("operation", "?")
-            outcome = e.get("outcome", "?")
-            src = e.get("source", "?")
-            caller = e.get("caller_identity", "?")
+            ts = _safe("timestamp", "?")[:19]
+            etype = _safe("event_type", "?")
+            op = _safe("operation", "?")
+            outcome = _safe("outcome", "?")
+            src = _safe("source", "?")
+            caller = _safe("caller_identity", "?")
             print(f"  {ts}  [{src}] {etype}: {op} → {outcome}  (caller: {caller})")
             if e.get("error"):
-                print(f"    error: {e['error'][:120]}")
+                print(f"    error: {_safe('error')[:120]}")
+            # ``resources`` names WHAT the decision was about -- the file a scanner
+            # held back, the destination class a grant covered. Without it the line
+            # says a refusal happened and never says what was refused, which is the
+            # one thing the owner reading this is trying to learn.
+            if e.get("resources"):
+                print(f"    resources: {_safe('resources')[:120]}")
             if e.get("downstream_service"):
-                print(f"    downstream: {e['downstream_service']}")
+                print(f"    downstream: {_safe('downstream_service')}")
     elif action == "verify":
 
         # detailed=True: a segment dir that refused to pin (or was swapped

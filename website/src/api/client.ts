@@ -58,7 +58,11 @@ export const SKILLS_TIMEOUT_MS = 15_000
 export const SLASH_COMMANDS_TIMEOUT_MS = 15_000
 import { installApiTransport } from './apiTransport'
 import type { SessionSummary } from '../types/sessionSummary'
-import { queryClient, resolveDefaultMemoryMode } from './queryClient'
+import {
+  queryClient,
+  invalidateAcrossQueryClients,
+  resolveDefaultMemoryMode,
+} from './queryClient'
 import { getStoredConsent } from '../utils/themeConsent'
 import { recordError, parseErrorCode, requestPath } from '../utils/errorReport'
 import { i18nT } from '../i18n/t'
@@ -470,6 +474,14 @@ export interface DecisionsConsentData {
    * conversation, so consent recorded against a message excerpt cannot stand for it.
    */
   memory_text?: boolean
+  /**
+   * Whether the owner consented to sending WAKE EVIDENCE — the transcript tail and
+   * pull-request readings the `nudge.wake` judge screens a tick against. Absent reads
+   * as not consented, on the same terms as the three above: this evidence comes from
+   * sessions the loop WATCHES rather than the one the owner is talking in, so none of
+   * the narrower yeses stands for it.
+   */
+  nudge_evidence?: boolean
   /**
    * One row per decision point this GATEWAY ships, projected from the seam's own
    * registry (`decisions/gate.py`). The card lists these rather than an array
@@ -1857,7 +1869,7 @@ function showSessionExpiredBanner(lead?: string): void {
         // `data === undefined` narrows it to queries that never carried a
         // successful value: exactly the ones the lapse broke, and the only ones
         // with nothing to overwrite a draft with.
-        void queryClient.invalidateQueries({
+        invalidateAcrossQueryClients({
           predicate: (q) => q.state.status === 'error' && q.state.data === undefined,
         })
       })
@@ -2847,6 +2859,9 @@ export interface MemberRosterRow {
   memory_version?: number
   memory_owner?: string
   model?: string
+  /** Optional presentation label shown in place of `name`. `name` stays the
+   *  identity every per-member route and binding is keyed on. */
+  display_name?: string
   /** Crew origin, NORMALIZED by the server to exactly 'kirocrew' (created in
    *  the crew manager), 'builtin', or 'package' (agent-sync-installed; the
    *  legacy 'aim' spelling and any unknown value collapse to this). */
@@ -4593,7 +4608,7 @@ export const api = {
   chatFolders: () => fetch('/api/chat/folders', { headers: { ..._sk } }).then(j),
   /** `config` carries the folder settings the create modal collects. Each is
    *  omitted when empty so the backend applies its own default. */
-  createChatFolder: (name: string, parentId?: string, config?: { project_dir?: string; default_agent?: string; color?: string; icon?: string; tags?: string[] }) =>
+  createChatFolder: (name: string, parentId?: string, config?: { project_dir?: string; default_agent?: string; color?: string; icon?: string; tags?: string[]; steering_dirs?: string[] }) =>
     post('/api/chat/folders', { name, parent_id: parentId || '', ...(config ?? {}) }).then(j),
   updateChatFolder: (id: string, body: object) => patch('/api/chat/folders/' + encodeURIComponent(id), body).then(j),
   /** Set several folders' `order` in ONE atomic request. The sidebar drag
@@ -5034,6 +5049,8 @@ export const api = {
     import_onboarded?: boolean
     /** Gates the gateway's first heartbeat; see `beacon.telemetry_permitted`. */
     privacy_acked?: boolean
+    /** Set once the first-run Meet CrewMates flow was finished or dismissed. */
+    crewmates_onboarded?: boolean
   }) =>
     put('/api/config/theme', body).then(j),
   // Voice

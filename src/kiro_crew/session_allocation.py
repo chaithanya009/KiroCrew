@@ -1065,6 +1065,9 @@ class SessionAllocationService:
     def mapped_sid(self, key: str) -> str:
         return self._owner._session_map.mapped_sid(self._owner._fold_key(key))
 
+    def mapped_session_keys(self) -> frozenset[str]:
+        return frozenset(self._owner._session_map.mapped_sids_by_key())
+
     def seed_conversation(
         self,
         key: str,
@@ -1210,14 +1213,33 @@ class SessionAllocationService:
             return True
         return False
 
-    def clear_queue(self, key: str) -> None:
+    def clear_queue(self, key: str, owned_by: Callable[[dict], bool] | None = None) -> None:
         key = self._owner._fold_key(key)
         session = self._sessions.get(key)
-        if session:
+        if session is None:
+            return
+        if owned_by is None:
             for _, _, kwargs in session.queue:
                 self._deps.unlink_queued_temp_paths(kwargs)
             session.queue.clear()
             session.cancelled.clear()
+            return
+        # Partitioned BEFORE anything is mutated, so a predicate that raises leaves the
+        # queue exactly as it was. Every entry is already dequeued nowhere else -- this
+        # runs under the caller's receipt lock -- so the pass costs one walk.
+        dropped = [item for item in session.queue if owned_by(item[2])]
+        if not dropped:
+            return
+        kept = [item for item in session.queue if not owned_by(item[2])]
+        for _, _, kwargs in dropped:
+            self._deps.unlink_queued_temp_paths(kwargs)
+        session.queue.clear()
+        session.queue.extend(kept)
+        # ``cancelled`` is deliberately LEFT ALONE. It holds bare message timestamps a
+        # mid-turn cancel asked ``dequeue`` to skip, with nothing on them saying whose
+        # they are, so clearing it here would un-cancel somebody else's cancel request.
+        # The whole-session branch above may clear it because it empties the queue those
+        # timestamps describe.
 
     async def is_provider_alive(self, key: str) -> bool | None:
         key = self._owner._fold_key(key)

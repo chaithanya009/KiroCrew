@@ -15,8 +15,9 @@ upstream sync.
   skills, MCP tools, API, scheduled learning, and dashboard. Conversation
   transcripts and session recovery are separate features and must continue to
   work. Do not reintroduce memory read/write instructions or tools.
-- The source-controlled bundled `config/prompt.md` is the agent prompt. Do not
-  restore a user-home override. Keep it concise. User-facing responses should
+- The source-controlled bundled `config/prompt.md` is the maintained agent
+  prompt for this installation. Do not add a user-home prompt override. Keep
+  it concise. User-facing responses should
   lead with the outcome and explain behavior in plain language; do not list
   internal file or function names unless requested or needed to act.
 - Automatic recovery of an interrupted turn must preserve the original request

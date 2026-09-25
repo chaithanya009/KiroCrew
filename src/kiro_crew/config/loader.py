@@ -1141,10 +1141,9 @@ def aws_consent_path() -> Path:
     keystone read-only for the shell.
 
     Holds ``{"<service>": {profile, region, account, arn, granted_at}}``; every
-    read fails soft to NO CONSENT (see ``aws_consent.read_grant``). The writers
-    are the authenticated dashboard ``/api/aws/consent`` handler and the
-    ``kirocrew aws-consent`` CLI, both of which open the path directly rather
-    than through this gate. Respects ``KIROCREW_HOME``.
+    read fails soft to NO CONSENT (see ``aws_consent.read_grant``). The writer is
+    the authenticated dashboard ``/api/aws/consent`` handler, which opens the path
+    directly rather than through this gate. Respects ``KIROCREW_HOME``.
     """
     return config_dir() / "aws_service_consent.json"
 
@@ -1616,8 +1615,15 @@ def update_config_locked(
     stamp_meta: bool = True,
     on_corrupt: Literal["fail", "reset"] = "fail",
     wait_for_lock: bool = True,
+    after_write: Callable[[], None] | None = None,
 ) -> dict:
     """Perform an atomic read-modify-write of a config file under an advisory lock.
+
+    ``after_write`` runs INSIDE the lock, only after the rename has committed the
+    new document (never when ``mutate`` returned ``None``): the hook for a
+    companion record that must follow the registry change and must not be
+    interleaved with another writer's -- the crew-teams drop that accompanies a
+    crew delete. Its exceptions propagate; the config write has already landed.
 
     The locked primitive for every DIRECT
     ``write_config_atomically(config_path())`` caller outside this module, and
@@ -1762,6 +1768,8 @@ def update_config_locked(
         # than on its next poll.
         _invalidate_config_cache()
         _notify_live_watch()
+        if after_write is not None:
+            after_write()
         return result
 
 
@@ -2100,8 +2108,24 @@ def workspace_dir_for(workspace: str | None = None) -> Path:
             "workspace directory",
             ws,
         )
-    dirname = entry.dir if entry is not None and entry.dir else WorkspaceConfig().dir
+    return workspace_dir_from_entry(entry)
 
+
+def workspace_dir_from_entry(entry: WorkspaceConfig | None) -> Path:
+    """The directory a ``workspaces`` entry names, by the ONE placement rule.
+
+    ``entry.dir`` may be absolute (anywhere on the host) or relative to the
+    data home; an absent entry or an empty ``dir`` is the base workspace
+    directory under ``config_dir()``. :func:`workspace_dir_for` applies this
+    after its own config load; a caller that already holds a
+    :class:`KiroCrewConfig` snapshot (the folder-steering memory-store fence)
+    applies it directly to that snapshot's entries so every workspace it fences
+    comes from the same load -- a second load per name could observe a
+    different document (a concurrent write, a transient read failure) and
+    silently fall back to the base directory for a workspace the first load
+    had placed elsewhere.
+    """
+    dirname = entry.dir if entry is not None and entry.dir else WorkspaceConfig().dir
     p = Path(dirname).expanduser()
     if p.is_absolute():
         return p
@@ -3338,6 +3362,7 @@ def _build_dashboard_config(_degraded: set[str], dashboard_data: dict) -> Dashbo
             key_present="tailscale" in dashboard_data,
         ),
         restore_sessions=dashboard_data.get("restore_sessions", False),
+        crewmate_threads=_safe_bool(dashboard_data.get("crewmate_threads"), False),
         qr_session_until_restart=_safe_bool(dashboard_data.get("qr_session_until_restart"), True),
         qr_session_persist_across_restart=_safe_bool(
             dashboard_data.get("qr_session_persist_across_restart"), False
@@ -3437,6 +3462,7 @@ def _build_dashboard_config(_degraded: set[str], dashboard_data: dict) -> Dashbo
             dashboard_data.get("privacy_acked"),
             _safe_bool(dashboard_data.get("onboarded"), False),
         ),
+        crewmates_onboarded=_safe_bool(dashboard_data.get("crewmates_onboarded"), False),
         user_role=str(dashboard_data.get("user_role", "")),
         user_role_other=str(dashboard_data.get("user_role_other", "")),
         user_technical_level=str(dashboard_data.get("user_technical_level", "")),
@@ -4610,6 +4636,10 @@ class KiroCrewConfig:
                     # Same guard as model: a non-string triggers (e.g. `1`) must
                     # not survive load — select_crew's roster calls .strip() on it.
                     raw_triggers = entry.get("triggers", "")
+                    # Same guard family: the label is rendered verbatim by every
+                    # roster surface, so a non-string collapses to "" (show the
+                    # name) rather than reaching the wire.
+                    raw_display_name = entry.get("display_name", "")
                     agents[name] = KiroCrewAgentConfig(
                         member_id=entry.get("member_id", ""),
                         kiro_agent=entry.get("kiro_agent", ""),
@@ -4620,6 +4650,7 @@ class KiroCrewConfig:
                         # collapse to "" (inherit) rather than travel to the
                         # provider, where kiro-cli rejects the whole overlay.
                         reasoning_effort=coerce_effort(entry.get("reasoning_effort", "")),
+                        display_name=raw_display_name if isinstance(raw_display_name, str) else "",
                         description=entry.get("description", ""),
                         triggers=raw_triggers if isinstance(raw_triggers, str) else "",
                         source=entry.get("source", "kirocrew"),
@@ -4651,6 +4682,18 @@ class KiroCrewConfig:
         # Migrate workspaces from flat or structured format
         raw_workspaces = data.get("workspaces", {})
         if not isinstance(raw_workspaces, dict):
+            # Reported, not just replaced: a gate that fences the memory
+            # workspaces (folder steering's silo fence) reads this table to
+            # learn WHERE the workspaces are, and an operator's absolute
+            # workspace directory that this load could not read is a directory
+            # the fence would otherwise not know to cover. Same posture as the
+            # ``dashboard.tailscale`` key: the consumer decides to fail closed.
+            logger.warning(
+                "Config 'workspaces' is not a JSON object (got %s); the workspace "
+                "table is unavailable for this load",
+                type(raw_workspaces).__name__,
+            )
+            _degraded.add(_resolution.DEGRADED_WORKSPACES)
             raw_workspaces = {}
         workspaces = _migrate_workspaces(raw_workspaces)
 

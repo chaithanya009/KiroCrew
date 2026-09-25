@@ -185,7 +185,6 @@ src/kiro_crew/dashboard/port_reclaim.py
 src/kiro_crew/dashboard/routes/skills.py
 src/kiro_crew/dashboard/slowloris.py
 src/kiro_crew/dashboard/stale_asset_watchdog.py
-src/kiro_crew/dashboard/system_notices.py
 src/kiro_crew/dashboard/tailnet_serve.py
 src/kiro_crew/dashboard/terminal_commands.py
 src/kiro_crew/dashboard/theme_validate.py
@@ -654,7 +653,6 @@ test/test_lesson_contradiction.py
 test/test_lesson_ranking.py
 test/test_lifecycle_hooks.py
 test/test_link_dashboard.py
-test/test_llm_pool.py
 test/test_local_gate.py
 test/test_loopback_proxy.py
 test/test_manifest_hooks.py
@@ -791,7 +789,6 @@ test/test_provider_dispatch.py
 test/test_publish_providers.py
 test/test_publish_sync.py
 test/test_queue_during_subagents.py
-test/test_queue_receipt.py
 test/test_quick_send.py
 test/test_read_bounded_json.py
 test/test_recovery_card_parity.py

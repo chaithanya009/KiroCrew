@@ -147,24 +147,34 @@ Out-of-band lanes that never gate a PR:
   button, not a CI comment), `pr-merge-conflict-label.yml` and `fork-pr-label.yml`
   (both mirror a fact GitHub does not surface in the `/pulls` list onto a label), and
   `add-contributor.yml` (a daily cron, plus manual dispatch, adds each merged
-  PR's author AND the reporters of the issues that PR closed to the README
+  PR's author, the linked authors and co-authors of the commits that landed via
+  a merged PR, AND the reporters of the issues those PRs closed to the README
   Contributors block via
   `scripts/update_contributors.py`; because the default branch is protected it
   opens a rolling PR rather than committing directly, like `test-durations.yml`.
   A login in `.github/contributors-optout.txt` is never added, which keeps the
   README's removal promise enforceable against the full-rebuild collector).
-  One paginated GraphQL sweep over `pullRequests(states: MERGED)` drives it,
-  reading each node's `author` and its `closingIssuesReferences` authors. The
-  reporter side is deliberately keyed on that link rather than on listing
-  `/issues`: the connection is populated only when a PR declares it closes the
-  issue, and only merged PRs are scanned, so an entry is evidence the report
-  changed the product — which keeps duplicates, invalid reports and
-  credit-farming issues out. It undercounts by design (a fix that omitted the
-  closing keyword is invisible), and the remedy is the manual `--login` path, not
-  loosening the rule. Dedup is two-layered: `sort -u` over the union, because
-  someone can be both a PR author and a reporter, then the script's own README
-  scan. The same block also holds contributors whose contribution left neither
-  trace — a review, a translation, a private security report — added with
+  Two independent paginated GraphQL sweeps drive it: one over
+  `pullRequests(states: MERGED)`, reading each node's `author` and its
+  `closingIssuesReferences` authors; and a separate commit-history sweep over
+  the default branch, scoped to commits whose `associatedPullRequests` include a
+  merged PR, reading each commit's `authors` (which resolves `Co-authored-by:`
+  trailers to linked accounts). The commit sweep is kept separate rather than
+  nested in the PR query because GraphQL cost scales with the product of nested
+  connections, and it is scoped to merged-PR commits so it credits the same
+  public-contribution boundary the author/reporter paths do — reaching an
+  original author whose work was cherry-picked or co-authored into a maintainer's
+  replacement PR. The reporter side is deliberately keyed on that closing link
+  rather than on listing `/issues`: the connection is populated only when a PR
+  declares it closes the issue, and only merged PRs are scanned, so an entry is
+  evidence the report changed the product — which keeps duplicates, invalid
+  reports and credit-farming issues out. It undercounts by design (a fix that
+  omitted the closing keyword is invisible), and the remedy is the manual
+  `--login` path, not loosening the rule. Dedup is two-layered: `sort -u` over
+  the three-way union (someone can be a PR author, a merged-PR commit co-author
+  and a reporter at once), then the script's own README scan. The same block also
+  holds contributors whose contribution left neither trace — a review, a
+  translation, a private security report — added with
   `scripts/update_contributors.py --login`. Those entries survive every later run
   because the collector only ever inserts and never rewrites an existing line;
   that preservation is what makes one shared list workable instead of a second
@@ -793,24 +803,50 @@ Details worth knowing:
     the set pinned in the script as `WATCHED_WORKFLOWS` and tested against the
     workflows whose `runs-on` actually carries the fleet label (the watchdog's
     own workflow is excluded, since that label appears only in its comment). One
-    listing per status covers the whole watched set as a client-side filter and
-    reaches more than a per-workflow loop would. Live statuses read at most eight
-    pages each, and each live classification sweep reads jobs for at most 50
-    runs: 40 to the oldest, which are the only actionable ones, and 10 reserved
+    listing per status covers the whole watched set as a client-side filter, which
+    reaches a fleet-routed workflow nobody registered — breadth a per-workflow loop
+    cannot have, and not the same thing as reaching further back in time. Depth is
+    the page walk: this endpoint returns pages below `per_page` mid-listing (98,
+    then 100, then 100, then 99 while `total_count` stood at 927, measured
+    2026-09-24), so only an EMPTY page ends the walk. Reading a short page as the
+    tail stopped every tick after page one, which left the sweep seeing the newest
+    couple of minutes of runs against a 15-minute orphan threshold and hid two
+    six-hour `main` outages; the six-hour orphan behind the second one sat on page
+    seven. Live statuses read at most ten
+    pages each — the API's reachable window, since a status-filtered runs listing
+    stops at 1000 results — and each live classification sweep reads jobs for at
+    most 50
+    runs: 40 to the classify slice and 10 reserved
     for the newest, whose prompt CodeBuild starts are the dispatch evidence a
     saturation hold is judged by. Spending the whole bound oldest first would
     leave a backlogged sweep unable to tell a dead fleet from a busy one, so it
-    would heal nothing exactly when the watchdog is needed. The log names the
+    would heal nothing exactly when the watchdog is needed. The classify slice is
+    drawn heal-eligible first — a `push` run of a heal-safe workflow, the only
+    shape a heal can act on — and oldest first within each class, because age
+    alone hands those slots to runs no heal will ever touch: 220 watched live runs
+    sat past the orphan threshold on 2026-09-24 and 18 past a day, the oldest 36
+    days, every one of them a pull-request run that stays listed and re-reads the
+    same slot on every tick. The log names the
     bound when other runs wait for the
-    next tick. Cancelled recovery reads at most sixteen pages because GitHub
-    orders that index by creation time while recovery selects by cancellation
-    time. Sixteen pages hold 1600 cancellations, about eight hours at the 200 an
+    next tick. Cancelled recovery reads at most ten pages, the same as the live
+    listings, because GitHub caps a status-filtered runs listing at 1000 results —
+    measured on this repository, page 11 returns an empty `workflow_runs` and
+    `total_count: 0`, not an error — so a deeper cap describes pages the endpoint
+    never serves. Ten pages hold 1000 cancellations, about five hours at the 200 an
     hour this repo was measured at, and the 2026-09-20 orphans were 21 hours old,
     so that reach is BEST-EFFORT and carries no coverage claim. GitHub offers no
     ordering by cancellation time, so nothing readable from the listing can prove
     every run cancelled inside the window was seen; truncation logs a warning, and a
     cancelled run that never got listed needs `gh run rerun` by hand. The reach only
-    changes how often that is true. The three live indexes plus
+    changes how often that is true. Because that 1000-result ceiling also serves an
+    empty page, an empty page is not proof of the tail: every live listing compares
+    the runs it yielded against the first page's `total_count`, and a shortfall on an
+    ACTIONABLE status (`in_progress`, `queued`) records a tick-level failure so the
+    scheduled run goes red. A `pending` shortfall only warns, because those runs are
+    held by their concurrency group, have no jobs, and are never healed — and
+    `pending` is what grows during the saturation the watchdog has to survive. The
+    remedy the failure prints is to NARROW the listing, not to raise the cap, since
+    the cap is already the reachable window. The three live indexes plus
     the cancelled index cost at most 40 calls
     per tick. It
     calls a run *orphaned* when one of its jobs is still `queued`,
@@ -1017,17 +1053,22 @@ Details worth knowing:
     that window while the limit persists. What the abort still buys is the work
     already done: one exhausted listing page leaves the runs already classified
     acted on rather than lost. Every other status (401, 404, 5xx) and every
-    malformed payload still raises. **The schedule ships disarmed**: `WATCHDOG_ARMED` at the top of the
-    workflow is `"false"`, so every scheduled tick is a dry run — it classifies
-    and writes its step summary but touches nothing — until a maintainer, having
-    read a few summaries against real API shapes and seen no healthy run called
-    `orphaned`, flips it to `"true"` in a one-line commit. That decision is tracked
-    in [issue #12717](https://github.com/kirodotdev/KiroCrew/issues/12717), which
-    carries the evidence gathered so far and the gate to clear before flipping, so
-    the repository cannot quietly come to believe a stall is fixed while the
-    watchdog is still only observing. A manual dispatch is
-    governed by its own `dry_run` input regardless, so a stuck run can be healed
-    by hand before arming. A `CI` run in *pending* with no jobs is
+    malformed payload still raises. **The schedule is armed**: `WATCHDOG_ARMED` at the top of the
+    workflow is `"true"`, so a scheduled tick cancels and re-runs what it
+    classifies, within the per-tick caps below. It shipped disarmed — every
+    scheduled tick a dry run that classified and wrote its step summary and
+    touched nothing — and was armed once detection-without-action had been
+    measured to cost two six-hour `main` outages, on 2026-09-23 and 2026-09-24.
+    Both times one stuck `fast-gate.yml` run held `main`'s single concurrency
+    slot, every later push lost its gate to eviction, `ci.yml` failed closed at
+    its 720-second wait, and a human cleared it with one
+    `POST /actions/runs/<id>/cancel` — the call the armed tick now makes itself.
+    The hold that would otherwise have refused those heals is cleared by the
+    supersession check: a run a newer push has replaced holds no result worth
+    protecting, so a busy fleet no longer shields the exact run that is blocking
+    the branch. A manual dispatch is
+    governed by its own `dry_run` input regardless, so a run can still be
+    inspected without acting. A `CI` run in *pending* with no jobs is
     **not** something the watchdog touches — that run is waiting on its
     concurrency group, not on a runner, and healing the run that holds the group
     is what releases it; the step summary names it so the reader knows why it
@@ -1764,13 +1805,15 @@ The Design trigger accepts the same evidence the UX lane admits: a
 HEAD -- and it reads presence the same way. Both Design lanes run a "Collect
 rendered evidence" step that sources the shared allowlisted fetch script, downloads
 and types every attachment the description offers, lists the committed images the
-revision adds or changes (same-repo only; the fork head is never checked out), and
-writes one evidence file the prompt is told to read; the description's text is not
-the predicate, so a fabricated or dead URL does not count as evidence. A transport
-failure is listed as "presence unconfirmed" and caps the Design verdict at `CONCERNS`
-rather than failing the lane, because the UX lane fails its run on the same failure
-and readiness already holds. An image hosted off a commit outside the PR, or one the
-description says shows another PR, is not evidence of this revision.
+revision adds or changes (from the checkout on a same-repo PR; out of the object
+store on a fork, by `pr-committed-evidence.sh`, since the fork head is never checked
+out as files), and writes one evidence file the prompt is told to read; the
+description's text is not the predicate, so a fabricated or dead URL does not count
+as evidence. A transport failure is listed as "presence unconfirmed" and caps the
+Design verdict at `CONCERNS` rather than failing the lane, because the UX lane fails
+its run on the same failure and readiness already holds. An image hosted off a
+commit outside the PR, or one the description says shows another PR, is not evidence
+of this revision.
 
 **Design Review owns the long-term / one-way-door lens** as its gate 8, "LONG-TERM
 REVERSIBILITY", in both the same-repo and fork variants. An unsafe one-way door is
@@ -1792,7 +1835,8 @@ It runs only when the diff touches `website/`, `temp-screenshots/**` or
 `.github/screenshots/**` (the last two are gitignored, so in practice `website/` is the
 trigger). A backend, CI or docs PR skips it with no model call and no comment churn,
 and the check passes. Review evidence is uploaded as a GitHub attachment, not
-committed: the author writes local paths in the PR body and runs
+committed -- except by a fork contributor, whom the upload endpoint refuses (see the
+fork lane below): the author writes local paths in the PR body and runs
 `gh pr create|edit --attach <path>`, which rewrites each into a permanent
 `https://github.com/user-attachments/assets/...` URL (dragging the file into the
 description in the web UI yields the same URL). The lane reads the body from the API when
@@ -1926,15 +1970,41 @@ description from the API and downloads the allowlisted `user-attachments` URLs o
 the runner (the job's egress allowlist names the two hosts a download touches,
 `github.com` and the `github-production-user-asset-6210df.s3.amazonaws.com` bucket
 its 302 points at), so the reviewer
-opens the same images a same-repo review would. An image a fork PR *commits* is not
-on disk -- the fork head is never checked out -- so a control shown only there is an
-evidence gap, which is a `BLOCK` (`cannot evaluate`) the author closes by attaching
-the image to the description. A control the attachments *do* show but no blind
-reader has read caps the fork PR at `CONCERNS`: that is the lane's limitation, not
-the author's gap, so it does not block. A maintainer who wants
-the blind read pushes the branch to this repository. A fork contributor without push
-access cannot run `gh --attach`; dragging the file into the PR description in the web
-UI yields the same `user-attachments` URL.
+opens the same images a same-repo review would. Media the fork PR *commits* under
+`temp-screenshots/` or `.github/screenshots/` is read too, by
+`.github/scripts/pr-committed-evidence.sh`: the blobs come out of the object store
+the authentic-diff step already fetched, typed by their bytes and copied under the
+same index names, so the fork head is still never checked out as files. That matters
+because `gh --attach` is *unavailable* to a fork contributor -- its upload endpoint
+answers read permission with a 404 ([cli/cli#14302](https://github.com/cli/cli/issues/14302))
+-- leaving them the web-UI drag and the committed path. The script carries its
+admission contract in one block at its head: every path the head holds under those
+directories is a candidate whatever its diff status, and a screenshot that was only
+*moved* from a path the base already held (a `git mv`, status `R100`) is refused by
+name and counted, not read -- its bytes show the base's rendering, not this
+revision's -- while a moved file whose bytes changed is read like any other. A control
+no supplied screenshot shows is still an evidence gap, a `BLOCK` (`cannot evaluate`)
+the author closes by attaching *or* committing the image. A control the evidence
+*does* show but no blind reader has read caps the fork PR at `CONCERNS`: that is the
+lane's limitation, not the author's gap, so it does not block. A maintainer who wants
+the blind read pushes the branch to this repository.
+
+**What happens to committed evidence at merge.** It merges. The squash lands the
+`temp-screenshots/` files on `main` as tracked files (the ignore rule stops mattering
+once a path is tracked) and their blobs in history, and it never does so silently:
+they are in the diff the maintainer merges. The merging maintainer then removes them
+from the tip in a follow-up `chore(evidence): drop the committed review media of #<n>`
+PR (`git rm -r temp-screenshots/<topic>`), so review media does not accumulate on
+`main` the way it did before the sweep that emptied the directory. That removal is
+the reversible half. The blobs are the irreversible half: a deletion commit leaves
+them in every clone's pack, and only a history rewrite -- which that sweep deferred to
+a separate, maintainer-approved change -- takes them out. This cost is accepted
+because it is bounded: fork PRs are the minority, `pr-committed-evidence.sh` refuses a
+file over its size ceiling, and the guidance asks for two or three shots. The
+evidence stays readable at the squash commit
+(`https://github.com/<owner>/<repo>/blob/<sha>/temp-screenshots/...`) after the
+removal, so the removal PR names that SHA. The why lives with the rule it excepts, in
+prepare-pr's `references/rationale.md`.
 
 The PR identity (number, repository, shas, data-file paths) is passed to both passes
 in `--append-system-prompt`, not in `prompt:`. GitHub rejects a workflow file

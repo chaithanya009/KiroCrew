@@ -262,11 +262,13 @@ AGENT_SPEC_SUFFIX = ".agent-spec.json"
 def _audit_denied(*, operation: str, source: str, resources: str, error: str) -> None:
     """Emit a denial audit row for a refused path, never raising.
 
-    BOTH denial paths in this module promise not to raise -- ``_read_agent_spec``
+    EVERY denial path in this module promises not to raise -- ``_read_agent_spec``
     by the contract :func:`_warn_on_systematic_scan_failure` documents and its
-    callers read bare, and :func:`project_agent_names` in its own docstring
-    ("Never raises; an unreadable checkout yields an empty set"). Auditing the
-    denial must not become the one way to break either promise: for some
+    callers read bare, :func:`project_agent_names` in its own docstring
+    ("Never raises; an unreadable checkout yields an empty set"), and
+    :func:`project_agent_files` by the contract its own callers read it on, since
+    each treats an empty list as "this checkout declares no agents". Auditing the
+    denial must not become the one way to break any of those promises: for some
     surfaces this is the process's FIRST SEL use, and constructing the singleton
     mkdirs its home (``sel.py``), so an unwritable or hostile SEL directory
     would abort whichever surface asked -- on exactly the hostile path the
@@ -276,8 +278,10 @@ def _audit_denied(*, operation: str, source: str, resources: str, error: str) ->
     what is lost is the audit ROW. That is best-effort by the SEL API's own
     design: ``log_api_access`` reserves fail-closed behaviour for its explicit
     ``critical=True`` callers (``apps/admission.py``, the auto-improvement
-    server) and neither of these sites has ever been one. WARNING, not debug, so
-    an operator sees that the trail has a hole rather than finding out later.
+    server) and no denial site in this module is one -- the denial-side rule in
+    ``docs/architecture/security-deep-dive.md`` says why a refusal must not be
+    coupled to SEL health. WARNING, not debug, so an operator sees that the trail
+    has a hole rather than finding out later.
 
     The fallback names only the ``operation`` -- a fixed internal label. The
     REFUSED PATH is deliberately not logged here: on this branch its resolved
@@ -621,6 +625,9 @@ def _warn_on_systematic_scan_failure(directory: Path, candidates: int, parsed: i
 def project_agent_files(
     project_dir: str | Path | None,
     include_legacy: bool = False,
+    *,
+    operation: str = "project_agent_files",
+    source: str = "project_agent_files",
 ) -> list[Path]:
     """Agent config files declared by a project checkout, sorted by stem.
 
@@ -648,11 +655,33 @@ def project_agent_files(
     The sensitive-path check is on the project root because that value arrives from
     a caller-supplied session field; the per-file resolved-target check that
     catches a planted symlink stays with the reader (:func:`_read_agent_spec`).
+
+    *operation*/*source* label the SEL denial event emitted on a sensitive
+    project directory, exactly as on :func:`_read_agent_spec` and
+    :func:`project_agent_names`: the calling surface names itself so the security
+    trail attributes the refusal to the request that triggered it. ``source`` is
+    the interface channel (``SecurityEvent.source`` vocabulary: dashboard, cli,
+    slack, cron, ...; ``"unknown"`` when the caller serves multiple channels) --
+    every call site passes it explicitly, enforced by the call-site ratchet test.
+    Both defaults exist ONLY so a bare call still records the refusal under a
+    label that names this function; they are not for new call sites.
     """
     if not project_dir:
         return []
     if is_sensitive_path(str(project_dir)):
         logger.debug("Skipping sensitive project dir for agent discovery: %s", project_dir)
+        # Audited like every other deny in this module: the path arrives from a
+        # caller-supplied session, spawn or channel field, so a scan of a
+        # protected tree is a probe an operator must be able to see. Best-effort
+        # by :func:`_audit_denied` -- the refusal below already stands, so a lost
+        # row costs the trail, never the guard (see the denial-audit rule in
+        # ``docs/architecture/security-deep-dive.md``).
+        _audit_denied(
+            operation=operation,
+            source=source,
+            resources=str(project_dir),
+            error="sensitive project dir rejected",
+        )
         return []
     specs: list[Path] = []
     try:
@@ -768,7 +797,7 @@ def project_agent_names(
         return cached[1]
     candidates = 0
     declared: list[str] = []
-    for f in project_agent_files(project_dir):
+    for f in project_agent_files(project_dir, operation=operation, source=source):
         # AppleDouble sidecars are rejected by design, not by failure — a
         # directory holding only sidecars is empty of specs, not broken.
         if not f.name.startswith("._"):
@@ -1189,11 +1218,12 @@ def agent_skill_globs(
             if strict and agent != "kirocrew":
                 raise SkillScopeResolutionError(f"Cannot resolve skill scope for agent {agent!r}")
             return []
-        directory = (
-            project_agents_dir(str(project_dir))
-            if winner.scope == SCOPE_PROJECT
-            else (agents_dir if agents_dir is not None else _kiro_agents_dir())
-        )
+        if winner.scope == SCOPE_PROJECT:
+            directory = project_agents_dir(str(project_dir))
+        elif agents_dir is not None:
+            directory = agents_dir
+        else:
+            directory = _kiro_agents_dir()
         path = directory / winner.filename
         data = _read_agent_spec(path, operation="agent_skill_globs", source="unknown")
         if strict and data is None:
@@ -1309,8 +1339,10 @@ def agent_welcome_message(
         if not project_dir:
             return ""
         directory = project_agents_dir(project_dir)
+    elif agents_dir is not None:
+        directory = agents_dir
     else:
-        directory = agents_dir if agents_dir is not None else _kiro_agents_dir()
+        directory = _kiro_agents_dir()
     data = _read_agent_spec(
         directory / winner.filename,
         operation="agent_welcome_message",
@@ -1697,7 +1729,7 @@ def list_agents(
     JSON on the event loop.
     """
     d = agents_dir or _kiro_agents_dir()
-    project_files = project_agent_files(project_dir)
+    project_files = project_agent_files(project_dir, operation="list_agents", source="unknown")
     cache_key = (str(d), str(project_dir or ""))
     signature: tuple[_ListAgentsSig, ...] = (
         _dir_signature(d),

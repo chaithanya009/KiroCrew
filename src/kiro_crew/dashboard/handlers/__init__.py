@@ -519,6 +519,14 @@ from kiro_crew.dashboard.handlers.taskrunner import (  # noqa: E402, F401
     api_taskrunner_update_task,
 )
 
+# ── Crewmate teams (handlers/teams.py) ──
+from kiro_crew.dashboard.handlers.teams import (  # noqa: E402, F401
+    api_teams_create,
+    api_teams_delete,
+    api_teams_list,
+    api_teams_update,
+)
+
 
 # ── Durable task queue + capacity view (handlers/tasks.py) ──
 async def api_task_action(request):
@@ -939,8 +947,7 @@ def _build_prompt_base() -> list[dict[str, Any]]:
 
 
 # Paid-AWS-service consent — the operator's confirmation surface for Amazon
-# Polly (TTS) and Amazon Transcribe (STT). Sole writer of the keystone grant
-# alongside the ``kirocrew aws-consent`` CLI.
+# Polly (TTS) and Amazon Transcribe (STT). Sole writer of the keystone grant.
 from kiro_crew.dashboard.handlers.aws_consent import (  # noqa: E402, F401
     api_aws_consent_delete,
     api_aws_consent_get,

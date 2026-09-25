@@ -9,7 +9,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from conftest import requires_symlinks
+from conftest import make_dir_link, requires_symlinks
 from kiro_crew import context as context_module
 from kiro_crew.config.loader import KiroCrewAgentConfig, KiroCrewConfig
 from kiro_crew.context import CONTEXT_GROUP_LESSONS, ContextBuilder
@@ -737,6 +737,47 @@ def test_absolute_resource_outside_a_linked_root_is_still_refused(env, tmp_path)
         essentials._resource_paths([f"file://{outside}"], linked_root, linked_root)
 
 
+def test_absolute_resource_in_link_spelling_admits_under_a_resolved_root(env, tmp_path):
+    """A link-spelled declaration must resolve against a realpath-spelled root.
+
+    The reverse of the installer case: a project root is stored resolved while
+    the template records the resource through the ``$HOME`` link, so neither
+    spelling of the root is a lexical prefix of the declaration.
+    """
+    from kiro_crew import member_essential_context as essentials
+
+    linked_root = tmp_path / "linked-root"
+    make_dir_link(linked_root, env.project)
+    real_root = Path(os.path.realpath(str(linked_root)))
+    declared = linked_root / "declared-guide.md"
+    paths = essentials._resource_paths([f"file://{declared}"], real_root, real_root)
+    assert paths, "a link-spelled resource under the resolved root was refused"
+    match, root = paths[0]
+    assert "Declared guide" in essentials._read(match, root)
+
+
+def test_link_spelled_resource_still_refuses_outside_and_links_below_root(env, tmp_path):
+    """Matching the root's link spelling admits neither a sibling nor a link below it."""
+    from kiro_crew import member_essential_context as essentials
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "guide.md").write_text("OUTSIDE_SECRET", encoding="utf-8")
+
+    linked_root = tmp_path / "linked-root"
+    make_dir_link(linked_root, env.project)
+    real_root = Path(os.path.realpath(str(linked_root)))
+    with pytest.raises(MemberEssentialContextError, match="outside"):
+        essentials._resource_paths([f"file://{outside / 'guide.md'}"], real_root, real_root)
+    make_dir_link(env.project / "escape", outside)
+    paths = essentials._resource_paths(
+        [f"file://{linked_root / 'escape' / 'guide.md'}"], real_root, real_root
+    )
+    with pytest.raises(MemberEssentialContextError, match="outside"):
+        for match, root in paths:
+            essentials._read(match, root)
+
+
 def test_owner_cleared_empty_anchors_are_valid_but_missing_source_refuses(env):
     env.memory._preferences_file.write_text("", encoding="utf-8")
     env.memory._projects_file.write_text("", encoding="utf-8")
@@ -799,7 +840,6 @@ def test_malformed_declared_template_fields_refuse_explicitly(env, field, value)
 
 
 def test_linked_directory_is_refused_before_enumerating_outside_sources(env, tmp_path):
-    from conftest import make_dir_link
 
     target = tmp_path / "other-project"
     target.mkdir()
@@ -850,6 +890,7 @@ def test_refused_workspace_root_is_never_resolved(env, monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize("source", ["package", "development", "user-override"])
+@pytest.mark.parametrize("spec_uses_stub", [False, True], ids=["file-pointer", "native-stub"])
 @pytest.mark.parametrize(
     "fresh, options",
     [
@@ -861,7 +902,7 @@ def test_refused_workspace_root_is_never_resolved(env, monkeypatch, tmp_path):
     ],
 )
 def test_inherited_product_prompt_uses_session_start_not_essentials(
-    env, tmp_path, monkeypatch, source, fresh, options
+    env, tmp_path, monkeypatch, source, spec_uses_stub, fresh, options
 ):
     from kiro_crew import agent
     from kiro_crew.config import config_dir
@@ -880,8 +921,9 @@ def test_inherited_product_prompt_uses_session_start_not_essentials(
     prompt_path.write_text("PRODUCT_PROMPT_AT_SESSION_START", encoding="utf-8")
     assert agent._prompt_path() == prompt_path
     spec = env.project / ".kiro" / "agents" / "writer-template.json"
+    spec_prompt = agent._NATIVE_PROMPT_STUB if spec_uses_stub else f"file://{prompt_path}"
     spec.write_text(
-        json.dumps({"name": "writer-template", "prompt": f"file://{prompt_path}"}),
+        json.dumps({"name": "writer-template", "prompt": spec_prompt}),
         encoding="utf-8",
     )
 
@@ -900,6 +942,45 @@ def test_inherited_product_prompt_uses_session_start_not_essentials(
     assert f"[Essential source: {prompt_path}]" not in message
     if fresh and not options.get("resumed"):
         assert message.count("PRODUCT_PROMPT_AT_SESSION_START") == 1
+    if spec_uses_stub:
+        # Essentials sanitise the stub's [AGENT SYSTEM PROMPT] markers, so a
+        # byte-exact match would miss a leak; assert on its marker-free tail.
+        assert "follow it as your authoritative contract" not in message
+    env.forbidden.assert_not_called()
+
+
+def test_managed_stub_reaches_owner_session_start(env, tmp_path, monkeypatch):
+    """A private-owner fork whose spec carries the native stub resolves to the
+    product contract at session start via the owner-template load, not the stub
+    text (see agent-spec-fields.md → Prompt)."""
+    from kiro_crew import agent
+
+    package = tmp_path / "installed-package" / "config"
+    monkeypatch.setattr(agent, "_BUNDLED_CFG_DIR", package)
+    monkeypatch.setattr(agent, "_project_dir", lambda: None)
+    prompt_path = package / "prompt.md"
+    prompt_path.parent.mkdir(parents=True, exist_ok=True)
+    prompt_path.write_text("PRODUCT_PROMPT_AT_SESSION_START", encoding="utf-8")
+    assert agent._prompt_path() == prompt_path
+    spec = env.project / ".kiro" / "agents" / "writer-template.json"
+    spec.write_text(
+        json.dumps({"name": "writer-template", "prompt": agent._NATIVE_PROMPT_STUB}),
+        encoding="utf-8",
+    )
+
+    # agent="writer-template" == the member's own template, so the owner-template
+    # session-start load (context._load_agent_prompt) runs — not the direct read.
+    message, _ = env.builder.build_message(
+        "Continue",
+        True,
+        agent="writer-template",
+        memory_store=env.store,
+        member=env.member,
+        project=str(env.project),
+    )
+
+    assert message.count("PRODUCT_PROMPT_AT_SESSION_START") == 1
+    assert "follow it as your authoritative contract" not in message
     env.forbidden.assert_not_called()
 
 
