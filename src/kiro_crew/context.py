@@ -4929,8 +4929,6 @@ class ContextBuilder:
                     session_start=True,
                 )
             )
-                )
-            )
             if agent_prompt:
                 parts.append(
                     f"[AGENT SYSTEM PROMPT]\n{agent_prompt}\n[END AGENT SYSTEM PROMPT]\n\n"
