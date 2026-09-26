@@ -116,8 +116,12 @@ COMMAND_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
     ),
 )
 
-SUMMARIES: dict[str, str] = {
+_ALL_SUMMARIES: dict[str, str] = {
     name: summary for _section, commands in COMMAND_GROUPS for name, summary in commands
+}
+_EXCLUDED = {"artifact", "memory", "knowledge", "learn", "consolidate", "bench"}
+SUMMARIES: dict[str, str] = {
+    name: summary for name, summary in _ALL_SUMMARIES.items() if name not in _EXCLUDED
 }
 
 # Position of each command in the help's listing, for ordering an error message
@@ -171,7 +175,7 @@ def add_command(
     Raises ``KeyError`` when ``name`` has no section, so a command cannot be
     added to the CLI without also appearing in the top-level help.
     """
-    kwargs.setdefault("description", SUMMARIES[name])
+    kwargs.setdefault("description", _ALL_SUMMARIES[name])
     return sub.add_parser(name, **kwargs)
 
 
@@ -183,16 +187,9 @@ def render_epilog(width: int = 13) -> str:
     commands immediately above them, and a reader who stops after the first
     screen is exactly the reader who needs them.
     """
-    from kiro_crew.fork_profile import ARTIFACTS_ENABLED, MEMORY_ENABLED
-
-    excluded = set()
-    if not ARTIFACTS_ENABLED:
-        excluded.add("artifact")
-    if not MEMORY_ENABLED:
-        excluded.update({"memory", "knowledge", "learn", "consolidate", "bench"})
     lines: list[str] = []
     for index, (section, commands) in enumerate(COMMAND_GROUPS):
-        commands = tuple((name, summary) for name, summary in commands if name not in excluded)
+        commands = tuple((name, summary) for name, summary in commands if name not in _EXCLUDED)
         if not commands:
             continue
         lines.append(f"{section}:")

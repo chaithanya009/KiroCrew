@@ -68,6 +68,7 @@ from kiro_crew.apps.hooks_integration import (
 from kiro_crew.apps.lifecycle_scripts import run_lifecycle_script as _run_lifecycle_script
 from kiro_crew.apps.manager import (
     _credential_free_source_metadata,
+    app_enabled_state,
     app_lifecycle_lock,
     apps_dir,
     cleanup_migrated_builtin,
@@ -1725,6 +1726,19 @@ async def handle_uninstall_app(request: web.Request) -> web.Response:
                             name,
                             exc_info=True,
                         )
+
+            # Step 7: remove the clone. Off-loop like Step 5 (a git tree), and INSIDE
+            # the lock held since Step 2: a second acquisition queues behind a parked
+            # install and would delete the tree that install just re-cloned. PR body.
+            if is_registry_source(info.get("source", "")):
+                app_reg_name = registry_name_from_source(info.get("source", ""))
+                if app_reg_name:
+                    from kiro_crew.apps.registry import app_source_dir
+
+                    ws_dir = app_source_dir(app_reg_name)
+                    if ws_dir.is_dir():
+                        await asyncio.to_thread(shutil.rmtree, ws_dir, ignore_errors=True)
+                        uninstall_log.append(f"Removed workspace for {app_reg_name}")
     if not result.ok:
         sel().log_api_access(
             caller="dashboard",
@@ -1751,17 +1765,6 @@ async def handle_uninstall_app(request: web.Request) -> web.Response:
             )
         else:
             uninstall_log.append(f"Dropped {dropped} conversation pointer(s)")
-
-    # Step 6: Clean up workspace (each registry app has its own workspace)
-    if is_registry_source(info.get("source", "")):
-        app_reg_name = registry_name_from_source(info.get("source", ""))
-        if app_reg_name:
-            from kiro_crew.apps.registry import app_source_dir
-
-            ws_dir = app_source_dir(app_reg_name)
-            if ws_dir.is_dir():
-                shutil.rmtree(ws_dir, ignore_errors=True)
-                uninstall_log.append(f"Removed workspace for {app_reg_name}")
 
     sel().log_api_access(
         caller="dashboard", operation="app_uninstall", outcome="completed", resources=name
@@ -1889,6 +1892,9 @@ async def handle_enable_app(request: web.Request) -> web.Response:
     # install/update/uninstall of the same app (e.g. enabling while an
     # off-loop uninstall is deleting the app directory).
     async with app_lifecycle_lock(name):
+        # A re-enable repeats every step but the Python hooks: the flag does not prove
+        # onEnable ran (a file-only CLI enable skips it), while hook_reconcile loads hooks.
+        was_enabled = app_enabled_state(name) is True
         result = enable_app(name, session_approval_consent=session_approval_consent)
         if not result.ok:
             sel().log_api_access(
@@ -2004,21 +2010,25 @@ async def handle_enable_app(request: web.Request) -> web.Response:
         # Invoke Python lifecycle hooks (routes + on_startup) — runs AFTER shell scripts
         try:
             state = request.app.get("state")
-            hooks_result = await on_app_enable(
-                name,
-                info,
-                cron_service=getattr(state, "crons", None),
-                # state exposes broadcast_ws, not broadcast: the old
-                # getattr(state, "broadcast", None) always resolved to None, so an
-                # app enabled from the dashboard got NO event bus at all.
-                broadcast_fn=(
-                    build_broadcast_fn(state.broadcast_ws) if state is not None else None
-                ),
-                spawn_impl=(
-                    build_spawn_impl(getattr(state, "subagents", None))
-                    if state is not None
-                    else None
-                ),
+            hooks_result = (
+                None
+                if was_enabled
+                else await on_app_enable(
+                    name,
+                    info,
+                    cron_service=getattr(state, "crons", None),
+                    # state exposes broadcast_ws, not broadcast: the old
+                    # getattr(state, "broadcast", None) always resolved to None, so an
+                    # app enabled from the dashboard got NO event bus at all.
+                    broadcast_fn=(
+                        build_broadcast_fn(state.broadcast_ws) if state is not None else None
+                    ),
+                    spawn_impl=(
+                        build_spawn_impl(getattr(state, "subagents", None))
+                        if state is not None
+                        else None
+                    ),
+                )
             )
             if hooks_result:
                 # Redact any sensitive content in health_status issues
@@ -2099,6 +2109,9 @@ async def handle_disable_app(request: web.Request) -> web.Response:
         startup_refusal = await _refuse_while_startup_hook_runs(name, action="disable")
         if startup_refusal is not None:
             return startup_refusal
+        # Teardown decides whether app code may run from `enabled`; read it under the lock.
+        if (enabled := app_enabled_state(name)) is not None:
+            info = {**info, "enabled": enabled}
 
         # `onDisable` is NOT run here: it runs inside `teardown_app_runtime`
         # below, so that revoking an app's execution grant runs it too. Keeping it

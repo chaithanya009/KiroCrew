@@ -458,8 +458,6 @@ def test_child_argv_resolved_path_used(monkeypatch) -> None:
         ["chat", "--no-jail"],
         ["--no-jail", "run", "T.md"],
         ["run", "T.md", "--no-jail"],
-        ["--no-jail", "consolidate"],
-        ["consolidate", "--no-jail"],
         ["--no-jail", "eval"],
         ["eval", "--no-jail"],
     ],

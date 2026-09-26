@@ -659,6 +659,16 @@ _CREW_SECRET_LEAVES: list[str] = [
     # working; there is deliberately no CLI verb to fence.
     "file_delivery_consent.json",
     "ssh_auth_sock_consent.json",
+    # The owner's credential-redaction switch. Same class of control as the
+    # consent records above: the record is what AUTHORIZES the credential scrubber
+    # to stand down in the owner's dashboard file viewer (the one surface it
+    # governs), so an agent that could write it would switch off the pass that
+    # keeps the secrets it can read out of that view. A missing or unreadable
+    # file reads as ENABLED, so fencing the
+    # write is what keeps the switch the owner's. The owner-gated dashboard
+    # ``/api/security/credential-redaction`` handler is the only writer and opens
+    # the path directly, not through this gate.
+    "credential_redaction.json",
     # The single-use step-up nonce that authorizes RECORDING a flagged-file
     # delivery grant. A whole DIRECTORY, not a leaf file, because arming writes a
     # sibling ``.tmp`` and renames it into place. It lives in its OWN top-level
@@ -675,6 +685,27 @@ _CREW_SECRET_LEAVES: list[str] = [
     "file-delivery-consent-pending",
     "token_signing.key",
     "refresh_chains.json",
+    # The staging directory the two leaves above publish through. Both are masked as
+    # individual FILES in the data-home root, and a mask covers a PATH, so a temp staged
+    # BESIDE either of them sits in that root under a name no mask covers -- readable in
+    # any agent sandbox, and ``link(2)``-able by a same-uid agent during the write. The
+    # temp holds the FULL signing key or chain state for the whole write, so that window
+    # is a forged-token path, and a crash between write and publish leaves the same bytes
+    # on disk indefinitely.
+    #
+    # Named as the whole DIRECTORY, like ``md-notebook-staging``, ``live-target-staging``
+    # and ``aws-control-staging`` above: the ``startswith(target + os.sep)`` rule then
+    # covers every temp name inside it, present and future. The keystone-artifact suffix
+    # rule below does NOT reach these temps -- it covers a direct child of a keystone
+    # leaf's own directory, and a staged temp sits one level below that -- so this entry
+    # is what protects them, and it is the stronger of the two: it covers a leftover
+    # whatever it is named, not only one ending in ``.tmp``.
+    #
+    # A TOP-LEVEL leaf, not a path under another directory, so no agent-writable ancestor
+    # can be renamed out from under it. The gateway process is the only writer and it
+    # opens these paths directly rather than through this gate, so publishing keeps
+    # working.
+    "auth-store-staging",
     ".local_secret",
     # Durable channel transport state: Teams' conversation -> serviceUrl and
     # identity -> conversation maps, and Telegram's getUpdates cursor. Two shapes of
@@ -2479,14 +2510,43 @@ def _home_targets_ttl(rebuild_secs: float, *, resolution_differed: bool = True) 
     return min(max(scaled, _HOME_TARGETS_TTL_SECS), _HOME_TARGETS_TTL_MAX_SECS)
 
 
-#: Last state :func:`_report_expiry_pin` reported, so the line is emitted once per
-#: TRANSITION rather than once per rebuild. A dict rather than a module global
-#: because it is written from inside a function.
-_home_targets_pin_state: dict[str, bool] = {}
+def _home_targets_tier(home_dirs: list[str]) -> str:
+    """Name the gate whose ``home_dirs`` list this is, for the expiry-pin line.
+
+    A label for a reader, never a decision: :func:`_report_expiry_pin` keys its
+    state on the list itself, so an unrecognised list still gets its own slot and
+    the right dedup while being named generically here. That is what keeps this
+    from being a second place a new gate must be registered for correctness --
+    ``test_every_gate_list_handed_to_the_builder_has_a_tier_name`` scans the call
+    sites and fails when one arrives without a name, so the generic answer is a
+    floor rather than somewhere to stop.
+
+    Compared against the live lists rather than a table frozen at import, because
+    the lists are assembled by ``+=`` across this module and a test may extend one.
+    """
+    if home_dirs == _SENSITIVE_HOME_DIRS:
+        return "read"
+    if home_dirs == _SENSITIVE_HOME_DIRS + _WRITE_PROTECTED_HOME_PATHS:
+        return "write"
+    if home_dirs == _KEYSTONE_ARTIFACT_PARENTS:
+        return "keystone-artifact"
+    return f"unnamed {len(home_dirs)}-entry"
 
 
-def _report_expiry_pin(pinned: bool) -> None:
-    """Say once, on each transition, which expiry the cache is actually selecting.
+#: Last state :func:`_report_expiry_pin` reported FOR EACH ``home_dirs`` list, so the
+#: line is emitted once per tier per TRANSITION rather than once per rebuild. Keyed on
+#: the list itself rather than on one shared slot because the gates hand the builder
+#: different lists whose answers can disagree on one host -- see
+#: :func:`_report_expiry_pin`. The roots are deliberately NOT part of this key: they key
+#: the target CACHE, but a tier reporting the same answer under new roots has not
+#: transitioned and must not re-log. Bounded by the number of gate lists, a handful of
+#: module constants, so it needs no eviction. A dict rather than a module global because
+#: it is written from inside a function.
+_home_targets_pin_state: dict[tuple[str, ...], bool] = {}
+
+
+def _report_expiry_pin(home_dirs: list[str], pinned: bool) -> None:
+    """Say once per tier, on each transition, which expiry that build selects.
 
     Without this the availability half self-disables in silence. On an install
     whose RESOLVED leaf under a home-override root is a symlink -- a crew-prefixed
@@ -2512,29 +2572,46 @@ def _report_expiry_pin(pinned: bool) -> None:
     dotfile in none of those classes cannot report
     a traversal, because the bulk targets are never resolved.
 
-    The dedup is ONE shared boolean, and that is weaker than per-build accuracy.
-    ``_home_targets_pin_state`` holds a single ``"pinned"`` key while
-    ``_cached_home_dir_targets`` calls this once per cache entry, and the three
-    ``home_dirs`` lists can resolve to different answers on one host -- a symlinked
-    crew leaf can pin the read and write builds while the keystone-artifact build
-    reports no traversal. So a steady host says it once only while every build
-    agrees; where they disagree the line alternates between the two messages
-    instead, and neither names which build it is about. Read a single line as "some
-    build selected this expiry", not as the state of every tier.
+    The dedup is per ``home_dirs`` list, because that list is what decides the
+    answer. The gates hand the builder three different ones -- the read gate passes
+    ``_SENSITIVE_HOME_DIRS``, :func:`is_sensitive_write_path` passes that plus
+    ``_WRITE_PROTECTED_HOME_PATHS``, and :func:`_is_keystone_publish_artifact`
+    passes ``_KEYSTONE_ARTIFACT_PARENTS`` -- while a symlinked write-protected crew
+    leaf that holds no secret (``models``, ``sessions``, ``app-sources``) sits in
+    the write gate's list alone. So one host can have the write build resolve that
+    leaf and pin the floor while the keystone-artifact build reports no traversal
+    and selects the cost-tracking expiry. Under one shared slot each of those builds
+    flips the key the other just set, so the line alternates between two opposite
+    messages for as long as the disagreement lasts and neither survives long enough
+    to read as a state. A per-list slot lets each build transition its OWN state: a
+    steady host says it once per tier rather than once per rebuild, and a tier that
+    flips says it again.
+
+    Both messages name the tier for the same reason. A reader diagnosing a refusal
+    needs to know WHICH gate is pinned, and on a host whose builds disagree a line
+    naming none of them cannot answer that -- the "cost-tracking expiry in force"
+    half would read as the state of the whole gate while another tier is pinned to
+    the floor, which is the opposite of the truth for whoever is tuning the knobs.
     """
-    if _home_targets_pin_state.get("pinned") is pinned:
+    key = tuple(home_dirs)
+    if _home_targets_pin_state.get(key) is pinned:
         return
-    _home_targets_pin_state["pinned"] = pinned
+    _home_targets_pin_state[key] = pinned
+    tier = _home_targets_tier(home_dirs)
     if pinned:
         logger.info(
-            "sensitive-path anchor cache: expiry pinned to the %.1fs floor because a "
-            "path under a home-override root resolved through a symlink, so the "
-            "cost-tracking expiry and both of its knobs do not apply while that holds",
+            "sensitive-path anchor cache (%s tier): expiry pinned to the %.1fs floor "
+            "because a path under a home-override root resolved through a symlink, so "
+            "the cost-tracking expiry and both of its knobs do not apply to this tier "
+            "while that holds",
+            tier,
             _HOME_TARGETS_TTL_SECS,
         )
     else:
         logger.info(
-            "sensitive-path anchor cache: cost-tracking expiry in force " "(ratio %s, cap %.1fs)",
+            "sensitive-path anchor cache (%s tier): cost-tracking expiry in force "
+            "(ratio %s, cap %.1fs)",
+            tier,
             _HOME_TARGETS_TTL_COST_RATIO,
             _HOME_TARGETS_TTL_MAX_SECS,
         )
@@ -2830,7 +2907,7 @@ def _cached_home_dir_targets(
     # double or any future builder that returns a plain ``set`` carries no
     # attribute and gets the floor rather than the long expiry.
     differed = bool(getattr(targets, "resolution_differed", True))
-    _report_expiry_pin(differed)
+    _report_expiry_pin(home_dirs, differed)
     ttl = _home_targets_ttl(max(0.0, built_at - now), resolution_differed=differed)
     # Bound the dict: the key space is tiny (two constant home_dirs lists ×
     # roots), but a test or embedder that churns KIROCREW_HOME must not grow it
@@ -3113,6 +3190,20 @@ def is_sensitive_canonical_path(resolved: str) -> bool:
     except RuntimeError:
         return is_sensitive_resolved_path(resolved)
     return is_sensitive_path(resolved)
+
+
+def canonical_path_refusal(resolved: str) -> str | None:
+    """:func:`is_sensitive_canonical_path` as reason-or-``None``: same gate per thread.
+
+    Only the on-loop (bounded) gate can stall, so only it can return the stall wording.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        if is_sensitive_canonical_path(resolved):
+            return f"Blocked: access to sensitive path: {resolved}"
+        return None
+    return sensitive_path_refusal(resolved)
 
 
 #: The fixed opening of an unverifiable-path refusal. Consumers tell a stall from a

@@ -6532,6 +6532,12 @@
       "artifact": "Artefact",
       "changed": "modifié",
       "diff_unavailable_file_exceeds_snapshot_limit": "Diff indisponible : le fichier est trop volumineux pour être comparé (plus de {{limit}} caractères).",
+      "file_only": "Fichier seul",
+      "diff_unavailable_turn_snapshot_budget": "Les modifications de ce tour étaient trop volumineuses pour conserver le diff de chaque fichier (plus de {{limit}} caractères au total).",
+      "turn_snapshot_budget_open_hint": "Clique sur le nom d’un fichier pour l’ouvrir.",
+      "omitted_files_notice_one": "{{files}} autre fichier modifié dans ce tour n’apparaît pas dans la liste.",
+      "omitted_files_notice_many": "{{files}} autres fichiers modifiés dans ce tour n’apparaissent pas dans la liste.",
+      "omitted_files_notice_other": "{{files}} autres fichiers modifiés dans ce tour n’apparaissent pas dans la liste.",
       "file_many": "{{count}} fichiers",
       "file_one": "{{count}} fichier",
       "file_other": "{{count}} fichiers",
@@ -7183,7 +7189,11 @@
       "diagram_source": "Source du diagramme",
       "copy_failed": "Échec de la copie",
       "mermaid_render_failed": "Impossible d’afficher ce diagramme. La source est affichée à la place.",
-      "image_position": "{{index}} sur {{total}}"
+      "image_position": "{{index}} sur {{total}}",
+      "copy_chip_name": "Copier {{text}}",
+      "open_path_chip_name": "Ouvrir {{path}}",
+      "browse_path_chip_name": "Parcourir {{path}}",
+      "switch_to_session_chip_name": "Passer à la session {{label}}"
     },
     "markdownToc": {
       "contents": "Sommaire",
@@ -7306,7 +7316,8 @@
       "close_editor": "Fermer l'éditeur",
       "copied": "Copié !",
       "copy": "Copier",
-      "edit_code_block": "Modifier le bloc de code"
+      "edit_code_block": "Modifier le bloc de code",
+      "not_saved_hint": "Non enregistré dans le chat. Fermer supprime les modifications."
     },
     "notifications": {
       "notifMeta": {
@@ -8531,7 +8542,15 @@
       "temporary_active_switch_to_persistent": "Temporaire — passer au mode persistant",
       "temporary_desc": "N’utilise pas la mémoire et n’apprend aucune leçon. Conserve la transcription pour restaurer l’onglet.",
       "try_create_a_plan_to_analyze_kirocrew_code_packa": "Essayez : « Crée un plan pour analyser le package de code {{productName}} et indiquer le nombre de fichiers par composant principal »",
-      "what_can_i_do_for_you": "Que puis-je faire pour toi ?"
+      "what_can_i_do_for_you": "Que puis-je faire pour toi ?",
+      "greeting_what_are_we_building_today": "Que construisons-nous aujourd'hui ?",
+      "greeting_where_should_we_start": "Par où commençons-nous ?",
+      "greeting_whats_on_your_mind": "Qu'as-tu en tête ?",
+      "greeting_ready_when_you_are": "Prêt quand tu l'es.",
+      "greeting_good_to_see_you": "Ravi de te revoir. Et maintenant ?",
+      "greeting_good_morning": "Bonjour. Par où commençons-nous ?",
+      "greeting_good_afternoon": "Bon après-midi. Par où commençons-nous ?",
+      "greeting_good_evening": "Bonsoir. Par où commençons-nous ?"
     },
     "widgetFrame": {
       "cannot_star_widget_has_no_slug_or_message_contex": "Impossible d’ajouter aux favoris : le widget n’a ni slug ni contexte de message",
@@ -10079,7 +10098,8 @@
         "sign_in": "Se connecter à Kiro",
         "sign_in_hint": "Ouvrez Paramètres → Aperçu → Connexion Kiro, reconnectez-vous, puis renvoyez votre message.",
         "feature_request_form": "Ouvrir le formulaire de demande de fonctionnalité",
-        "feature_request_form_hint": "Ton quota mensuel est épuisé — dépose plutôt ta demande sur GitHub avec ce formulaire. Ce formulaire contourne l’agent : il ouvre le formulaire d’issue GitHub que tu remplis toi-même et ne consomme rien de ton quota mensuel."
+        "feature_request_form_hint": "Ton quota mensuel est épuisé — dépose plutôt ta demande sur GitHub avec ce formulaire. Ce formulaire contourne l’agent : il ouvre le formulaire d’issue GitHub que tu remplis toi-même et ne consomme rien de ton quota mensuel.",
+        "session_start_repeat_hint": "La session de l’agent n’a pas pu démarrer plusieurs fois de suite ; reprendre ne ferait que relancer le même démarrage. Redémarre le gateway depuis un terminal avec {{command}}, puis renvoie ton message."
       },
       "folderPanel": {
         "clear_search": "Effacer la recherche",
@@ -10331,6 +10351,13 @@
         "stop_failed": "Impossible d’arrêter le sous-agent {{name}}",
         "stop_all_failed": "Impossible d’arrêter les sous-agents",
         "retry_failed_error": "Impossible de réessayer certains sous-agents en échec"
+      },
+      "subagentQueued": {
+        "adaptive_cap_zero": "en attente de démarrage — les démarrages sont suspendus tant que cet ordinateur manque de mémoire ou est surchargé ; ils reprennent d’eux-mêmes une fois la situation rétablie",
+        "low_memory": "en attente de démarrage — nécessite {{required}} de mémoire libre, {{available}} libres actuellement ; libère de la mémoire pour continuer",
+        "low_memory_no_figures": "en attente de démarrage — mémoire libre insuffisante ; libère de la mémoire pour continuer",
+        "posture_critical": "en attente de démarrage — la mémoire de cet ordinateur est critiquement basse ({{available}} libres) ; libère de la mémoire pour continuer",
+        "posture_critical_no_figures": "en attente de démarrage — la mémoire de cet ordinateur est critiquement basse ; libère de la mémoire pour continuer"
       },
       "subagentRunCard": {
         "agent_finished_many": "{{count}} agents terminés",
@@ -11022,7 +11049,6 @@
       "hidden_folders": "dossiers masqués",
       "hide": "Masquer",
       "hide_folder": "Masquer le dossier",
-      "hide_from_flat_view": "Masquer {{name}} de la vue à plat",
       "hide_when_empty": "Masquer si vide",
       "hours": "heures",
       "include_untagged_sessions": "Inclure les sessions sans étiquette",
@@ -11118,7 +11144,6 @@
       "show_hidden_folder_many": "Afficher {{count}} dossiers masqués",
       "show_hidden_folder_one": "Afficher {{count}} dossier masqué",
       "show_hidden_folder_other": "Afficher {{count}} dossiers masqués",
-      "show_in_flat_view": "Afficher {{name}} dans la vue à plat",
       "show_only_sessions_tagged": "Afficher uniquement les sessions avec l'étiquette {{name}}",
       "show_the_folder_list": "Afficher la liste des dossiers",
       "skip": "Ignorer",
@@ -11306,6 +11331,7 @@
       "block_semantic_memory": "Faits que vous avez indiqués",
       "block_skill_hint": "Compétences pertinentes",
       "block_skill_index": "Index des compétences",
+      "block_task_facts": "Faits rappelés pour cette tâche",
       "block_unclassified": "Non classé",
       "block_your_message": "Votre message",
       "cat_memory": "Mémoire à ton sujet",
@@ -12584,6 +12610,8 @@
         "confirm_reapply_body": "Cette action recharge le modèle configuré et efface puis reconstruit les vecteurs de mémoire stockés."
       },
       "kiroCrewCfgTab": {
+        "agent_for_pool_processes_empty_uses_default_agent": "Agent pour les processus du pool. Vide = agent par défaut.",
+        "applies_to_sessions_started_after_the_change": "S'applique aux sessions démarrées après la modification. 'auto' isole l'agent dans le sandbox mais les outils d'identifiants continuent de fonctionner ; 'strict' masque en plus les identifiants cloud, SSH, kube et de registres, donc ces outils cessent de fonctionner dans l'agent, uniquement là où le sandbox de {{productName}} confine le processus : pas sous Windows, ni pour un processus macOS délégué au sandbox interne de kiro-cli ; 'off' désactive le sandbox de {{productName}} (sous macOS, le sandbox de kiro-cli s'applique toujours s'il est activé).",
         "approval_mode": "Mode d'approbation",
         "auto": "auto",
         "auto_size_max": "Taille auto max",
@@ -12599,9 +12627,9 @@
         "embedding_provider": "Fournisseur d'embedding",
         "enable_dynamic_mcp_tool_discovery_via_kiro_cli_t": "Activer la découverte dynamique des outils MCP via kiro-cli. Prend effet à la prochaine session.",
         "immediate_auto_approves_all_tools_interactive_as": "Immédiat. 'auto' approuve tous les outils ; 'interactive' demande à chaque fois.",
-        "immediate_auto_enables_sandbox_for_untrusted_too": "Immédiat. 'auto' active le sandbox pour les outils non fiables.",
         "inherited_provider": "hérité ({{provider}})",
         "kirocrew_agents": "Agents {{productName}}",
+        "max_age_for_pooled_processes_0_disables_expiry": "Âge maximal des processus du pool. 0 désactive l'expiration.",
         "max_channel_agents": "Agents de canal max",
         "max_channels": "Canaux max",
         "max_concurrent_subagents": "Sous-agents simultanés max",
@@ -12617,6 +12645,7 @@
         "next_update_check_cycle": "Au prochain cycle de vérification des mises à jour.",
         "no_agents_defined": "Aucun agent défini",
         "no_memory_stores": "Aucun stockage mémoire",
+        "number_of_pre_spawned_processes_0_disables": "Nombre de processus prélancés. 0 désactive.",
         "pool_agent": "Agent du pool",
         "pool_size": "Taille du pool",
         "pool_ttl": "TTL du pool",
@@ -12633,12 +12662,9 @@
         "using_global_memory_settings": "Utilisation des paramètres de mémoire globaux",
         "using_legacy_mode_agent_default_agent_as_agent_t": "Mode héritage — agent.default_agent comme modèle d'agent",
         "warm_pool": "Pool préchauffé",
-        "workspace": "Espace de travail",
-        "workspaces": "Espaces de travail",
-        "number_of_pre_spawned_processes_0_disables": "Nombre de processus prélancés. 0 désactive.",
-        "agent_for_pool_processes_empty_uses_default_agent": "Agent pour les processus du pool. Vide = agent par défaut.",
         "warm_pool_description": "Pré-lance des processus ACP CLI pour un démarrage de session instantané.",
-        "max_age_for_pooled_processes_0_disables_expiry": "Âge maximal des processus du pool. 0 désactive l'expiration."
+        "workspace": "Espace de travail",
+        "workspaces": "Espaces de travail"
       },
       "mcpTab": {
         "actions": "Actions",
@@ -12698,6 +12724,23 @@
         "probe_failing_help": "{{failures}} sondages en echec consecutifs. Le serveur reste monte : c'est un releve d'etat, pas une modification.",
         "reset_failures": "Reinitialiser le compteur",
         "reset_failures_help": "Efface le compteur d'echecs consecutifs de ce serveur.",
+        "disabled_in_config": "Désactivé dans la config",
+        "disabled_in_config_invalid": "Erreur de config",
+        "status_invalid_value": "Valeur non valide",
+        "copy_path": "Copier le chemin",
+        "copy_path_named": "Copier le chemin {{file}}",
+        "path_copied": "Copié",
+        "copy_path_failed": "Échec de la copie",
+        "disabled_in_config_help": "Désactivé dans la configuration Kiro MCP partagée, que Kiro IDE lit aussi. Il n’est jamais démarré et ce panneau ne peut pas le réactiver : modifie l’indicateur dans cette configuration.",
+        "disabled_in_config_where": "Désactivé dans <file>{{file}}</file>. Modifier ce fichier lève sa désactivation ; une autre configuration peut encore garder le serveur éteint. Un interrupteur est prévu.",
+        "disabled_in_config_where_unknown": "Désactivé dans la configuration MCP partagée. Modifier cette configuration lève sa désactivation ; une autre configuration peut encore garder le serveur éteint. Un interrupteur est prévu.",
+        "disabled_in_config_invalid_where": "Désactivé : la valeur de \"disabled\" dans <file>{{file}}</file> n’est pas valide. Mets-la à true ou false dans ce fichier.",
+        "disabled_in_config_invalid_where_unknown": "Désactivé : la valeur de \"disabled\" dans la configuration MCP partagée n’est pas valide. Mets-la à true ou false dans cette configuration.",
+        "uninstall_disabled_in_config_help": "Retire ce serveur de toutes les configurations MCP, y compris la configuration partagée où il est désactivé.",
+        "scope_disabled_in_config": "{{label}} : désactivé (désactivé dans la configuration MCP partagée ; modifie-la là-bas)",
+        "disabled_count_one": "{{count}} désactivé",
+        "disabled_count_many": "{{count}} désactivés",
+        "disabled_count_other": "{{count}} désactivés",
         "sign_in": "Se connecter",
         "sign_in_authorize": "Autoriser {{name}}",
         "sign_in_mint_failed": "Impossible de démarrer la connexion. Réessayez.",
@@ -14248,6 +14291,11 @@
         "status_unavailable": "Statut indisponible"
       },
       "chatPanel": {
+        "advanced": "Avancé",
+        "discovery": "Découverte",
+        "rail_label": "Paramètres du chat",
+        "side_panel": "Panneau latéral",
+        "transcript": "Conversation",
         "about_you": "À propos de vous",
         "answer_only_details_on_request": "Réponse seule — mots les plus simples, détails sur demande",
         "auto_add_documents": "Ajouter automatiquement les documents",
@@ -14369,7 +14417,6 @@
         "maximum_characters_retained_in_the_completion_ev": "Nombre maximal de caractères conservés dans l’événement de fin après application du mode de troncature. 0 désactive complètement la troncature. Par défaut : {{n}}.",
         "mcp_apps_in_side_panel": "Applications MCP dans le panneau latéral",
         "merge_queued_messages": "Fusionner les messages en file d'attente",
-        "messages": "Messages",
         "minimal_stats_only_name_on_hover": "Minimal (statistiques seules, nom au survol)",
         "mirror_documents_you_save_as_artifacts_into_the_l": "Reflète dans la bibliothèque les documents que vous enregistrez comme artéfacts, les tient à jour au fil de vos modifications et les retire quand vous supprimez l’artéfact.",
         "mod_enter_for_newline": "{{mod}}+Enter pour un saut de ligne",
@@ -14404,7 +14451,6 @@
         "restore_window": "Fenêtre de restauration",
         "retry": "Réessayer",
         "role_background": "Arrière-plan",
-        "role_chat": "Discussion",
         "role_effort_hint": "Ne s’applique qu’aux modèles capables de raisonnement. «Valeur par défaut du modèle» n’applique aucun remplacement: ce travail n’hérite pas de votre effort de raisonnement par défaut.",
         "role_model_auto": "Automatique (le fournisseur choisit)",
         "role_model_auto_hint": "Avec «Automatique», le fournisseur choisit: votre modèle par défaut n’est pas hérité. Épinglez un modèle pour y exécuter ce travail.",
@@ -14464,7 +14510,6 @@
         "failed_to_start_feature_video_download": "Impossible de démarrer le téléchargement",
         "minimap_side_left": "Gauche",
         "minimap_side_right": "Droite",
-        "minimap": "Minicarte",
         "minimap_location": "Emplacement de la minicarte",
         "minimap_location_desc": "Sur le bord droit, la minicarte remplace la barre de défilement.",
         "message_font_size": "Taille de police des messages",
@@ -14621,6 +14666,11 @@
         "zoom_level": "Niveau de zoom",
         "font_family_option_opendyslexic": "OpenDyslexic",
         "config_load_failed": "Impossible de charger les réglages d’affichage enregistrés. Les réglages du shell, des sessions récentes et de la complétion des commandes sont indisponibles jusqu’au chargement.",
+        "installed_themes_load_failed": "Impossible de charger la liste des thèmes ; nouvelle tentative automatique. Tant qu'elle n'est pas chargée, un thème installé ne peut être ni sélectionné ni appliqué.",
+        "installed_themes_refresh_failed": "Impossible d'actualiser la liste des thèmes. Elle n'est plus à jour.",
+        "installed_themes_refresh_failed_after_install": "Le thème a été installé, mais la liste des thèmes n'a pas pu être actualisée. Appuie sur Réessayer pour actualiser la liste et l'appliquer, ou choisis-le dans la liste des thèmes une fois actualisée.",
+        "retry_theme_list": "Réessayer",
+        "retrying_theme_list": "Nouvelle tentative…",
         "recent_tint_save_failed": "Impossible d’enregistrer le nombre de sessions récentes mises en évidence."
       },
       "importPanel": {
@@ -15112,7 +15162,25 @@
         "file_delivery_destination_help": "Cela signifie que le fichier arrive dans le dossier boîte d'envoi de cet ordinateur et apparaît dans la vue Fichiers de votre tableau de bord — nulle part où un tiers peut le voir. Il n'est jamais envoyé vers Slack ni un canal de discussion.",
         "file_delivery_armed_help": "Une dernière étape, sur cette machine : exécutez cette commande dans un terminal sur l'ordinateur qui exécute {{productName}} pour terminer l'autorisation de livraison. Cela confirme qu'une personne est à la machine — une session de navigateur seule ne peut pas l'autoriser.",
         "file_delivery_armed_expires": "Cette demande expire dans environ {{duration}}.",
-        "file_delivery_arm_status_failed": "Impossible de vérifier si une approbation est en cours."
+        "file_delivery_arm_status_failed": "Impossible de vérifier si une approbation est en cours.",
+        "credential_redaction_section": "Masquage des identifiants dans les vues de fichiers",
+        "credential_redaction_toggle": "Masquer les identifiants dans les fichiers que le tableau de bord ouvre pour toi",
+        "credential_redaction_toggle_help": "Désactivé, les fichiers que le tableau de bord ouvre pour toi (l'onglet Fichiers du panneau latéral du chat et les aperçus Bibliothèque et Artefacts) s'affichent tels qu'ils ont été écrits, dans ton propre tableau de bord seulement. Activé par défaut. Les conversations de ce tableau de bord, Slack et les canaux de messagerie restent masqués. Le changer recharge les fichiers ouverts (les modifications non enregistrées sont conservées) et ferme les vues de comparaison de fichiers (diff).",
+        "credential_redaction_off_notice": "Les fichiers que tu ouvres s'affichent sans masquage ; le chat et les canaux de messagerie restent masqués.",
+        "credential_redaction_off_since": "Désactivé depuis {{time}}.",
+        "credential_redaction_read_failed": "Impossible de lire le réglage de masquage. Rien ne s'affiche ici parce que la lecture a échoué, pas parce que le masquage est désactivé. Le lien « Ouvrir une discussion avec l'agent » ne partage que ce message d'erreur.",
+        "credential_redaction_write_failed": "Impossible d'enregistrer la modification. {{state}} Le lien « Ouvrir une discussion avec l'agent » ne partage que ce message d'erreur.",
+        "credential_redaction_retry": "Réessayer",
+        "credential_redaction_desc_intro": "{{productName}} masque tout ce qui ressemble à un identifiant (clés d'accès, jetons, clés privées) de la sortie de l'agent avant que tu la voies. Lorsqu'il masque une valeur qui t'appartient et que tu dois relire, ces quatre étapes te la font apparaître.",
+        "credential_redaction_step_write": "Demande à l'agent d'écrire la valeur dans un fichier.",
+        "credential_redaction_step_off": "Désactive l'interrupteur ci-dessous.",
+        "credential_redaction_step_open": "Ouvre ce fichier depuis l'onglet Fichiers du panneau latéral du chat.",
+        "credential_redaction_step_on": "Réactive l'interrupteur.",
+        "credential_redaction_desc_tail": "Ceci est distinct de la page Secrets, qui stocke des valeurs à l'usage de l'agent. Ce réglage contrôle seulement si tu vois les valeurs en forme d'identifiant dans les fichiers que le tableau de bord ouvre pour toi. Les liens qui semblent exfiltrer des données (par exemple un lien d'approbation avec un long jeton dans son URL) restent masqués dans les deux cas, et toutes les règles de blocage de commandes restent appliquées.",
+        "credential_redaction_owner_only": "Seul le propriétaire du tableau de bord peut lire ou modifier ce réglage. Le lien « Ouvrir une discussion avec l'agent » ne partage que ce message d'erreur.",
+        "credential_redaction_still_on": "Le masquage est toujours activé.",
+        "credential_redaction_still_off": "Le masquage est toujours désactivé.",
+        "credential_redaction_ask_agent": "Ouvrir une discussion avec l'agent sur cette erreur"
       },
       "shortcutsPanel": {
         "bind_chat_tab_switching_to_ctrl_digit_instead_of": "Associer le changement d'onglet de chat à Ctrl+chiffre au lieu de Option+chiffre",
@@ -15667,7 +15735,6 @@
         "code_ready_for": "Le code de connexion de {{name}} est prêt",
         "confirm_cancel_remove": "Oui, supprimer « {{tag}} »",
         "confirm_delete_of": "Confirm deleting « {{name}} »",
-        "connect_after_sign_in": "Se connecter après la connexion Kiro",
         "copied": "Copied",
         "copy_code_aria": "Copier votre code de connexion {{code}}",
         "copy_command": "Copy command",
@@ -15991,7 +16058,12 @@
       "window_tokens_col": "Fenêtre (tokens)",
       "off_body": "Activer avec <settingRef/>. Les métriques restent locales (<metricsDir/>) — rien ne quitte cette machine.",
       "gauges": "Jauges",
-      "gauges_latest": "dernier échantillon"
+      "gauges_latest": "dernier échantillon",
+      "credits_by_origin": "Crédits par origine",
+      "credits_by_model": "Crédits par modèle",
+      "top_sessions": "Principales sessions",
+      "other_group": "Autres ({{n}})",
+      "full_table": "Tableau complet"
     },
     "terminalPopoutFrame": {
       "return": "Revenir au dock",

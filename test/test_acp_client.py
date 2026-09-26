@@ -4336,8 +4336,8 @@ class TestSendPipeErrors:
                 pass
 
     @pytest.mark.asyncio
-    async def test_stale_eligible_re_enabled_after_tool_then_text(self):
-        """Text after tool re-enables _stale_eligible — synthetic complete fires."""
+    async def test_stale_eligible_re_enabled_after_completed_tool_then_text(self):
+        """Text after a completed tool permits synthetic completion."""
         from kiro_crew.acp.types import (
             EVENT_COMPLETE,
             EVENT_TEXT_CHUNK,
@@ -4365,9 +4365,20 @@ class TestSendPipeErrors:
             params={
                 "update": {
                     "sessionUpdate": UPDATE_TOOL_CALL,
-                    "toolUseId": "tool_1",
+                    "toolCallId": "tool_1",
                     "name": "Read",
                     "input": "{}",
+                }
+            },
+        )
+        result_msg = JsonRpcMessage(
+            method="session/update",
+            params={
+                "update": {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "tool_1",
+                    "status": "completed",
+                    "content": [{"content": {"type": "text", "text": "ok"}}],
                 }
             },
         )
@@ -4384,8 +4395,9 @@ class TestSendPipeErrors:
         async def fake_prompt_loop(req_id, timeout):
             yield "update", text1
             yield "update", tool_msg
+            yield "update", result_msg
             yield "update", text2
-            # No "complete" — text after tool, stale eligible again.
+            # No "complete" — the completed tool leaves the model idle.
 
         client.ensure_ready = AsyncMock()
         client._send_prompt = AsyncMock(return_value=1)
@@ -5720,6 +5732,40 @@ class TestExtractToolEvent:
         event = client._extract_tool_event(msg)
         assert event is not None
         assert "-old" in event.tool_input or "+new" in event.tool_input
+        assert event.diff_path == "f.py"
+
+    def test_tool_call_diff_path_survives_an_inaccurate_kind(self):
+        """A diff content block still marks the write plane even when the
+        backend's own ``kind`` is not ``edit`` (e.g. ``read`` or unset) --
+        ``is_edit_call`` ORs ``diff_path`` with ``kind`` precisely so an
+        agent-influenced ``kind`` cannot hide a real file write from
+        ``tool.risk``'s caution carve-out."""
+        client = AcpClient()
+        from kiro_crew.acp.types import JsonRpcMessage
+
+        msg = JsonRpcMessage(
+            method="session/update",
+            params={
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "title": "write",
+                    "kind": "read",
+                    "toolCallId": "tc-diffpath",
+                    "input": {},
+                    "content": [
+                        {
+                            "type": "diff",
+                            "oldText": "old\n",
+                            "newText": "new\n",
+                            "path": "README.md",
+                        }
+                    ],
+                }
+            },
+        )
+        event = client._extract_tool_event(msg)
+        assert event is not None
+        assert event.diff_path == "README.md"
 
     def test_tool_call_str_replace_fallback(self):
         client = AcpClient()
@@ -8071,6 +8117,7 @@ class TestExtractToolCallRefinement:
         assert event is not None
         # _make_unified_diff prefixes file headers
         assert "foo.py" in event.tool_input
+        assert event.diff_path == "foo.py"
 
     def test_redacts_credentials_in_input(self):
         client = self._client()
@@ -8426,7 +8473,7 @@ class TestWaitForResponseDeferral:
             [{"name": "ready"}, {"name": "broken"}, {"name": "silent"}]
         )
 
-        assert "2/3 MCP server(s) reported" in progress
+        assert "2/3 session-injected MCP server(s) reported" in progress
         assert "no report from silent" in progress
         assert "failed: broken" in progress
         assert "supersecret" not in progress

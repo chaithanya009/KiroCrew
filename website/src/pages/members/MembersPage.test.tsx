@@ -26,6 +26,12 @@ vi.mock('../../api/client', () => ({
     members: vi.fn(),
     memberThread: vi.fn(),
     memberActivity: vi.fn(() => Promise.resolve({ slug: '', member: '', capped: false, entries: [] })),
+    // The open member's folded views. The roster list carries the `roster` view
+    // alone, so the drawer's activity timeline and patrol state read their
+    // baseline here. Resolved-and-empty is the state every case not about those
+    // blocks wants, and the patrol tile waits for this read before it forms a
+    // verdict — an unstubbed reject would leave every drawer case racing it.
+    memberProjections: vi.fn(() => Promise.resolve({ asOfSeq: 0, values: {} })),
     // The Notes tab's read. "No notes yet" is the state every case not about
     // Notes wants: an empty state, not an alert.
     memberBriefing: vi.fn(() => Promise.resolve({ slug: '', member: '', supported: true, text: '', updated_ts: null, redacted: false, truncated: false })),
@@ -272,6 +278,11 @@ beforeEach(() => {
   // the quiet defaults.
   vi.mocked(api.memberActivity).mockImplementation(() =>
     Promise.resolve({ slug: '', member: '', capped: false, entries: [] }),
+  )
+  // The patrol tile waits for this read before it forms a verdict, so a case
+  // that holds it open would leave every later drawer on the skeleton.
+  vi.mocked(api.memberProjections).mockImplementation(() =>
+    Promise.resolve({ asOfSeq: 0, values: {} }),
   )
   // The flag case above turns reply threads ON for one test; back to the default.
   vi.mocked(api.kirocrewConfig).mockImplementation(() => Promise.resolve({}))
@@ -788,8 +799,8 @@ describe('MembersPage side panel (Notes / Work log / Dashboard) and edit jump', 
     await renderPage([row({ bound: true, slot_key: 'member-oncall' })])
     fireEvent.click(await rosterRow('oncall'))
     await screen.findByTestId('member-notes')
-    // The pinned Artifacts view is always on the strip (SidePanel contract).
-    fireEvent.click(screen.getByRole('tab', { name: 'Artifacts' }))
+    // Files remains available as a slot-bound view in this fork.
+    fireEvent.click(screen.getByRole('tab', { name: 'Files' }))
     await waitFor(() => expect(screen.queryByTestId('member-notes')).toBeNull())
     fireEvent.click(screen.getByTestId('side-panel-leading-tab-crew-notes'))
     expect(await screen.findByTestId('member-notes')).toBeInTheDocument()
@@ -872,9 +883,9 @@ describe('MembersPage side panel (Notes / Work log / Dashboard) and edit jump', 
     await renderPage([row({ bound: true, slot_key: 'member-oncall' })])
     fireEvent.click(await rosterRow('oncall'))
     await screen.findByTestId('member-notes')
-    // Leading block: Notes, Work log, Dashboard; pinned: Artifacts, Files — and NOT Changes.
+    // Leading block: Notes, Work log, Dashboard; pinned: Files — and NOT Changes.
     expect(screen.getAllByRole('tab').map((t) => t.getAttribute('aria-label'))).toEqual([
-      'Notes', 'Work log', 'Dashboard', 'Artifacts', 'Files',
+      'Notes', 'Work log', 'Dashboard', 'Files',
     ])
     fireEvent.pointerDown(
       screen.getByRole('button', { name: 'Open side panel tab' }),
@@ -971,7 +982,7 @@ describe('MembersPage side panel (Notes / Work log / Dashboard) and edit jump', 
     await renderPage([row({ bound: true, slot_key: 'member-oncall' })])
     fireEvent.click(await rosterRow('oncall'))
     expect(await screen.findByTestId('chat-pane-stub')).toHaveTextContent('member-oncall')
-    await screen.findByRole('tab', { name: 'Artifacts' })
+    await screen.findByRole('tab', { name: 'Files' })
     ;(api.memberThread as ReturnType<typeof vi.fn>).mockReturnValueOnce(pending)
     fireEvent.click(await rosterRow('oncall'))
     // In flight: thread still renders the cached key, panel is summary-only.
@@ -981,7 +992,7 @@ describe('MembersPage side panel (Notes / Work log / Dashboard) and edit jump', 
     expect(screen.getByTestId('chat-pane-stub')).toHaveTextContent('member-oncall')
     // Confirmed: the slot-bound views return.
     act(() => { resolveRepost({ slot_key: 'member-oncall', slug: 'oncall', member: 'oncall', created: false }) })
-    await screen.findByRole('tab', { name: 'Artifacts' })
+    await screen.findByRole('tab', { name: 'Files' })
   })
 
   it('a thread re-POST withholds the Browser view but never re-keys its body: the native view stays mounted on the same slot', async () => {
@@ -997,7 +1008,7 @@ describe('MembersPage side panel (Notes / Work log / Dashboard) and edit jump', 
     await renderPage([row({ bound: true, slot_key: 'member-oncall' })])
     fireEvent.click(await rosterRow('oncall'))
     expect(await screen.findByTestId('chat-pane-stub')).toHaveTextContent('member-oncall')
-    await screen.findByRole('tab', { name: 'Artifacts' })
+    await screen.findByRole('tab', { name: 'Files' })
     fireEvent.pointerDown(
       screen.getByRole('button', { name: 'Open side panel tab' }),
       { button: 0, ctrlKey: false, pointerType: 'mouse' },
@@ -1022,7 +1033,7 @@ describe('MembersPage side panel (Notes / Work log / Dashboard) and edit jump', 
     expect(body).toHaveAttribute('data-session-key', 'member-oncall')
   })
 
-  it('a stored tab focus survives the re-open round-trip: Artifacts stays focused, not reset to Notes', async () => {
+  it('a stored tab focus survives the re-open round-trip: Files stays focused, not reset to Notes', async () => {
     // While the re-open POST is in flight every slot view is withheld and the
     // strip falls back to Notes — but that fallback must not be
     // written into the bucket, or every switch would wipe the user's focus.
@@ -1031,15 +1042,15 @@ describe('MembersPage side panel (Notes / Work log / Dashboard) and edit jump', 
     await renderPage([row({ bound: true, slot_key: 'member-oncall' })])
     fireEvent.click(await rosterRow('oncall'))
     await screen.findByTestId('member-notes')
-    fireEvent.click(screen.getByRole('tab', { name: 'Artifacts' }))
-    await waitFor(() => expect(screen.getByRole('tab', { name: 'Artifacts' })).toHaveAttribute('aria-selected', 'true'))
+    fireEvent.click(screen.getByRole('tab', { name: 'Files' }))
+    await waitFor(() => expect(screen.getByRole('tab', { name: 'Files' })).toHaveAttribute('aria-selected', 'true'))
     ;(api.memberThread as ReturnType<typeof vi.fn>).mockReturnValueOnce(pending)
     fireEvent.click(await rosterRow('oncall'))
     // In flight: summary shown as the fallback (and its body loads).
     expect(await screen.findByTestId('member-notes')).toBeInTheDocument()
     act(() => { resolveRepost({ slot_key: 'member-oncall', slug: 'oncall', member: 'oncall', created: false }) })
-    // Confirmed: the stored focus is back on Artifacts, untouched by the fallback.
-    await waitFor(() => expect(screen.getByRole('tab', { name: 'Artifacts' })).toHaveAttribute('aria-selected', 'true'))
+    // Confirmed: the stored focus is back on Files, untouched by the fallback.
+    await waitFor(() => expect(screen.getByRole('tab', { name: 'Files' })).toHaveAttribute('aria-selected', 'true'))
     expect(screen.queryByTestId('member-notes')).toBeNull()
   })
 
@@ -1108,7 +1119,7 @@ describe('MembersPage side panel (Notes / Work log / Dashboard) and edit jump', 
     await renderPage([row({ bound: true, slot_key: 'member-oncall' })])
     fireEvent.click(await rosterRow('oncall'))
     expect(await screen.findByTestId('chat-pane-stub')).toHaveTextContent('member-oncall')
-    expect(screen.getByRole('tab', { name: 'Artifacts' })).toBeInTheDocument()
+    expect(screen.getByRole('tab', { name: 'Files' })).toBeInTheDocument()
     ;(api.memberThread as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error('409'))
     fireEvent.click(await rosterRow('oncall'))
     expect(await screen.findByTestId('member-thread-error')).toHaveTextContent(/Couldn't reconnect/i)
@@ -2073,6 +2084,55 @@ describe('MembersPage auto patrol (monitor loop status)', () => {
     expect(cycles).toHaveTextContent('61')
     expect(cycles).toHaveTextContent(/no limit/i)
     expect(cycles).not.toHaveTextContent('61/0')
+  })
+
+  it('waits for the durable wake baseline instead of reading an empty registry as nothing scheduled', async () => {
+    // The verdict reads two sources: the live registry for presence, and the
+    // `wake` projection for a stop that outlives it. The projection arrives with
+    // the open member's own read, so a verdict formed before that read lands
+    // shows "nothing scheduled" for a member the log records as STOPPED -- the
+    // exact reading the durable record exists to prevent. Held open here so the
+    // window is observable rather than a race.
+    let release!: (v: { asOfSeq: number; values: Record<string, unknown> }) => void
+    ;(api.memberProjections as ReturnType<typeof vi.fn>).mockReturnValue(
+      new Promise((resolve) => {
+        release = resolve
+      }),
+    )
+    ;(api.autonudgeList as ReturnType<typeof vi.fn>).mockResolvedValue({ enabled: true, loops: [] })
+    await renderPage([row({ bound: true, slot_key: 'member-oncall' })])
+    fireEvent.click(await rosterRow('oncall'))
+    await openWorkLog()
+
+    // While the read is in flight the tile shows its skeleton and commits to no
+    // verdict -- in particular not the "nothing scheduled" one.
+    await waitFor(() => expect(screen.getByTestId('member-patrol-loading')).toBeInTheDocument())
+    expect(screen.queryByTestId('member-patrol-status')).toBeNull()
+
+    release({ asOfSeq: 4, values: { wake: { patrol: 'stopped', stopped_reason: 'runtime_budget' } } })
+
+    // Once it lands the durable stop is what renders, reason and all.
+    await waitFor(() => expect(screen.queryByTestId('member-patrol-loading')).toBeNull())
+    expect(screen.getByTestId('member-patrol-status')).toHaveTextContent(/stopped/i)
+    expect(screen.getByTestId('member-patrol-reason')).toBeInTheDocument()
+  })
+
+  it('a FAILED projections read shows the error, never "nothing scheduled"', async () => {
+    // The same window as the test above, ending the other way. A read that fails
+    // is also no longer in flight, so a readiness test asking only whether the
+    // request settled opens the gate on a baseline that never arrived -- and the
+    // tile then states the one thing it cannot know, that nothing is scheduled.
+    // Three states, and a failure is its own: skeleton, error, or a verdict.
+    ;(api.memberProjections as ReturnType<typeof vi.fn>).mockRejectedValue(
+      new Error('projections read failed'),
+    )
+    ;(api.autonudgeList as ReturnType<typeof vi.fn>).mockResolvedValue({ enabled: true, loops: [] })
+    await renderPage([row({ bound: true, slot_key: 'member-oncall' })])
+    fireEvent.click(await rosterRow('oncall'))
+    await openWorkLog()
+
+    await waitFor(() => expect(screen.getByTestId('member-patrol-error')).toBeInTheDocument())
+    expect(screen.queryByTestId('member-patrol-status')).toBeNull()
   })
 
   it('a banner, when set, is what the instruction row shows', async () => {

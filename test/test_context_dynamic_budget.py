@@ -101,17 +101,6 @@ def test_tiny_window_is_floored_not_zeroed():
 # ── End-to-end: build_session_context honours the resolved window ────────────
 
 
-def test_build_session_context_does_not_load_old_projects_for_any_window(tmp_path):
-    store = MemoryStore(workspace=tmp_path / "ws")
-    store.write_projects("# Projects\n\n" + "OLD TASK FACT " * 6000)
-    builder = _builder_for(store, tmp_path)
-    for window in (200_000, 1_000_000, 2_000_000):
-        text = builder.build_session_context(model_window=window)
-        assert "OLD TASK FACT " * 100 not in text
-        assert "# Projects" in text
-        assert "memory_recall" in text
-
-
 # ── per_message cap scales with the history budget ───────────────────────────
 
 

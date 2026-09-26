@@ -310,6 +310,35 @@ thread) logs new `oom_kill` events with the victim scopes (each scope's own
 slice's own ceiling engaged (`memory.events.local max` on the slice) — the discriminator
 between an aggregate breach and a single scope hitting its own per-tree limit.
 
+A **task** breach has no comparable kernel event to observe: past `pids.max` the kernel
+fails `fork()` with `EAGAIN` in whichever scope asks next, logs nothing, and every agent
+under that slice hits the same wall at once — the whole agent population of this user's
+gateways, since the slice lives in the per-UID user manager, not the machine's other users.
+What makes it observable is the count on the way up, so
+`resource_status.probe()` reads the slice's `pids.current` against its `pids.max` and carries
+three figures on its snapshot — the slice total, the ceiling, and this instance's own
+child-slice share, read separately so an install is never credited with a co-resident
+gateway's tasks. The reading reaches the `resource_status` pull tool and the diagnostics
+bundle's posture block; past
+`_SLICE_TASKS_TIGHT_RATIO` (90%) of the ceiling it also rides the injected `[RESOURCES]`
+line, and raises that line by itself when memory is not the constraint — the case the memory
+figure cannot express at all. Note the asymmetry with memory, which is deliberate: the task
+figure is **reported, never gated**. `posture` stays a single memory scalar, so
+`admission_check` and `prewarm_allowance` behave identically at any task count, and a
+refusal keeps naming the GB reading an operator can act on. The dashboard's `/api/system`
+payload deliberately does NOT carry these figures: nothing renders them yet, and the key
+lands in the same change as its consumer rather than ahead of it.
+
+Where there is no cgroup task ceiling to approach (macOS, Windows, no delegation) all three
+figures read `-1`. The RENDERED surfaces then print nothing rather than an unknown —
+`summary_lines()` drops its line and the `[RESOURCES]` advisory cannot be raised by a task
+count at all — while the diagnostics bundle carries the `-1` sentinel through, because a
+reader parsing fields needs the key present to tell "not measurable here" from a field this
+gateway version does not serve. An absent ceiling and an unreadable one stay distinct:
+`pids.max` holding the kernel's `max` sentinel reports `0` and prints "no ceiling set", while
+a read that fails — a slice released between the directory check and the read — reports `-1`
+and prints "ceiling unreadable", so a teardown is never published as an absent limit.
+
 ### Availability and fallback
 
 The scope requires Linux with cgroup v2 delegation (the `pids` and `memory` controllers
@@ -329,16 +358,20 @@ does not have is any ceiling that stops one growing in the first place.
 The reaper's fingerprint-less arm — the cmdlines a user's own shell could reproduce
 (`npx @playwright/mcp`, `<launcher> mcp start-server <name>`) — demands positive identity
 before it signals, and that identity is the process's exec-time `KIROCREW_SPAWNED` environ
-entry. macOS reads it from `sysctl(CTL_KERN, KERN_PROCARGS2, pid)`
-(`platform_compat.darwin_process_environ`), the record `ps -E` prints: same-uid only, no
-entitlement, no elevated privilege, and a kernel copy fixed at exec, so it is evidence one
+entry. macOS attempts to read it from `sysctl(CTL_KERN, KERN_PROCARGS2, pid)`
+(`platform_compat.darwin_process_environ`). Some macOS hosts return only argv and omit
+the environment even for a same-uid child; the reaper then refuses to signal it.
+When present, the environment is a kernel copy fixed at exec, so it is evidence one
 process cannot forge for another. The read is bounded at the kernel's `ARG_MAX` ceiling on
 argv-plus-environment rather than the smaller bound the argv probe uses, because the
 environment sits *after* argv in that one record — a launcher that appends to its own argv
 on every generation would otherwise push its own environment out of the read and be refused
 for want of identity. Windows has no comparable same-uid read and keeps failing closed.
 
-Two residuals on macOS, both deliberate:
+Additional limits on macOS:
+
+- If the kernel omits the environment from `KERN_PROCARGS2`, the marker cannot
+  prove identity and the fingerprint-less launcher arm stays inactive.
 
 - The **descendant** walk under a reaped root stays a no-op there: it needs a per-pid parent
   edge and start identity from one atomic read (`_pid_parent_and_token`, `/proc`-only) and a

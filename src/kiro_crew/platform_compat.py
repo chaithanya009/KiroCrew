@@ -1819,11 +1819,10 @@ def darwin_process_environ(pid: int) -> list[bytes] | None:
     be read or parsed -- never an empty list for an unreadable process, so a
     caller can tell "no such variable" apart from "could not look".
 
-    Same-uid processes only, and no entitlement or elevated privilege for our
-    own: the same kernel record and the same permission contract
-    :func:`darwin_process_argv` already reads. The environment here is the
-    kernel's copy fixed at exec, which is why it is ownership evidence a
-    process cannot forge for another, unlike anything on disk.
+    Same-uid processes only. Some macOS kernels return only argv even for a
+    same-uid child; that answer returns ``None`` so identity checks fail closed.
+    When present, the environment is the kernel's copy fixed at exec, which is
+    ownership evidence a process cannot forge for another.
 
     The ``argc`` argv entries are skipped BY COUNT, empty strings included, so
     an *argument* that merely looks like an environment entry can never be read

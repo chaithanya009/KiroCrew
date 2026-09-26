@@ -6401,6 +6401,13 @@
         "waiting_for_your_approval_to_start": "Waiting for your approval to start",
         "waiting_to_start_queued_behind_the_concurrency_l": "Waiting to start — queued behind the concurrency limit"
       },
+      "subagentQueued": {
+        "adaptive_cap_zero": "waiting to start — starts are paused while this computer is low on memory or overloaded; they resume on their own once it recovers",
+        "low_memory": "waiting to start — needs {{required}} of free memory, {{available}} free now; free up memory to continue",
+        "low_memory_no_figures": "waiting to start — not enough free memory; free up memory to continue",
+        "posture_critical": "waiting to start — this computer's memory is critically low ({{available}} free); free up memory to continue",
+        "posture_critical_no_figures": "waiting to start — this computer's memory is critically low; free up memory to continue"
+      },
       "subagentRunCard": {
         "open_in_the_subagents_panel": "Open in the Subagents panel",
         "open_subagents_panel": "Open Subagents panel",
@@ -6687,6 +6694,7 @@
       "block_semantic_memory": "Facts you told it",
       "block_skill_hint": "Relevant skills",
       "block_skill_index": "Skill index",
+      "block_task_facts": "Facts recalled for this task",
       "block_unclassified": "Unclassified",
       "block_your_message": "Your message",
       "cat_memory": "Memory about you",
@@ -7474,6 +7482,7 @@
         "err_env_override_with_ref": "<settingRef/> is set and overrides this setting. Unset it to change the model here."
       },
       "kiroCrewCfgTab": {
+        "applies_to_sessions_started_after_the_change": "Applies to sessions started after the change. 'auto' sandboxes the agent but keeps credential tooling working; 'strict' also hides cloud, SSH, kube and registry credentials, so those tools stop working inside the agent — only where {{productName}}'s own sandbox confines the spawn, not on Windows or on a macOS spawn delegated to kiro-cli's internal sandbox; 'off' skips {{productName}}'s sandbox (on macOS kiro-cli's own sandbox still applies when enabled).",
         "approval_mode": "Approval Mode",
         "auto": "auto",
         "auto_size_max": "Auto-Size Max",
@@ -7486,7 +7495,6 @@
         "embedding_provider": "Embedding Provider",
         "enable_dynamic_mcp_tool_discovery_via_kiro_cli_t": "Enable dynamic MCP tool discovery via kiro-cli. Takes effect on next session.",
         "immediate_auto_approves_all_tools_interactive_as": "Immediate. 'auto' approves all tools; 'interactive' asks before each.",
-        "immediate_auto_enables_sandbox_for_untrusted_too": "Immediate. 'auto' enables sandbox for untrusted tools.",
         "kirocrew_agents": "{{productName}} Agents",
         "max_channel_agents": "Max Channel Agents",
         "max_channels": "Max Channels",
@@ -8399,6 +8407,11 @@
       },
       "chatPanel": {
         "about_you": "About You",
+        "advanced": "Advanced",
+        "discovery": "Discovery",
+        "rail_label": "Chat settings",
+        "side_panel": "Side panel",
+        "transcript": "Transcript",
         "answer_only_details_on_request": "Answer only — plainest words, details on request",
         "auto_add_documents": "Auto-Add Documents",
         "auto_add_saved_artifacts": "Auto-Add Saved Artifacts",
@@ -8467,7 +8480,6 @@
         "link_patterns_unsafe_pattern": "This pattern is too complex to run safely, so this rule is ignored. Keep one repeating part, e.g. \\b[A-Z]{2,5}-\\d+\\b; backreferences (\\1, \\k<name>) are not supported",
         "mcp_apps_in_side_panel": "MCP Apps in Side Panel",
         "merge_queued_messages": "Merge Queued Messages",
-        "messages": "Messages",
         "minimap_side_left": "Left",
         "minimap_side_right": "Right",
         "mirror_documents_you_save_as_artifacts_into_the_l": "Mirror documents you save as artifacts into the library, keep them in sync as you edit, and remove them when you delete the artifact.",
@@ -8512,7 +8524,6 @@
         "which_part_of_a_subagent_s_stream_to_keep_when_i": "Which part of a subagent's stream to keep when injecting its completion event into the parent session. Head preserves the start (default, matches legacy behavior). Tail preserves the final summary. Both keeps a slice from each end with a marker between them.",
         "widget_density": "Widget Density",
         "your_role": "Your Role",
-        "minimap": "Minimap",
         "minimap_location": "Minimap location",
         "minimap_location_desc": "When located on the right edge, the minimap replaces the scroll bar."
       },
@@ -9016,7 +9027,6 @@
         "code_ready_for": "The sign-in code for {{name}} is ready",
         "confirm_cancel_remove": "Yes, remove “{{tag}}”",
         "confirm_delete_of": "Confirm deleting “{{name}}”",
-        "connect_after_sign_in": "Connect after sign-in",
         "copied": "Copied",
         "copy_code_aria": "Copy your sign-in code {{code}}",
         "copy_command": "Copy command",
@@ -9359,7 +9369,12 @@
       "window_tokens_col": "Window (tokens)",
       "off_body": "Enable with <settingRef/>. Metrics stay local (<metricsDir/>) — nothing leaves this machine.",
       "gauges": "Gauges",
-      "gauges_latest": "latest sample"
+      "gauges_latest": "latest sample",
+      "credits_by_origin": "Credits by origin",
+      "credits_by_model": "Credits by model",
+      "top_sessions": "Top sessions",
+      "other_group": "Other ({{n}})",
+      "full_table": "Full table"
     },
     "terminalPopoutFrame": {
       "return": "Return to dock",

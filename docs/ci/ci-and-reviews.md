@@ -366,7 +366,7 @@ Every job here is blocking. Every job that costs real runner time also `needs:`
 | Job | What it enforces |
 |---|---|
 | `changes` | "Detect changed surface". Resolves the path filters every other job reads, so a diff that cannot affect a surface does not pay for it |
-| `await-fast-gate` | Polls the `Fast Gate` run for this exact head commit and **fails closed** in all three ways it can go wrong: a run that never appears (180s budget), one that never completes (720s budget), and one that completes non-success. A barrier that passed when it could not read its subject would be worse than none, because the matrix would run anyway and the log would claim it was cleared to. One extra ~1-minute job buys the whole matrix the right to not start |
+| `await-fast-gate` | Polls the `Fast Gate` run for this exact head commit and **fails closed** in all three ways it can go wrong: a run that never appears (180s budget), one that never completes (720s budget), and one whose conclusion is a decided non-success. `action_required` is not one of them: GitHub reports a fork run still awaiting maintainer approval as `completed`/`action_required`, so the barrier polls it as pending under the 720s budget rather than letting approval order decide whether the matrix runs. A barrier that passed when it could not read its subject would be worse than none, because the matrix would run anyway and the log would claim it was cleared to. One extra ~1-minute job buys the whole matrix the right to not start |
 | `backend-lint` | `isort --check-only`, `flake8`, `mypy` on Python 3.12, plus `scripts/check_black_formatting.py` — black enforced on every file outside `.github/black-baseline.txt`, which can only shrink — and `scripts/check_subprocess_encoding.py` (self-test first) — no text-mode subprocess call without an explicit `encoding=`, `**UTF8_TEXT`, or a `# subprocess-encoding: locale` marker, outside `.github/subprocess-encoding-baseline.txt`, which can only shrink — and `scripts/check_sync_io_in_async.py` (self-test first) — no blocking db / subprocess / http / `time.sleep` call inside an `async def` under `src/`, outside `.github/sync-io-in-async-baseline.txt`, which can only shrink. A stall past `dashboard.loop_stall_exit_after_secs` (25s) makes the watchdog kill the gateway and drop every in-flight turn (#3057, #1572); the escape is an offload (`await asyncio.to_thread(...)`, or a named lane from `src/kiro_crew/executors.py`) or a `# on-loop-io-ok: <why it cannot block>` marker whose reason is mandatory. All four baselined gates in this job read their diff scope from the one shared resolver in `scripts/ratchet_scope.py`, so they cannot disagree about which lines a change added; the env-base gates (`check_brand_name.py`, `check_harness_parity.py`, `check_focus_cue.py`) share the same diff parsing through its explicit-base entry points while keeping their `*_BASE_REF` base semantics |
 | `backend-test` | 8 whole-file shards on Python 3.12, assigned before import, `-n auto` within each; 60-minute job budget includes coverage upload, with the 120-second per-test timeout retained. Large CodeBuild compute with the non-root boundary for eligible actors; hosted fallback |
 | `backend-test-windows` | All 8 whole-file shards use large CodeBuild compute for eligible actors, windows-latest otherwise; `--no-cov`, 180s per-test timeout. See the migration contract below |
@@ -515,11 +515,17 @@ All eight `backend-test` shards use `linux_runner_large`; all eight
 `backend-test-windows` shards and `backend-test-windows-fail-closed` use the
 centrally resolved large Windows label. `e2e-boot-matrix` maps its Linux and
 Windows legs to those outputs without changing `matrix.os`, names, timeouts or
-artifact names. `backend-lint` uses large on the fleet. The formatter gate keeps
-Black's original native CLI and default worker selection when `RUNNER_ENVIRONMENT`
-is explicitly `github-hosted`; the CI step does not set `BLACK_NUM_WORKERS`.
-Fleet and local checks use `scripts/bounded_black.py`, with at most eight workers
-regardless of the native pool size. `scripts/ci_black_diagnostics.py` runs the gate
+artifact names. `backend-lint` uses large on the fleet. The formatter gate runs
+`scripts/bounded_black.py` on every runner -- fleet, GitHub-hosted and local --
+with at most eight workers regardless of the native pool size; the CI step does
+not set `BLACK_NUM_WORKERS`. Hosted runners originally kept Black's native CLI and
+default pool, and every fork PR's lint job then died mid-step with exit 143 after
+6-9 minutes ([#13689](https://github.com/kirodotdev/KiroCrew/issues/13689)):
+`ubuntu-latest` installs the compiled Black wheel, whose per-worker retention is
+the same failure the fleet measured, and the hosted VM has no cgroup cap
+(`memory.max: max`, 16 GB host), so the runner itself was torn down instead of a
+worker being OOM-killed. Recycling costs about 1.6x native wall time on four
+cores; more workers than cores do not shorten it. `scripts/ci_black_diagnostics.py` runs the gate
 once, preserves its failure status and stderr, and records bounded cgroup readings
 and child peak RSS. Worker count alone does not bound retained formatting trees:
 [the env-only two-worker fleet run](https://github.com/kirodotdev/KiroCrew/actions/runs/35417525930/job/105829161045)
@@ -669,7 +675,7 @@ Where the coverage went:
 | Lane | Where | Blocking? |
 |---|---|---|
 | `backend-test-macos` (full suite, 3 shards) | `platform-tests.yml`: called by `nightly.yml` at 06:00 UTC, plus `workflow_dispatch` against any branch | Holds the nightly **publish** jobs, never the builds — the artifacts are the evidence a fixer works from. Maintains one tracking issue (`platform-tests-macos` label) carrying the failing node ids and the pull requests merged in the last 24h |
-| The same suite, on demand | `macos-on-demand.yml`, `pull_request`, calls `platform-tests.yml` against the PR head; a Linux `decide` job runs it when the diff touches a darwin-sensitive path, **or** the PR carries the `ci:macos` label, **or** the head SHA falls in a 1-in-20 sample (`16#${HEAD_SHA:0:8} % 20`, deterministic per commit) (acts immediately -- the workflow listens for `labeled`) | Advisory. It is a separate workflow ON PURPOSE: a macOS job inside `ci.yml` holds that workflow's completion even with `continue-on-error`, so it would still hold readiness. Readiness evaluates neither this workflow nor its check |
+| The same suite, on demand | `macos-on-demand.yml`, `pull_request`, calls `platform-tests.yml` against the PR head; a Linux `decide` job runs it when the diff touches a darwin-sensitive path, **or** the PR carries the `ci:macos` label, **or** the head SHA falls in a 1-in-20 sample (`16#${HEAD_SHA:0:8} % 20`, deterministic per commit) (acts immediately -- the workflow listens for `labeled`). Over those three sits a CEILING: the path and sample switches are refused while this lane already holds `LANE_MAX_LIVE_RUNS` (6) live runs of the hosted macOS pool, because on 2026-09-24 it held 53 of the 56 in-progress macOS jobs and one shard waited 14 hours for a runner while `build.yml` and `release.yml` queued behind it. A capped run is skipped, not queued, so the ceiling bounds demand and settles the lane at about nine verdicts an hour -- a timely verdict for a few pull requests instead of a 14-hour one for all of them, with the nightly still covering every merge. The `ci:macos` label is never refused, and neither is a re-run, so a retry cannot turn a red lane into a skip | Advisory. It is a separate workflow ON PURPOSE: a macOS job inside `ci.yml` holds that workflow's completion even with `continue-on-error`, so it would still hold readiness. Readiness evaluates neither this workflow nor its check |
 | Real gateway boot on macOS | `ci.yml`'s `e2e-boot-matrix`, push-to-main leg; `nightly.yml`'s `pod-scenarios` | Blocking on main / holds nothing in the nightly |
 
 `test/test_macos_platform_tests_gate.py` pins all of it, including the property that
@@ -1066,7 +1072,9 @@ Details worth knowing:
     The hold that would otherwise have refused those heals is cleared by the
     supersession check: a run a newer push has replaced holds no result worth
     protecting, so a busy fleet no longer shields the exact run that is blocking
-    the branch. A manual dispatch is
+    the branch -- at attempt 1. Past attempt 1 the heal path refuses the cancel
+    itself (a later attempt may be somebody's hand re-run, see below) and the
+    tick goes red naming the run. A manual dispatch is
     governed by its own `dry_run` input regardless, so a run can still be
     inspected without acting. A `CI` run in *pending* with no jobs is
     **not** something the watchdog touches — that run is waiting on its
@@ -1077,7 +1085,22 @@ Details worth knowing:
     for the run to report `completed`, then `gh run rerun <run-id>`
     (`gh run rerun <run-id> --failed` keeps the successful jobs but carries the
     stale-label caveat). `workflow_dispatch` with `dry_run: true` (the default
-    for a manual dispatch) detects and reports without acting.
+    for a manual dispatch) detects and reports without acting. **A hand re-run is
+    safe from the watchdog's cancel once a newer push supersedes it**: a run past
+    attempt 1 may be the very `gh run rerun` above, and cancelling a superseded run
+    is never followed by a re-run (the heal path declines to re-run a superseded
+    run, `superseded-before-cancel` is not a failed outcome, and the recovery pass
+    classifies a superseded cancelled run out), so it would be a silent loss. The
+    guard sits at the cancel itself, so every route reaches it -- an orphan with
+    no fleet hold, and one whose hold the supersession check released alike: for
+    any attempt past the first the heal path asks the supersession question
+    immediately before cancelling and leaves a superseded (or undecidable) run
+    untouched. That is a failed outcome
+    (`rerun-attempt-superseded-left-untouched`): the run keeps its concurrency
+    group's running slot and the watchdog will never free it, so the tick goes
+    red and its log names the `gh run cancel <run-id>` to type. A re-run attempt
+    that is still its branch's newest is healed like any orphan. A held
+    concurrency group a human is told about is the cheaper failure.
   - **Trust model.** A self-hosted runner exposes its host identity to the job it
     runs; that is inherent, not something this PR adds. What bounds it: only runs
     triggered by accounts that can push here reach the runner (forks never do);
@@ -1805,9 +1828,11 @@ The Design trigger accepts the same evidence the UX lane admits: a
 HEAD -- and it reads presence the same way. Both Design lanes run a "Collect
 rendered evidence" step that sources the shared allowlisted fetch script, downloads
 and types every attachment the description offers, lists the committed images the
-revision adds or changes (from the checkout on a same-repo PR; out of the object
-store on a fork, by `pr-committed-evidence.sh`, since the fork head is never checked
-out as files), and writes one evidence file the prompt is told to read; the
+revision adds or changes (by sourcing `.github/scripts/pr-committed-evidence.sh`,
+which reads every blob out of the object store at the head SHA with `git cat-file`
+and never off a working tree -- one admission path through one set of gates for a
+same-repo PR and a fork PR alike; the two differ only in where the workflow learns
+the head SHA), and writes one evidence file the prompt is told to read; the
 description's text is not the predicate, so a fabricated or dead URL does not count
 as evidence. A transport failure is listed as "presence unconfirmed" and caps the
 Design verdict at `CONCERNS` rather than failing the lane, because the UX lane fails

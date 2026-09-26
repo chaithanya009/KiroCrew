@@ -10,9 +10,6 @@ vi.mock('../pages/overview', () => ({
   UsageTab: () => <div data-testid="usage-tab">UsageTab</div>,
   WakaTimeTab: () => <div data-testid="wakatime-tab">WakaTimeTab</div>,
 }))
-vi.mock('../pages/overview/MemoryTab', () => ({
-  default: () => <div data-testid="memory-tab">MemoryTab</div>,
-}))
 
 vi.mock('../hooks/useUptime', () => ({
   useUptime: () => '2h 30m',
@@ -20,7 +17,6 @@ vi.mock('../hooks/useUptime', () => ({
 
 vi.mock('../api/client', () => ({
   api: {
-    memorySettings: vi.fn().mockResolvedValue({ history_idle_hours: 3, history_max_days: 90, migrated: false }),
     // Present only to be asserted NEVER called: the landing page must not read
     // the Kiro sign-in status, let alone render its chooser.
     kasLoginStatus: vi.fn().mockResolvedValue({ authenticated: false }),
@@ -73,7 +69,6 @@ describe('OverviewPage — mission control', () => {
     expect(screen.queryByText('Agent Config')).not.toBeInTheDocument()
     expect(screen.queryByText('Import/Export')).not.toBeInTheDocument()
     // Neither drill-in surface is mounted on the landing view.
-    expect(screen.queryByTestId('memory-tab')).not.toBeInTheDocument()
     expect(screen.queryByTestId('usage-tab')).not.toBeInTheDocument()
   })
 
@@ -88,31 +83,10 @@ describe('OverviewPage — mission control', () => {
     expect(screen.queryByText('All systems running')).not.toBeInTheDocument()
   })
 
-  it('renders usage and memory summary cards', async () => {
+  it('renders the usage summary card', async () => {
     renderWithProviders(<OverviewPage />, { store: statusStore() })
     expect(screen.getByText('Usage')).toBeInTheDocument()
-    expect(screen.getByText('Memory')).toBeInTheDocument()
-    expect(await screen.findByText(/Summarizes chats into memory after 3h idle/)).toBeInTheDocument()
     expect(await screen.findByText(/Today:/)).toBeInTheDocument()
-  })
-
-  it('drills into Memory and back', async () => {
-    renderWithProviders(<OverviewPage />, { store: statusStore() })
-    // Summary cards share the verb, in render order: Usage (0), WakaTime (1),
-    // Memory (2).
-    fireEvent.click(screen.getAllByRole('button', { name: /View details/ })[2])
-    expect(await screen.findByTestId('memory-tab')).toBeInTheDocument()
-    expect(screen.queryByText('All systems running')).not.toBeInTheDocument()
-    fireEvent.click(screen.getByRole('button', { name: /Overview/ }))
-    expect(screen.getByText('All systems running')).toBeInTheDocument()
-    expect(screen.queryByTestId('memory-tab')).not.toBeInTheDocument()
-  })
-
-  it('lets a member drill-in own its title while keeping one back action', async () => {
-    renderWithProviders(<OverviewPage />, { store: statusStore(), route: '/settings/overview?view=memory&store=member-alice' })
-    expect(await screen.findByTestId('memory-tab')).toBeInTheDocument()
-    expect(screen.queryByText('Memory')).toBeNull()
-    expect(screen.getAllByRole('button', { name: /Overview/ })).toHaveLength(1)
   })
 
   it('drills into Usage and back', () => {
@@ -166,7 +140,7 @@ describe('OverviewPage — mission control', () => {
   it('hosts no Kiro sign-in card and never reads the sign-in status', async () => {
     const { api } = await import('../api/client')
     renderWithProviders(<OverviewPage />, { store: statusStore() })
-    expect(await screen.findByText('Memory')).toBeInTheDocument()
+    expect(await screen.findByText('Usage')).toBeInTheDocument()
     expect(screen.queryByTestId('kiro-sign-in-card')).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: /Continue with/ })).not.toBeInTheDocument()
     expect(api.kasLoginStatus).not.toHaveBeenCalled()
@@ -177,7 +151,7 @@ describe('OverviewPage — mission control', () => {
     // Kiro CLI (the default, spelled as the empty string): no pointer, and no
     // wrapper left behind where the card used to sit.
     const first = renderWithProviders(<OverviewPage />, { store: statusStore() })
-    expect(await screen.findByText('Memory')).toBeInTheDocument()
+    expect(await screen.findByText('Usage')).toBeInTheDocument()
     expect(screen.queryByTestId('kiro-sign-in-moved')).not.toBeInTheDocument()
     first.unmount()
 

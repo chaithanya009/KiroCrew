@@ -257,6 +257,13 @@ bounded worker count; the full suite is CI's job and never runs locally unless a
 human passes `--full`. See
 [prepare-pr](src/kiro_crew/builtin_skills/kirocrew-dev/prepare-pr/references/gate-floor.md).
 
+For this fork's upstream sync, select validation for reachable product features
+and fork invariants. Skip suites dedicated to artifact and persistent-memory
+features that the fork disables; keep checks that prove those surfaces stay
+disabled, and keep transcript and interrupted-turn recovery checks. Start long
+tests once, then wait for their completion event or use a timer instead of
+repeatedly watching their output.
+
 - **On macOS, run `mypy --platform linux src/kiro_crew`.** Without it a local run
   reports errors you did not cause and MISSES the Linux-only errors CI fails on, so
   a clean local run is a false green.

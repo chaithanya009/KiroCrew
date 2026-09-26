@@ -281,10 +281,8 @@ src/kiro_crew/slack/blocks.py
 src/kiro_crew/slack/client.py
 src/kiro_crew/slack/enterprise.py
 src/kiro_crew/slack/events.py
-src/kiro_crew/slack/interactions.py
 src/kiro_crew/slack/sessions_view.py
 src/kiro_crew/subagent_scale.py
-src/kiro_crew/suggestions.py
 src/kiro_crew/testing/channel_fixtures.py
 src/kiro_crew/webhooks.py
 src/kiro_crew/weixin/client.py
@@ -445,8 +443,6 @@ test/test_connections_l0_probe.py
 test/test_connections_registry.py
 test/test_connections_tool_aliases.py
 test/test_consolidate_cmd.py
-test/test_context_marker_neutralization.py
-test/test_context_ui_language.py
 test/test_continuable_followups.py
 test/test_crash_dump_store.py
 test/test_crash_guard.py
@@ -550,7 +546,6 @@ test/test_dev_fleet_node_toolchain.py
 test/test_dev_fleet_repo_accessor.py
 test/test_dev_fleet_server_more_coverage.py
 test/test_diagnostics.py
-test/test_discord_client_coverage.py
 test/test_display_time_redaction.py
 test/test_doc_parser.py
 test/test_docker_entrypoint.py
@@ -745,7 +740,6 @@ test/test_open_dm_retry.py
 test/test_open_slots_persistence.py
 test/test_options_click_validation.py
 test/test_options_submit.py
-test/test_outbox_binary.py
 test/test_override_expiry_notice.py
 test/test_papyrus_gitops.py
 test/test_papyrus_latex.py
@@ -867,7 +861,6 @@ test/test_slack_dashboard_live_sync.py
 test/test_slack_handler_coverage_branches.py
 test/test_slack_home_tab.py
 test/test_slack_inline_stop.py
-test/test_slack_interactions_coverage.py
 test/test_slack_linked_approval.py
 test/test_slack_mirror_unlink.py
 test/test_slack_options_lifecycle.py

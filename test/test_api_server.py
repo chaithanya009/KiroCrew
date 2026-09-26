@@ -643,14 +643,14 @@ class TestApiServerAuth:
             await runner.cleanup()
 
     @pytest.mark.asyncio
-    async def test_post_lessons_denied_without_secret(self, tmp_path, monkeypatch):
+    async def test_post_lessons_unavailable_in_fork(self, tmp_path, monkeypatch):
         import aiohttp
 
         runner, _state, base = await self._start(tmp_path, monkeypatch)
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.post(f"{base}/api/lessons", json={"text": "injected"}) as resp:
-                    assert resp.status == 403
+                    assert resp.status == 404
         finally:
             await runner.cleanup()
 
@@ -697,24 +697,19 @@ class TestApiServerAuth:
             await runner.cleanup()
 
     @pytest.mark.asyncio
-    async def test_artifact_folders_denied_without_secret(self, tmp_path, monkeypatch):
-        # /api/artifact-folders is called by MCP tools (_get/_post w/ secret) AND
-        # the browser — classified as a mixed internal path. Must deny an
-        # unauthenticated caller.
+    async def test_artifact_folders_unavailable_without_secret(self, tmp_path, monkeypatch):
         import aiohttp
 
         runner, _state, base = await self._start(tmp_path, monkeypatch)
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(f"{base}/api/artifact-folders") as resp:
-                    assert resp.status == 403
+                    assert resp.status == 404
         finally:
             await runner.cleanup()
 
     @pytest.mark.asyncio
-    async def test_artifact_folders_allowed_with_secret(self, tmp_path, monkeypatch):
-        # The MCP artifact-folder tools authenticate via X-Internal-Secret; the
-        # request must reach the handler (not be 403'd by auth) with the secret.
+    async def test_artifact_folders_unavailable_with_secret(self, tmp_path, monkeypatch):
         import aiohttp
 
         runner, _state, base = await self._start(tmp_path, monkeypatch)
@@ -725,8 +720,7 @@ class TestApiServerAuth:
                     f"{base}/api/artifact-folders",
                     headers={"X-Internal-Secret": secret},
                 ) as resp:
-                    # Auth passed → handler reached (200). NOT 403 (auth reject).
-                    assert resp.status != 403
+                    assert resp.status == 404
         finally:
             await runner.cleanup()
 

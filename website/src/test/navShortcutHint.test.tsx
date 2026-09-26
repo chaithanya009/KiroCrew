@@ -149,9 +149,7 @@ describe('nav shortcut hint — derivation from the registry', () => {
     // would pass for the wrong reason.
     const routes = getBuiltinSurfaces().map(s => s.route)
     expect(routes).toContain('/settings')
-    expect(routes).toContain('/artifacts')
     expect(navShortcutDef('/settings')).toBeUndefined()
-    expect(navShortcutDef('/artifacts')).toBeUndefined()
   })
 
   it('pins which rail routes carry a chord, so un-hiding a surface surfaces the question', () => {
@@ -274,7 +272,6 @@ describe('App nav rail — rows declare and display their chord', () => {
     // Presence first: an absent row would satisfy "no attribute" vacuously.
     await waitFor(() => expect(screen.getByRole('button', { name: 'Settings' })).toBeInTheDocument())
     expect(screen.getByRole('button', { name: 'Settings' })).not.toHaveAttribute('aria-keyshortcuts')
-    expect(screen.getByRole('button', { name: 'Artifacts' })).not.toHaveAttribute('aria-keyshortcuts')
   })
 
   it('shows the display chord as decoration, located by row identity rather than by the value asserted', async () => {
@@ -293,7 +290,6 @@ describe('App nav rail — rows declare and display their chord', () => {
     // COMPLEMENT: no chordless row grew a badge, so the hint is per-bound-route
     // and not sprayed across the rail.
     expect(screen.queryByTestId('nav-shortcut-settings')).toBeNull()
-    expect(screen.queryByTestId('nav-shortcut-artifacts')).toBeNull()
     expect(screen.queryByTestId('nav-shortcut-capabilities')).toBeNull()
   })
 

@@ -5304,50 +5304,6 @@ class TestFlushSegment:
         # chat_segment should be broadcast
         state.broadcast_ws.assert_called_once_with("chat_segment", {"slot": "s1"})
 
-    def test_flush_segment_schedules_widget_registration(self, tmp_path, monkeypatch):
-        """A segment containing an <mcwidget> auto-registers it as an artifact.
-
-        This is the integration seam for widget-as-artifact-by-default: without
-        it nothing registers emitted widgets, and the in-session Artifacts tab
-        can never list them.
-        """
-        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
-        state = _make_state(tmp_path)
-        state.broadcast_ws = MagicMock()
-        slot = state.get_or_create_slot("s1")
-
-        calls: list = []
-
-        async def _fake_register(text, message_ts, session_key):
-            calls.append((text, message_ts, session_key))
-            return []
-
-        monkeypatch.setattr(
-            "kiro_crew.dashboard.chat_runner.register_widgets_off_loop", _fake_register
-        )
-
-        from kiro_crew.dashboard.chat import _flush_segment
-
-        async def _run():
-            _flush_segment(state, slot, '<mcwidget title="W">body</mcwidget>')
-            # The task is detached — let it run before asserting.
-            await asyncio.sleep(0)
-            for t in list(state._background_tasks):
-                await t
-
-        asyncio.run(_run())
-
-        assert len(calls) == 1
-        text, message_ts, session_key = calls[0]
-        assert "<mcwidget" in text
-        # Keyed to the finalized assistant message.
-        assert message_ts
-        # Attributed with the BARE slot key. Asserting the literal string here
-        # would happily pin a prefix the reader never queries, so assert the
-        # value the in-session tab actually sends (?session=<activeSlot>, i.e.
-        # slot.key) — ArtifactStore.list compares session_key exactly.
-        assert session_key == slot.key
-
     def test_flush_segment_skips_registration_without_a_widget(self, tmp_path, monkeypatch):
         """The common case (no widget) must not touch the artifact store at all."""
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
@@ -5374,43 +5330,6 @@ class TestFlushSegment:
 
         asyncio.run(_run())
         assert called is False
-
-    def test_flush_segment_registers_redacted_text(self, tmp_path, monkeypatch):
-        """A credential stripped from chat must not survive into the artifact.
-
-        Registration runs on the POST-redaction text; passing the raw accumulated
-        text would persist to disk (and re-surface on the artifact page) exactly
-        what the segment redaction just removed.
-        """
-        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
-        state = _make_state(tmp_path)
-        state.broadcast_ws = MagicMock()
-        slot = state.get_or_create_slot("s1")
-
-        captured: list = []
-
-        async def _fake_register(text, message_ts, session_key):
-            captured.append(text)
-            return []
-
-        monkeypatch.setattr(
-            "kiro_crew.dashboard.chat_runner.register_widgets_off_loop", _fake_register
-        )
-
-        from kiro_crew.dashboard.chat import _flush_segment
-
-        secret = "AKIAIOSFODNN7EXAMPLE"
-
-        async def _run():
-            _flush_segment(state, slot, f'<mcwidget title="W">key={secret}</mcwidget>')
-            await asyncio.sleep(0)
-            for t in list(state._background_tasks):
-                await t
-
-        asyncio.run(_run())
-
-        assert captured, "registration should have been scheduled"
-        assert secret not in captured[0]
 
     @pytest.mark.parametrize("mode", ["incognito", "temporary"])
     def test_flush_segment_skips_registration_in_restricted_sessions(
@@ -17966,10 +17885,10 @@ class TestStopReasonCancelled:
         state.consolidator.maybe_consolidate.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_handler_stop_reason_end_turn_preserves_existing_behavior(
+    async def test_handler_stop_reason_end_turn_skips_memory_consolidation(
         self, tmp_path, monkeypatch
     ):
-        """When stop_reason='end_turn', record_success and maybe_consolidate fire."""
+        """A completed turn records success without writing persistent memory."""
         from kiro_crew.acp.types import STOP_REASON_END_TURN
         from kiro_crew.dashboard.chat import _run_chat
         from kiro_crew.providers.base import EVENT_COMPLETE, EVENT_TEXT_CHUNK, LLMEvent
@@ -17987,7 +17906,7 @@ class TestStopReasonCancelled:
         await _run_chat(state, slot, "hello")
 
         state.sessions.record_success.assert_called_once()
-        state.consolidator.maybe_consolidate.assert_called_once()
+        state.consolidator.maybe_consolidate.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_monitor_wake_turn_does_not_write_user_memory(self, tmp_path, monkeypatch):
@@ -19834,7 +19753,7 @@ class TestEmptyResponseRetry:
         # task created by another test can run while this module-level function is
         # patched and must not change the behavior observed for this turn.
         own_flushes = [
-            mock_call for mock_call in mock_flush.call_args_list if mock_call.args == (slot,)
+            mock_call for mock_call in mock_flush.call_args_list if mock_call.args[:1] == (slot,)
         ]
         assert len(own_flushes) == 1
 

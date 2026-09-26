@@ -143,15 +143,16 @@ logger = logging.getLogger(__name__)
 # so the name is kept and read through ``_agents_dir()``.
 KIRO_AGENTS_DIR: Path | None = None
 
-# Alias count above which the skill-view census warns. Every spawn projects one
-# ``kirocrew-skill-view-*.json`` per authored agent into the shared agents
-# directory, and kiro-cli reads EVERY file there on startup, so the count is a
-# startup cost for every session on the host. A healthy host carries live
-# sessions x authored agents (a few hundred); the measured trouble starts past a
-# couple of thousand -- about 8s of prune walk per spawn at 2,360 files, and
-# ``EMFILE: too many open files`` from kiro-cli at 15k. The reclaim drains a
-# backlog by a bounded number per spawn, so a count above this is either a
-# pre-reclaim backlog still draining or one this gateway cannot drain (another
+# Alias count above which the skill-view census warns. The projection publishes
+# one ``kirocrew-skill-view-*.json`` per distinct agent view into the shared
+# agents directory -- spawns that derive the same view share one file -- and
+# kiro-cli reads EVERY file there on startup, so the count is a startup cost for
+# every session on the host. A healthy host carries roughly authored agents x
+# workspaces; the measured trouble starts past a couple of thousand -- about 8s
+# of prune walk per spawn at 2,360 files, and ``EMFILE: too many open files``
+# from kiro-cli at 15k. A boot drain clears a backlog at gateway start and the
+# per-spawn reclaim covers steady-state orphans, so a count above this is either
+# a backlog this gateway has not drained yet or one it cannot drain (another
 # data home's aliases, an unreadable lease record); the warning tells which.
 _SKILL_VIEW_BACKLOG_WARN = 2000
 
@@ -2705,6 +2706,116 @@ def _doctor_live_target_pointer(issues: list[str]) -> None:
         )
 
 
+def _doctor_masked_credential_aliases(issues: list[str]) -> None:
+    """Report a masked credential leaf that will refuse the next agent spawn.
+
+    The same job :func:`_doctor_live_target_pointer` does for the live-target pointer, for
+    the same shape on the leaves whose bytes are a credential: ``sandbox`` refuses a spawn
+    when one of them has a second hard link, because a mask binds a path and the second name
+    reaches the same bytes unmasked. A hard link on a file in the home is ordinary operation
+    for ``cp -al``, rsnapshot and other hard-link snapshot tools, so the condition appears
+    without anybody doing anything wrong and the first symptom is that agents stop starting.
+
+    Both confined launch paths issue this refusal -- the namespace launcher through
+    :func:`sandbox.namespace_argv` and the Seatbelt profile through
+    :func:`sandbox.sandbox_exec_argv` -- so the probe runs on Linux and on macOS. A platform
+    with no confined launch path is skipped: naming the condition there would report an
+    outage that cannot arrive.
+
+    The sentence is the launcher's own, not a paraphrase, so an operator who reads this line
+    and later meets the refusal reads one diagnosis rather than two.
+    """
+    if not (sys.platform.startswith("linux") or sys.platform == "darwin"):
+        return
+    try:
+        aliased = sandbox.masked_credential_leaf_aliases()
+    except Exception as exc:  # noqa: BLE001 — doctor must survive a broken probe
+        print("\nMasked Credential Leaves")
+        print(f"  aliases:     ⚠️  could not check ({_safe_display(exc)})")
+        return
+    if not aliased:
+        return
+    # ``credential_mask_applies`` rather than a mode comparison of this module's own, for
+    # the reason the pointer's section states: it counts BOTH unwrapped outcomes, so a host
+    # that hands the command over unwrapped is not told it is about to lose every spawn.
+    try:
+        confined = sandbox.credential_mask_applies(sandbox.configured_sandbox_mode())
+    except Exception:  # noqa: BLE001 — an unreadable mode must not hide the leaf
+        confined = True
+    print("\nMasked Credential Leaves")
+    try:
+        live_home = str(config_dir())
+    except Exception:  # noqa: BLE001 — an unresolvable home must not hide the leaf
+        live_home = ""
+    refusing = False
+    masked_any = False
+    outside_live_any = False
+    for path, links, root, accounted in aliased:
+        # Only the live home refuses, and only when a name could NOT be located. A leaf whose
+        # every other name is located is masked for the spawn and nothing is refused, so
+        # saying "REFUSED" for it sends the operator after a failure that is not coming --
+        # the same error in the other direction as reporting nothing at all. Every other
+        # spelling is reported and the spawn proceeds, because an unused home is masked by
+        # nothing while it is absent and a refusal there would be reachable from inside a
+        # sandbox.
+        in_live = bool(live_home) and root == live_home
+        if accounted:
+            masked_any = True
+            print(f"  alias:       ⚠️  masked for each spawn — {path} ({links} links)")
+        elif confined and in_live:
+            refusing = True
+            print(f"  alias:       ❌ agent spawns will be REFUSED — {path} ({links} links)")
+        elif in_live:
+            print(f"  alias:       ⚠️  will refuse spawns once confined — {path} ({links} links)")
+        else:
+            outside_live_any = True
+            print(f"  alias:       ⚠️  reported, spawns proceed — {path} ({links} links)")
+        # Whole tokens: the remedy names a path and a ``find`` invocation the operator
+        # copies, and the default wrap splits both.
+        # An accounted leaf gets the search command WITHOUT the refusal sentence. The full
+        # detail opens with "cannot mask", which is what a spawn raises with and the direct
+        # contradiction of the "masked for each spawn" line above it.
+        if accounted:
+            _print_wrapped(sandbox._masked_leaf_alias_search_hint(path))
+        else:
+            _print_wrapped(sandbox._masked_leaf_multilink_detail(path, links))
+    if refusing:
+        _print_wrapped(
+            "Until this is fixed every agent spawn on this host fails closed, and the "
+            "only other notice is a warning in the gateway log."
+        )
+        issues.append("masked credential leaf alias")
+    elif confined:
+        # Each sentence is selected by what was actually printed. A single fixed trailer
+        # claimed these leaves sit outside the live data home, which is false for an
+        # accounted leaf in the live home -- the case this host reaches whenever the auth
+        # store keeps its staging link.
+        reasons = ["No spawn is refused for these."]
+        if masked_any:
+            reasons.append(
+                "Where every other name was located, those names are masked for each spawn "
+                "too, so the bytes are unreachable from inside one."
+            )
+        if outside_live_any:
+            reasons.append(
+                "Where a name could not be located, the leaf is outside the live data home, "
+                "which the launcher reports rather than refusing on, so that a file inside a "
+                "home this install does not use cannot stop every launch."
+            )
+        reasons.append(
+            "Remove the extra link anyway: a name no mask covers leaves the bytes readable, "
+            "and this report is the only notice."
+        )
+        _print_wrapped(" ".join(reasons))
+    else:
+        _print_wrapped(
+            "This is not what stops a spawn on this host yet: the launcher reaches the "
+            "mask only when it WRAPS a child, and this host hands the command over "
+            "unwrapped or refuses it for a different reason. Remove the extra link before "
+            "the host starts confining spawns, or the first one that does fails closed."
+        )
+
+
 def _linger_enabled(user: str) -> bool | None:
     """Whether ``user``'s systemd instance lingers past logout.
 
@@ -4093,10 +4204,12 @@ def _doctor_skill_view_census(agents_dir: Path) -> None:
 
     Advisory and read-only, like the janitor line above it. The count matters
     because kiro-cli enumerates every file in this directory on every startup
-    and the projection writes one alias per authored agent per spawn: a backlog
-    from a build that predates the lease-based reclaim reached 28k files on one
-    host and made every session start crawl. The gateway's reclaim drains its
-    own home's unreferenced aliases a bounded number per spawn; the report says
+    and the projection writes one alias per distinct agent view, shared by
+    every spawn of that agent: a backlog from a build that predates the
+    lease-based reclaim reached 28k files on one host and made every session
+    start crawl. The gateway drains its own home's unreferenced aliases -- the
+    whole backlog at boot in lock-bounded batches, a bounded number per spawn
+    after that; the report says
     exactly which share that covers -- not aliases another data home owns, not
     lease-named ones while their lease is held -- and refuses to promise any
     drain while a lease record is unreadable, since the reclaim then keeps
@@ -4831,6 +4944,7 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
     # who just read the backend verdict is the one who needs to know a spawn will be
     # refused for a reason the backend line cannot express.
     _doctor_live_target_pointer(issues)
+    _doctor_masked_credential_aliases(issues)
 
     # ── Memory pressure preparedness (swap / userspace OOM killer) ──
     _doctor_memory_pressure(issues)

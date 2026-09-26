@@ -9,7 +9,7 @@ import ErrorNotice, { ErrorNoticeMenuItem } from '../components/ErrorNotice'
 import JiraLogo from '../components/icons/JiraLogo'
 import { sourceProviderMeta } from '../utils/sourceProviderMeta'
 import FolderGlyph from '../components/FolderGlyph'
-import { DndContext, closestCenter, pointerWithin, useDroppable, useDndContext, DragOverlay, MeasuringStrategy, type DragEndEvent, type DragStartEvent, type DragOverEvent, type CollisionDetection, type Collision } from '@dnd-kit/core'
+import { DndContext, closestCenter, pointerWithin, useDroppable, DragOverlay, MeasuringStrategy, type DragEndEvent, type DragStartEvent, type DragOverEvent, type CollisionDetection, type Collision } from '@dnd-kit/core'
 import { SortableContext, verticalListSortingStrategy, useSortable } from '@dnd-kit/sortable'
 import { CSS } from '@dnd-kit/utilities'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
@@ -77,7 +77,7 @@ import SessionActionsMenu from '../components/SessionActionsMenu'
 import { ChannelBrandIcon, hasChannelBrandIcon } from '../components/ChannelBrandIcon'
 import { RemoteCrewChip } from '../components/RemoteCrewChip'
 import TagManagerList from '../components/TagManagerList'
-import { DndDraggable, DndDroppable, pointerWithinDeepest, closestEdge } from '../components/dnd'
+import { DndActiveProbe, DndDraggable, DndDroppable, pointerWithinDeepest, closestEdge } from '../components/dnd'
 import { bySidebarOrder, collectFolderSubtreeIds, folderNameText } from '../utils/folderTree'
 import { normalizeRunSessionKey } from '../apps/workflows/runModel'
 import { sanitizeLlmOutput } from '../utils/sanitize'
@@ -577,37 +577,6 @@ function ChatPaneDropZone({ refusal }: { refusal: SessionRefBlockReason | null }
       )}
     </div>
   )
-}
-
-/**
- * Reports whether the enclosing DndContext has an active drag, so the sidebar
- * can reconcile its own drag mirror (`activeDrag`, `dragFrozen`) against the
- * store dnd-kit actually holds.
- *
- * The mirror is set from `onDragStart` and cleared from `onDragEnd` /
- * `onDragCancel`, but dnd-kit only fires the end callbacks when its
- * `sensorContext.active` is populated, and that ref is filled by a layout
- * effect on the commit AFTER the start. A press-move-release that finishes
- * before this component commits (the sidebar is heavy and the mouse sensor
- * arms at 5px) therefore leaves dnd-kit idle while the mirror still says a
- * drag is live: the row projection stays frozen (rows filtered before the
- * gesture never come back, the pinned divider repeats), and the chat-pane
- * drop zone stays on screen with nothing to drop.
- *
- * One probe per DndContext, keyed by a stable id: the tree/flat lanes have
- * one context and the board has one per column, and only a context that
- * hosted the gesture reports active — an idle neighbour must not be read as
- * "no drag anywhere".
- */
-function DndActiveProbe({ report }: { report: (id: string, active: boolean) => void }) {
-  const id = useId()
-  const { active } = useDndContext()
-  const isActive = active != null
-  useLayoutEffect(() => {
-    report(id, isActive)
-    return () => report(id, false)
-  }, [id, isActive, report])
-  return null
 }
 
 /** Approximate height (px) of a folder header row. For root folder drags the
@@ -2616,9 +2585,14 @@ const SessionRow = memo(function SessionRow({
           // this row is nested under the session that opened it.
           'data-conductor-depth': conductor.depth,
           ...(conductor.depth > 0 ? { 'data-testid': 'conductor-nested-row' } : {}),
+          ...(conductor.anchorOnly ? { 'data-conductor-anchor': 'true' } : {}),
         } : {})}
         initial={rowAnimEnabled ? { opacity: 0, x: -12 } : false}
-        animate={{ opacity: 1, x: 0 }}
+        // The anchor's dimming belongs HERE and not in a class: Motion writes its
+        // animation target to the element's own style, so an inline `opacity: 1` from
+        // this target outranks any opacity utility on the same row and the anchor paints
+        // at full strength. One source of truth, and the property a person actually sees.
+        animate={{ opacity: conductor?.anchorOnly ? 0.55 : 1, x: 0 }}
         transition={{ layout: { type: 'spring', stiffness: 500, damping: 35 }, opacity: { duration: 0.2 }, x: { duration: 0.2 } }}>
         {/* Both dnd ids are ORIGIN-QUALIFIED (`rowIdentity`, not `s.key`): a peer
             row's disabled droppable/draggable still registers its id with dnd-kit,
@@ -3296,10 +3270,18 @@ interface ConductorRowExtras {
    *  is present and simply not above this row right now, and the two must not share a
    *  tooltip that claims the session closed. */
   citesParent?: string | null
+  /** True when this row is on screen only to hold its workers together: the active
+   *  filter does not admit it, but something in its subtree needs it as the row the
+   *  nesting hangs from. Dimmed, because it is context rather than a match. */
+  anchorOnly?: boolean
 }
 
-/** Which conductor rows the user has expanded, as a JSON array of root keys. */
-const CONDUCTOR_EXPANDED_LS_KEY = 'mc-sidebar-conductor-expanded'
+/** Which conductor rows the user has collapsed, as a JSON array of row keys. A row
+ *  absent from it is OPEN, which is what makes the lane match the System page on a
+ *  gateway the user has never touched this control on. */
+const CONDUCTOR_COLLAPSED_LS_KEY = 'mc-sidebar-conductor-collapsed'
+/** The key the one above supersedes, kept only so it can be removed from storage. */
+const CONDUCTOR_SUPERSEDED_EXPANDED_LS_KEY = 'mc-sidebar-conductor-expanded'
 
 /**
  * The persisted lane, migrating the boolean this replaced.
@@ -3316,17 +3298,32 @@ function readStoredLane(): SidebarLane {
   return localStorage.getItem(FLAT_VIEW_LS_KEY) === '1' ? 'flat' : 'tree'
 }
 
-/** The expanded conductor roots, or an empty set when the value is unusable. */
-function readConductorExpanded(): Set<string> {
+/** The conductor rows the user has COLLAPSED, or an empty set when the value is
+ *  unusable. Collapsed rather than expanded is what makes EXPANDED the default: the
+ *  lane must show the tree the System page's Sessions tab shows, and a conductor this
+ *  build has never seen has no entry here, so it renders open.
+ *
+ *  The set this supersedes held the OPPOSITE sense, one row per conductor the user had
+ *  opened, and there is no reading of it that produces this one: a row it names was
+ *  open, which is now the default, and a row it omits was closed only if the user ever
+ *  saw it. So it is dropped rather than converted -- left in place it would sit in
+ *  storage for the life of the browser profile, meaning nothing to any build. */
+function readConductorCollapsed(): Set<string> {
   try {
-    const raw = localStorage.getItem(CONDUCTOR_EXPANDED_LS_KEY)
+    localStorage.removeItem(CONDUCTOR_SUPERSEDED_EXPANDED_LS_KEY)
+  } catch {
+    // Storage that refuses a write still answers reads, so the fold state below is
+    // worth reading; an undeletable stale key costs nothing but the bytes.
+  }
+  try {
+    const raw = localStorage.getItem(CONDUCTOR_COLLAPSED_LS_KEY)
     if (!raw) return new Set()
     const parsed: unknown = JSON.parse(raw)
     if (!Array.isArray(parsed)) return new Set()
     return new Set(parsed.filter((k): k is string => typeof k === 'string' && k !== ''))
   } catch {
-    // Collapsed-by-default is the documented default, so an unreadable value costs
-    // the user one re-expand rather than an error they cannot act on.
+    // Expanded-by-default is the documented default, so an unreadable value costs the
+    // user one re-collapse rather than an error they cannot act on.
     return new Set()
   }
 }
@@ -5369,6 +5366,18 @@ function ChatSidebar({
   // directly and re-renders on change.
   const reduceMotion = useReducedMotion()
 
+  /**
+   * The one order every session lane uses. Extracted so the conductor lane can sort
+   * the FULL row set the same way `filteredSlots` sorts the narrowed one: that lane
+   * builds its tree from every row, and a comparator of its own would make the two
+   * lanes disagree about the same two sessions for no reason a user could see.
+   */
+  const laneOrder = useCallback((a: Slot, b: Slot) => searchRanked
+    ? ((!isPeerRow(a) ? searchRanked.get(a.key) : undefined) ?? Infinity)
+      - ((!isPeerRow(b) ? searchRanked.get(b.key) : undefined) ?? Infinity)
+    : compareLocalPinnedThenSort(a, b, sortKey, pinned, pinnedRank),
+    [searchRanked, sortKey, pinned, pinnedRank])
+
   const filteredSlots = useMemo(() => {
     if (dragFrozen) return frozenSlotsRef.current
     // Live sessions from connected remote instances join the LIVE list, not the
@@ -5391,14 +5400,11 @@ function ChatSidebar({
       // of the sidebar sort (mirrors the Older Sessions lane and the command
       // palette). Pinning stays a reachability promise for browsing, not a
       // ranking hint inside explicit search results.
-      .sort((a, b) => searchRanked
-        ? ((!isPeerRow(a) ? searchRanked.get(a.key) : undefined) ?? Infinity)
-          - ((!isPeerRow(b) ? searchRanked.get(b.key) : undefined) ?? Infinity)
-        : compareLocalPinnedThenSort(a, b, sortKey, pinned, pinnedRank))
+      .sort(laneOrder)
     frozenSlotsRef.current = next
     return next
   },
-    [allRows, filterDimensions, searchRanked, pinned, pinnedRank, sortKey, dragFrozen]
+    [allRows, filterDimensions, laneOrder, dragFrozen]
   )
 
   // Hold the row under the pointer in place. Under a last-activity sort,
@@ -5579,9 +5585,14 @@ function ChatSidebar({
     }
   }, [lineagePending, dispatch])
 
+  // Read from the FULL row set, never from `filteredSlots`. The lane's own tree is
+  // built from every row, so whether there is anything to nest is not a question a
+  // filter gets to answer: computed from the narrowed list, turning on Unread could
+  // hide every parent-carrying row, flip this false and take the whole lane away --
+  // the nesting appeared and then vanished with no control touched that says so.
   const lineageAvailable = useMemo(
-    () => filteredSlots.some(s => s.parent?.key != null || s.parent?.slot),
-    [filteredSlots],
+    () => allRows.some(s => s.parent?.key != null || s.parent?.slot),
+    [allRows],
   )
   // Gated on `lineageAvailable` as well as the board, and the reason is the toggle:
   // it renders only when more than one lane is available, so with a persisted
@@ -5760,13 +5771,56 @@ function ChatSidebar({
   // Flat-view slot list: filteredSlots minus sessions in hidden folders —
   // EXCEPT while searching, where every match must stay reachable so a hidden
   // folder never becomes a search dead-end.
-  const flatSlots = useMemo(() => {
-    if (!folderFilterActive) return filteredSlots
-    return filteredSlots.filter(s => {
-      const fid = localSlotFolder(s, slotFolders)
-      return !(fid && filterHiddenSubtree.has(fid))
-    })
-  }, [filteredSlots, folderFilterActive, filterHiddenSubtree, slotFolders])
+  /** Does the folder filter conceal this row?
+   *
+   *  ONE definition because every lane that renders sessions has to ask it, and each
+   *  asks it where it builds its row POPULATION rather than at its render site: the
+   *  tree lane drops an unchecked folder's whole block, the flat lane strips the rows,
+   *  and the conductor lane keeps them out of its lineage. Asked at a render site
+   *  instead, a lane would have to remember to ask again for every set it derives --
+   *  its matches, its context anchors, its collapsed aggregates -- and the one it
+   *  forgot would put a row on screen the person asked not to see.
+   *
+   *  Distinct from `isFolderHidden`, which is the folder's OWN hide-when-empty
+   *  attribute. This one is the person's choice in the filter menu, and
+   *  `folderFilterActive` turns it off entirely while the search box has text, so a
+   *  hidden folder never becomes a search dead-end. */
+  const isRowFolderHidden = useCallback((s: Slot): boolean => {
+    if (!folderFilterActive) return false
+    const fid = localSlotFolder(s, slotFolders)
+    return !!fid && filterHiddenSubtree.has(fid)
+  }, [folderFilterActive, filterHiddenSubtree, slotFolders])
+
+  /** Flat-view slot list: `filteredSlots` minus every row the folder filter conceals. */
+  const flatSlots = useMemo(
+    () => (folderFilterActive ? filteredSlots.filter(s => !isRowFolderHidden(s)) : filteredSlots),
+    [filteredSlots, folderFilterActive, isRowFolderHidden],
+  )
+
+  /**
+   * Which cited creators exist at all, as `origin -> set of slot keys` over the
+   * UNFILTERED population.
+   *
+   * The conductor lane's citation glyph has two readings, and only this tells them
+   * apart. A row placed under nothing because its creator is GONE is an orphan, and the
+   * glyph says the creator is closed. A row placed under nothing because its creator is
+   * merely concealed has a creator that is open and running, so the same glyph would
+   * state something false about a live session. Read against the population before any
+   * concealment, a present creator means the lane is simply not nesting -- which is what
+   * `citesParent` says.
+   */
+  const citedCreatorExists = useMemo(() => {
+    const byOrigin = new Map<string | undefined, Set<string>>()
+    for (const s of allRows) {
+      let inOrigin = byOrigin.get(s.peer_id)
+      if (inOrigin === undefined) {
+        inOrigin = new Set<string>()
+        byOrigin.set(s.peer_id, inOrigin)
+      }
+      inOrigin.add(s.key)
+    }
+    return byOrigin
+  }, [allRows])
 
   // ── conductor lane ───────────────────────────────────────────────────────
   //
@@ -5775,12 +5829,47 @@ function ChatSidebar({
   // their folders put them, and today they scatter through a recency-sorted list.
 
   /**
-   * The lineage tree over the rows this lane renders.
+   * Every live session, in the lane's order -- NOT the filtered list.
    *
-   * Built from `flatSlots` -- the flat lane's own ordered list -- so root order AND
-   * sibling order are the flat lane's order, with no comparator of its own. A second
-   * comparator would make the two lanes disagree about the same two sessions for no
-   * reason a user could see.
+   * The tree has to be built over the whole population, because an edge is a fact about
+   * two sessions and not about the current filter. Built from `filteredSlots`, a
+   * conductor the filter did not admit was simply absent, so every worker it opened
+   * resolved no parent and popped to the top level as an orphan: switching on Unread
+   * scattered a conductor's workers across the lane, and the System page nested all of
+   * them at the same moment.
+   *
+   * Order is `laneOrder`, the comparator `filteredSlots` itself sorts by, so root and
+   * sibling order still match the flat lane.
+   *
+   * The VIEW filters are what that whole population spans: status, tag and search decide
+   * what the lane is ABOUT, so a row they exclude still belongs in the tree and renders
+   * as a dimmed context anchor. The FOLDER filter is a stronger statement -- the person
+   * asked not to see that folder -- so `isRowFolderHidden` applies HERE, to the
+   * population itself. A concealed row is then absent from the tree, from `byKey` and
+   * from every set derived downstream, so no render site has to ask a second time; its
+   * children resolve no parent and fall back to the orphan-root treatment this lane
+   * already gives a child whose parent it cannot show. The reveal row at the bottom of
+   * the lane stays the way to look inside a hide.
+   */
+  const conductorRows = useMemo(() => {
+    if (!conductorLaneActive) return []
+    return [...allRows].filter(s => !isRowFolderHidden(s)).sort(laneOrder)
+  }, [conductorLaneActive, allRows, laneOrder, isRowFolderHidden])
+
+  /**
+   * Row identities the active filter ADMITS, as the flat lane computed them.
+   *
+   * The filter still decides what the lane is about; it just no longer decides what the
+   * tree is. A row in this set is a match and renders normally; a row outside it renders
+   * only when something under it matched, and then as a dimmed anchor.
+   */
+  const conductorMatching = useMemo(
+    () => new Set(flatSlots.map(sessionRowIdentity)),
+    [flatSlots],
+  )
+
+  /**
+   * The lineage tree over the rows this lane renders.
    *
    * Only computed while the lane is active: cheap, but still per-render work for a
    * view nobody is looking at.
@@ -5801,7 +5890,7 @@ function ChatSidebar({
     // Nested by origin rather than keyed on one joined string: there is then no
     // separator, so no peer id or slot key containing it can be read as the wrong pair.
     const byOrigin = new Map<string | undefined, Map<string, string>>()
-    for (const s of flatSlots) {
+    for (const s of conductorRows) {
       let inOrigin = byOrigin.get(s.peer_id)
       if (inOrigin === undefined) {
         inOrigin = new Map<string, string>()
@@ -5809,7 +5898,7 @@ function ChatSidebar({
       }
       inOrigin.set(s.key, sessionRowIdentity(s))
     }
-    return buildLineage(flatSlots, {
+    return buildLineage(conductorRows, {
       identityOf: sessionRowIdentity,
       parentIdentityOf: s => {
         const cited = s.parent?.key
@@ -5817,29 +5906,31 @@ function ChatSidebar({
         return byOrigin.get(s.peer_id)?.get(cited) ?? null
       },
     })
-  }, [conductorLaneActive, flatSlots])
+  }, [conductorLaneActive, conductorRows])
 
   /**
-   * Which conductor rows are open. COLLAPSED by default, and persisted.
+   * Which conductor rows are shut. EXPANDED by default, and the shut ones persist.
    *
-   * Collapsed is the default that makes the lane worth having: a conductor with
-   * fourteen workers should read as one row with a count, not as fifteen rows the
-   * user has to skim past. The set is keyed by row key and survives a reload, because
-   * a user who opened a conductor to watch its workers has not finished watching them.
+   * Expanded is the default because this lane exists to show the same tree the System
+   * page's Sessions tab shows, and that one arrives open: a conductor whose fourteen
+   * workers are behind a chevron the user has to find is not the same view. The set
+   * holds what the user has CLOSED, so it survives a reload -- somebody who folded a
+   * conductor away has not changed their mind -- while a conductor it has never held
+   * renders open.
    */
-  const [conductorExpanded, setConductorExpanded] = useState<Set<string>>(readConductorExpanded)
-  const persistConductorExpanded = useCallback((next: Set<string>) => {
-    safeSetItem(CONDUCTOR_EXPANDED_LS_KEY, JSON.stringify(Array.from(next)))
+  const [conductorCollapsed, setConductorCollapsed] = useState<Set<string>>(readConductorCollapsed)
+  const persistConductorCollapsed = useCallback((next: Set<string>) => {
+    safeSetItem(CONDUCTOR_COLLAPSED_LS_KEY, JSON.stringify(Array.from(next)))
   }, [])
   const toggleConductorExpanded = useCallback((key: string) => {
-    setConductorExpanded(prev => {
+    setConductorCollapsed(prev => {
       const next = new Set(prev)
       if (next.has(key)) next.delete(key)
       else next.add(key)
-      persistConductorExpanded(next)
+      persistConductorCollapsed(next)
       return next
     })
-  }, [persistConductorExpanded])
+  }, [persistConductorCollapsed])
 
   /**
    * Open every ancestor of *key* so a nested row becomes visible.
@@ -5856,15 +5947,15 @@ function ChatSidebar({
   const lineageParentsRef = useRef<Map<string, string>>(new Map())
   lineageParentsRef.current = lineage?.parentOf ?? lineageParentsRef.current
   const expandConductorAncestors = useCallback((key: string) => {
-    setConductorExpanded(prev => {
+    setConductorCollapsed(prev => {
       const chain = ancestorsOf(key, lineageParentsRef.current)
-      if (chain.length === 0 || chain.every(k => prev.has(k))) return prev
+      if (chain.length === 0 || chain.every(k => !prev.has(k))) return prev
       const next = new Set(prev)
-      for (const k of chain) next.add(k)
-      persistConductorExpanded(next)
+      for (const k of chain) next.delete(k)
+      persistConductorCollapsed(next)
       return next
     })
-  }, [persistConductorExpanded])
+  }, [persistConductorCollapsed])
 
   /**
    * The creator each row cited on the PREVIOUS frame, so a row that MOVED can be told
@@ -5906,19 +5997,23 @@ function ChatSidebar({
    * very row that moved. The baseline has to predate the move, so it cannot be seeded by
    * the frame that carries it.
    *
-   * For the same reason the next frame's map CARRIES the previous one forward rather than
-   * replacing it. `flatSlots` is search- and folder-filtered, so a row the current filter
-   * excludes is absent from this frame without having gone anywhere -- and rebuilding the
-   * map from this frame alone would evict its baseline. An adoption landing while a search
-   * is active would then be read as a creation once the search cleared, which is the same
-   * row-hiding failure by a different route. A row that is genuinely gone is dropped by
-   * the lane unmounting, not by one filtered frame.
+   * The tracked set is EVERY row, not the filtered one. A row the filter excludes can
+   * still be on screen -- the lane keeps it as a dimmed anchor when something under it
+   * matched -- so reading only the filtered set would miss exactly those rows' moves, and
+   * the promise above is what would break: an anchor adopted under a collapsed conductor
+   * would take its subtree off screen with nothing opening the destination.
+   *
+   * The next frame's map also CARRIES the previous one forward rather than replacing it,
+   * because a row absent from one frame has not necessarily gone anywhere. Rebuilding
+   * from a single frame would evict its baseline, and a later reappearance would read as
+   * a creation rather than a move -- the same row-hiding failure by another route. A row
+   * that is genuinely gone is dropped by the lane unmounting, not by one thin frame.
    */
   useEffect(() => {
     const previous = citedCreatorRef.current
     const current = new Map<string, string | null>(previous)
     const moved: string[] = []
-    for (const slot of flatSlots) {
+    for (const slot of allRows) {
       const identity = sessionRowIdentity(slot)
       const cited = slot.parent?.slot ?? null
       current.set(identity, cited)
@@ -5932,7 +6027,7 @@ function ChatSidebar({
     // able to tell a move from a creation.
     if (!conductorLaneActive || lineage == null) return
     for (const identity of moved) expandConductorAncestors(identity)
-  }, [conductorLaneActive, lineage, flatSlots, expandConductorAncestors])
+  }, [conductorLaneActive, lineage, allRows, expandConductorAncestors])
 
   /**
    * The lanes that can actually render something, in cycle order.
@@ -7137,7 +7232,12 @@ function ChatSidebar({
   const renderColumnFolder = (folder: ChatFolder, columnId: string, colSlotKeys: Set<string>, dragHandleProps?: React.HTMLAttributes<HTMLElement>, forceCollapsed?: boolean): React.ReactNode => {
     const childFolders = folders.filter(f => f.parent_id === folder.id).sort(bySidebarOrder)
     const { rows: childSlots, navScope: folderLaneScope, container: folderHoldContainer } = heldLane(filteredSlots.filter(s => colSlotKeys.has(sessionRowIdentity(s)) && localSlotFolder(s, slotFolders) === folder.id), columnId, `board:${columnId}:folder:${folder.id}`)
-    const deepChildren = childFolders
+    // A nested folder the person unchecked drops out of the recursion, so neither its
+    // header nor anything under it renders. Checking the folder's OWN id is enough:
+    // dropping it here takes its descendants with it, the same way the tree's block
+    // removal does. Its sessions are already gone from `colSlotKeys`; without this the
+    // column would still draw the header of a folder the person asked not to see.
+    const deepChildren = childFolders.filter(f => !isFolderFilteredOut(f))
     // Same opt-in as the tree (see the note in renderFolderBlock): only when the
     // setting is on does a column copy holding nothing lose its body, and with it
     // the collapse state it no longer has anything to remember.
@@ -8725,10 +8825,21 @@ function ChatSidebar({
             )}
             <DropdownMenu open={filterSortOpen} onOpenChange={setFilterSortOpen}>
               <DropdownMenuTrigger asChild>
+                {/* The funnel carries the hide's only on-screen trace in a board.
+                    A board column draws no folder header, so it has no reveal row
+                    either: without a mark here, rows the person hid are simply
+                    absent, the hide survives a reload, and every later visit reads
+                    as sessions that disappeared. The tint says something is being
+                    withheld and the title says how much, so the menu holding the
+                    undo is the thing the eye is drawn to. */}
                 <FilterMenuButton
-                  title={i18nT('pages.chatSidebar.sort_filter_sessions')}
+                  title={filterHiddenFolders.size > 0
+                    ? `${i18nT('pages.chatSidebar.sort_filter_sessions')} - ${filterHiddenFolders.size} ${i18nT('pages.chatSidebar.hidden')}`
+                    : i18nT('pages.chatSidebar.sort_filter_sessions')}
                   aria-label={i18nT('pages.chatSidebar.sort_and_filter_sessions')}
                   badge={filterCounts['unread']}
+                  className={filterHiddenFolders.size > 0 ? 'text-accent' : undefined}
+                  data-folder-hide-active={filterHiddenFolders.size > 0 ? String(filterHiddenFolders.size) : undefined}
                 />
               </DropdownMenuTrigger>
               <FilterMenuContent align="end">
@@ -9033,7 +9144,13 @@ function ChatSidebar({
                     menu's own scroll (the DropdownMenuContent primitive caps to
                     the available viewport height and scrolls) with no inner
                     scroll region of its own. */}
-                {!boardLaneActive && folderFilterRows.length > 0 && (
+                {/* Reachable in EVERY view, the board included. The folder hide applies
+                    to the board's own population, so a person who hides a folder and
+                    then switches to a board needs the control that reverses it where
+                    they are standing: a board column has no folder header, so it carries
+                    no reveal row either, and without this section the hide would have no
+                    way back short of leaving board view. */}
+                {folderFilterRows.length > 0 && (
                   <>
                     <DropdownMenuSeparator />
                     {/* The heading doubles as the shelve control: activating it
@@ -9069,7 +9186,7 @@ function ChatSidebar({
                         style={{ paddingLeft: `${8 + depth * 14}px` }}
                         title={hiddenByAncestor
                           ? i18nT('pages.chatSidebar.hidden_because_parent_hidden', { name: f.name })
-                          : hidden ? i18nT('pages.chatSidebar.show_in_flat_view', { name: f.name }) : i18nT('pages.chatSidebar.hide_from_flat_view', { name: f.name })}
+                          : hidden ? i18nT('pages.chatSidebar.show_folder') : i18nT('pages.chatSidebar.hide_folder')}
                         // Keep the menu open so several folders can be toggled.
                         onSelect={e => { e.preventDefault(); toggleFolderFilter(f.id) }}
                         data-testid={`folder-filter-${f.id}`}
@@ -9309,8 +9426,21 @@ function ChatSidebar({
               // Keyed by identity, exactly as `lineage` is: a raw-key map would let a
               // federated peer row overwrite the local row it collides with, so one
               // session would vanish and the other would render twice.
-              const byKey = new Map(flatSlots.map(s => [sessionRowIdentity(s), s] as const))
-              const rows: Array<{ id: string; slot: Slot; depth: number; childCount: number; expanded: boolean; orphanOf: string | null; citesParent?: string | null; aggregate: { needsYou: number; running: number } | null }> = []
+              const byKey = new Map(conductorRows.map(s => [sessionRowIdentity(s), s] as const))
+              // The rows this lane may show: every match, plus each ancestor a match
+              // needs to hang from. An ancestor is on screen as CONTEXT -- the filter
+              // did not admit it -- so it renders dimmed and still carries its chevron.
+              // Without it a filtered-out conductor's workers each resolved no parent
+              // and scattered to the top level, which is what switching on Unread did.
+              const kept = new Set<string>()
+              for (const id of conductorMatching) {
+                if (!byKey.has(id)) continue
+                kept.add(id)
+                for (const up of ancestorsOf(id, tree.parentOf)) kept.add(up)
+              }
+              const keptKids = (key: string) =>
+                (tree.children.get(key) ?? []).filter(k => kept.has(k))
+              const rows: Array<{ id: string; slot: Slot; depth: number; childCount: number; expanded: boolean; orphanOf: string | null; citesParent?: string | null; anchorOnly: boolean; aggregate: { needsYou: number; running: number } | null }> = []
 
               /** Does this row want the user? The same two signals the row itself
                *  renders as a dot or a subtitle, so a collapsed conductor's badge and
@@ -9335,18 +9465,29 @@ function ChatSidebar({
               const emit = (key: string, depth: number) => {
                 const slot = byKey.get(key)
                 if (!slot) return
-                const kids = tree.children.get(key) ?? []
-                const expanded = conductorExpanded.has(key)
+                const kids = keptKids(key)
+                const expanded = !conductorCollapsed.has(key)
                 const subtree = kids.length > 0 && !expanded
-                  ? descendantsOf(key, tree.children)
+                  ? descendantsOf(key, tree.children).filter(k => kept.has(k))
                   : []
+                // Which of the two citation glyphs this row earns. `orphanCitation` only
+                // knows the row was placed under nothing; whether that is because the
+                // creator closed or because the folder filter conceals it is decided
+                // against the unfiltered population. A creator that is still there is
+                // open and running, so saying it closed would be false.
+                const cited = orphanCitation(slot, tree.parentOf.get(key) ?? null)
+                const citedKey = slot.parent?.key
+                const creatorStillOpen = cited != null && citedKey != null
+                  && (citedCreatorExists.get(slot.peer_id)?.has(citedKey) ?? false)
                 rows.push({
                   id: key,
                   slot,
                   depth,
                   childCount: kids.length,
                   expanded,
-                  orphanOf: orphanCitation(slot, tree.parentOf.get(key) ?? null),
+                  orphanOf: creatorStillOpen ? null : cited,
+                  citesParent: creatorStillOpen ? cited : null,
+                  anchorOnly: !conductorMatching.has(key),
                   // Only a COLLAPSED conductor aggregates: while it is open its
                   // children show their own badges, and showing both would count the
                   // same session twice on one screen.
@@ -9367,10 +9508,10 @@ function ChatSidebar({
                 for (const s of flatSlots) {
                   // The cited creator rides along even though the lane is not nesting:
                   // flattened, a child is otherwise indistinguishable from a root.
-                  rows.push({ id: sessionRowIdentity(s), slot: s, depth: 0, childCount: 0, expanded: false, orphanOf: null, citesParent: s.parent?.slot ?? null, aggregate: null })
+                  rows.push({ id: sessionRowIdentity(s), slot: s, depth: 0, childCount: 0, expanded: false, orphanOf: null, citesParent: s.parent?.slot ?? null, anchorOnly: false, aggregate: null })
                 }
               } else {
-                for (const key of tree.roots) emit(key, 0)
+                for (const key of tree.roots) if (kept.has(key)) emit(key, 0)
               }
 
               return rows.map((row, i) => {
@@ -9393,6 +9534,7 @@ function ChatSidebar({
                       aggregate: row.aggregate,
                       orphanOf: row.orphanOf,
                       citesParent: row.citesParent ?? null,
+                      anchorOnly: row.anchorOnly,
                     })}
                   </Fragment>
                 )
@@ -9401,10 +9543,15 @@ function ChatSidebar({
             {flatSlots.length === 0 && (
               <div className="px-3 py-4 text-[12px] text-muted">{i18nT('pages.chatSidebar.no_sessions_match')}</div>
             )}
-            {flatSlots.length > 0 && lineage != null && lineage.children.size === 0 && (
+            {flatSlots.length > 0 && lineage != null && lineage.children.size === 0 && allHiddenFolders.length === 0 && (
               // Not an error state: the crew log may be off, or nothing has opened
               // anything yet. The lane still shows every session -- it just has no
               // nesting to show, and says so instead of looking broken.
+              //
+              // Withheld while this lane is concealing a folder, because then the note
+              // cannot be read as intended: the rows above it are live sessions, and the
+              // reveal row immediately below already says how many folders are hidden,
+              // which is the actual reason there is no nesting left to draw.
               <div className="px-3 py-2 text-[11px] text-muted select-none" data-testid="conductor-lane-empty-note">
                 {i18nT('pages.chatSidebar.no_conductor_sessions_yet')}
               </div>
@@ -9657,7 +9804,13 @@ function ChatSidebar({
           )}
           <div className="flex-1 overflow-x-auto overflow-y-hidden flex gap-2 p-2" data-testid="column-strip">
             {orderedColumns.map((col, colIdx) => {
-              const colSlots = filteredSlots.filter(s => !isPeerRow(s) && columnMatches(col, s))
+              // `isRowFolderHidden` here rather than at the render sites below, because
+              // this one population feeds all of them: the flat-board rows, every folder
+              // block's body through `colSlotKeys`, each block's aggregate count, and the
+              // "no sessions" notice. The board lane has no reveal row (a column has no
+              // folder header for one to hang from), so the hide is absolute here and the
+              // way back is re-checking the folder in the filter menu.
+              const colSlots = filteredSlots.filter(s => !isPeerRow(s) && columnMatches(col, s) && !isRowFolderHidden(s))
               const colTags = col.tag_ids.map(tid => tagById[tid]).filter(Boolean) as ChatTag[]
               const laneDef = col.source === 'state' ? SESSION_LANES.find(l => l.key === col.state_key) : undefined
               // Only a single-status-tag column can accept a card: dropping onto a
@@ -9739,7 +9892,7 @@ function ChatSidebar({
                         </span>
                       )}
                     </div>
-                    <span className="text-[11px] text-muted shrink-0">{colSlots.length}</span>
+                    <span data-testid={`column-count-${col.id}`} className="text-[11px] text-muted shrink-0">{colSlots.length}</span>
                     <button type="button" data-testid={`column-new-folder-${col.id}`} className="text-muted hover:text-accent bg-transparent border-none cursor-pointer shrink-0 p-[2px]" title={i18nT('pages.chatSidebar.new_folder')} aria-label={i18nT('pages.chatSidebar.new_folder')} onClick={() => { setFolderModal({ mode: 'create', parentId: '' }) }}><FolderPlus size={12} /></button>
                     {!laneDef && <button type="button" data-testid={`column-edit-${col.id}`} className="text-muted hover:text-accent bg-transparent border-none cursor-pointer shrink-0 p-[2px]" title={i18nT('pages.chatSidebar.filter_manage_tags')} aria-label={i18nT('pages.chatSidebar.filter_manage_tags')} onClick={() => setColumnEditId(columnEditId === col.id ? null : col.id)}><TagIcon size={12} /></button>}
                     <button
@@ -9855,7 +10008,13 @@ function ChatSidebar({
                       // order. Cross-lane card drag (the column onDrop above) is
                       // untouched; only folder rendering (and with it folder
                       // reorder/drop, which need folder headers) goes away.
-                      const relevantFolders = flatView ? [] : rootFolders
+                      // A folder the person unchecked in the filter menu drops out here
+                      // for the same reason the tree drops it: the hide is a statement
+                      // about the folder, not about one lane, so every lane that renders
+                      // folder blocks answers to it. `isFolderHidden` is deliberately NOT
+                      // applied -- a board column renders an empty folder header on
+                      // purpose, as something to drop onto.
+                      const relevantFolders = flatView ? [] : rootFolders.filter(f => !isFolderFilteredOut(f))
                       const { rows: ungrouped, navScope: colLaneScope, container: colHoldContainer } = heldLane(flatView
                         ? colSlots
                         : colSlots.filter(s => {

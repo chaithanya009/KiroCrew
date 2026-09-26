@@ -4263,20 +4263,25 @@ class TestUxReviewReadsTheScreenshotsBlindFirst:
         assertions name the stale shapes; the positive ones name the rule the
         trigger states instead. The design trigger is checked in BOTH design
         lanes because their calibration blocks are pinned identical, so its
-        wording has to be true of a same-repo checkout and of a fork read out
-        of the object store alike. The CANNOT-EVALUATE contract itself is
+        wording has to be true of a same-repo and a fork pull request alike --
+        which it is only as the one read the shared script performs: bytes out
+        of the object store at the head SHA, never off a working tree. A
+        per-lane split ("in a same-repo checkout as the file at HEAD") names a
+        read the script does not perform. The CANNOT-EVALUATE contract itself is
         untouched: the point is which evidence counts, not when the lane may
         refuse."""
         for lane in DESIGN_LANES:
             design_prompt = _flat(_step(lane, "Design review (Fable 5)")["with"]["prompt"])
             assert "THIS checkout can render" not in design_prompt, lane
             assert "a committed image is not evidence here" not in design_prompt, lane
+            assert "in a same-repo checkout as the file at HEAD" not in design_prompt, lane
             assert "no committed image or recording it names" in design_prompt, lane
             assert "counts the same as an attachment" in design_prompt, lane
             assert (
-                "on a fork pull request as bytes the workflow read out of the object store"
-                in design_prompt
+                "read as bytes out of the object store at the head SHA, never off a "
+                "working tree, on a same-repo and a fork pull request alike" in design_prompt
             ), lane
+            assert "a committed path the list does not name was not admitted" in design_prompt, lane
             # The lane still refuses when the list names nothing, and still
             # says a URL the workflow could not download is not evidence.
             assert "CANNOT EVALUATE -- REQUIRED EVIDENCE MISSING" in design_prompt, lane
@@ -9517,7 +9522,14 @@ class TestReviewLaneVerdictVisibility:
         # And that branch answers 2 as well: a rival comment in the slot is the
         # same refusal as finding one before the first write, reached later.
         rival = canonical.split("took this lane's slot while this run was retrying", 1)[1]
-        assert rival.split("\n")[1].strip() == "return 2", rival[:160]
+        # Read as the FIRST return after that branch rather than the next
+        # physical line: a withheld arm retains the verdict before returning, so
+        # a line sits between the message and the answer. Any other status here,
+        # including one the retention introduced, still fails.
+        rival_returns = [
+            line.strip() for line in rival.split("\n") if line.strip().startswith("return ")
+        ]
+        assert rival_returns and rival_returns[0] == "return 2", rival[:240]
         # Two classified reads, asking the same question at different times:
         # before the first write, and again during the backoff. Both are scoped
         # to the slot as well as the needle.
@@ -11559,6 +11571,42 @@ class TestForkLaneSurfacesAnUnstampedReviewBody:
         assert "UNSTAMPED" not in posted
 
 
+def _fork_gpt_cli_config(tmp_path: Path) -> dict:
+    """Run the fork GPT lane's config step and parse the file it writes.
+
+    PARSE, never grep: a heredoc emitting invalid TOML would still satisfy a
+    substring assertion while codex discards the whole file -- taking the shell
+    environment policy and the sandbox mode with it.
+    """
+    import tomllib
+
+    bash = _bash()
+    if bash is None:
+        pytest.skip("writing the review CLI config requires Bash")
+    home = tmp_path / "home"
+    home.mkdir()
+    script_file = tmp_path / "step.sh"
+    script_file.write_text(
+        _step_script(
+            _workflow("fork-gpt-review.yml"), "Configure the review CLI for Amazon Bedrock"
+        ),
+        encoding="utf-8",
+        newline="\n",
+    )
+    proc = subprocess.run(
+        [bash, "-e", str(script_file)],
+        check=False,
+        capture_output=True,
+        encoding="utf-8",
+        cwd=tmp_path,
+        env={**os.environ, "HOME": str(home)},
+    )
+    assert proc.returncode == 0, proc.stderr
+    written = home / ".codex" / "config.toml"
+    assert written.is_file(), "the step wrote no config.toml"
+    return tomllib.loads(written.read_text(encoding="utf-8"))
+
+
 class TestForkGptLaneKeepsCredentialsOutOfTheModelShell:
     """`codex exec` hands the model a shell; the Opus lane deliberately does not.
 
@@ -11574,34 +11622,7 @@ class TestForkGptLaneKeepsCredentialsOutOfTheModelShell:
     STEP = "Configure the review CLI for Amazon Bedrock"
 
     def _config(self, tmp_path: Path) -> dict:
-        import tomllib
-
-        bash = _bash()
-        if bash is None:
-            pytest.skip("writing the review CLI config requires Bash")
-        home = tmp_path / "home"
-        home.mkdir()
-        script_file = tmp_path / "step.sh"
-        script_file.write_text(
-            _step_script(_workflow("fork-gpt-review.yml"), self.STEP),
-            encoding="utf-8",
-            newline="\n",
-        )
-        proc = subprocess.run(
-            [bash, "-e", str(script_file)],
-            check=False,
-            capture_output=True,
-            encoding="utf-8",
-            cwd=tmp_path,
-            env={**os.environ, "HOME": str(home)},
-        )
-        assert proc.returncode == 0, proc.stderr
-        written = home / ".codex" / "config.toml"
-        assert written.is_file(), "the step wrote no config.toml"
-        # PARSE, never grep: a heredoc emitting invalid TOML would still satisfy a
-        # substring assertion while codex discards the policy and the model's
-        # shell keeps the credentials.
-        return tomllib.loads(written.read_text(encoding="utf-8"))
+        return _fork_gpt_cli_config(tmp_path)
 
     def test_the_bedrock_provider_still_resolves(self, tmp_path: Path) -> None:
         # The exclusions must not cost the lane its model: the provider reads its
@@ -11625,6 +11646,55 @@ class TestForkGptLaneKeepsCredentialsOutOfTheModelShell:
         # false so GH_TOKEN and future secret-shaped variables drop out too.
         policy = self._config(tmp_path)["shell_environment_policy"]
         assert policy["ignore_default_excludes"] is False
+
+
+class TestForkGptLaneSandboxModeLivesInTheConfigFile:
+    """A `--sandbox` flag on the command line makes this lane's config unreachable.
+
+    The flag wins over `sandbox_mode` in the staged config AND suppresses a
+    `default_permissions` profile outright, so a filesystem rule written into that
+    file is inert for as long as the flag is passed. The mode therefore belongs in
+    the file, which is the only place a read restriction can be attached to it.
+
+    Both halves are asserted because either one alone is unsafe. Dropping the flag
+    without pinning the key leaves the effective mode to a config default this
+    repository does not control, and `workspace-write` and `danger-full-access`
+    are legal values for it -- on a lane that reviews a fork's UNTRUSTED diff
+    holding Bedrock credentials.
+    """
+
+    WORKFLOW = "fork-gpt-review.yml"
+
+    def _codex_commands(self) -> list[str]:
+        """Every `codex exec` invocation, backslash continuations joined up."""
+        joined = re.sub(r"\\\n\s*", " ", _workflow(self.WORKFLOW))
+        commands = [
+            _flat(line).strip()
+            for line in joined.splitlines()
+            if ".bin/codex" in line and " exec " in _flat(line)
+        ]
+        assert commands, f"{self.WORKFLOW} runs no `codex exec` command to check"
+        return commands
+
+    def test_neither_pass_passes_the_sandbox_flag(self) -> None:
+        for command in self._codex_commands():
+            assert "--sandbox" not in command, (
+                f"{self.WORKFLOW} passes --sandbox on a `codex exec` command line: "
+                f"{command!r}. The flag overrides the staged config.toml and "
+                "suppresses its `default_permissions` profile, so every filesystem "
+                "rule in that file stops being enforced while this argument is "
+                "present -- silently, because the lane still reports a read-only "
+                "sandbox and still produces a verdict"
+            )
+
+    def test_the_staged_config_pins_the_mode_explicitly(self, tmp_path: Path) -> None:
+        config = _fork_gpt_cli_config(tmp_path)
+        assert config.get("sandbox_mode") == "read-only", (
+            'the staged config.toml does not pin sandbox_mode = "read-only". With '
+            "no --sandbox argument on the command line, `codex exec` resolves the "
+            "mode from this file, so an absent or widened key hands the model's "
+            "shell more of the runner than reading the diff needs"
+        )
 
 
 class TestForkModelStepsDenyReadingTheEnvironment:

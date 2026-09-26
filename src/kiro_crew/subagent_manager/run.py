@@ -16,6 +16,8 @@ from ..subagent_persistence import (
 from ._component import ManagerComponent
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from ..subagent import (
         _AGENT_NAME_RE,
         _CANCEL_RESUME_PREFIX,
@@ -760,7 +762,13 @@ class RunEventCoordinator(ManagerComponent):
             or any(a.parent_session_key == parent_session_key for a in self._manager.running)
         )
 
-    def _emit_queue_depth_impl(self, parent_session_key: str, batch_id: str = "") -> None:
+    def _emit_queue_depth_impl(
+        self,
+        parent_session_key: str,
+        batch_id: str = "",
+        *,
+        wait: dict[str, Any] | None = None,
+    ) -> None:
         """Emit the current queued depth for *parent_session_key* as a
         ``subagent_queued`` lifecycle event.
 
@@ -770,9 +778,22 @@ class RunEventCoordinator(ManagerComponent):
         This advisory count lets the UI show "N waiting to start" the moment a
         wave is accepted, and stay mounted across the staggered ramp.
 
+        *wait* is the gate's label for WHY the rows wait (``reason`` one of the
+        ``QUEUED_REASON_*`` kinds, plus ``available_gb`` / ``required_gb`` for the
+        memory kinds). The gate passes it on the emit that follows its verdict;
+        it is remembered per parent and rides on every later emit for that
+        parent -- the drain's and the cancel path's re-emits carry no verdict of
+        their own -- until the parent's depth reaches 0, when it is forgotten
+        and the event is once again the bare ``{"queued": 0}``. Absent on an
+        event exactly when nothing was labelled, so a client reading only the
+        count is unaffected and one reading the reason never sees a stale one.
+
         Fire-and-forget: scheduled on the running loop; a no-op in sync/test
         contexts without a loop (the count is advisory UI signal, not state).
         """
+        manager = self._manager
+        if wait is not None:
+            manager._queue_wait[parent_session_key] = dict(wait)
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -783,18 +804,25 @@ class RunEventCoordinator(ManagerComponent):
             parent_session_key=parent_session_key,
             batch_id=batch_id,
         )
-        admission = self._manager._admission
+
+        def _extra(depth: int) -> dict[str, Any]:
+            if depth <= 0:
+                manager._queue_wait.pop(parent_session_key, None)
+                return {"queued": depth}
+            return {"queued": depth, **manager._queue_wait.get(parent_session_key, {})}
+
+        admission = manager._admission
         store = admission.taskq_store()
         if store is None or not type(admission).pump_off_loop:
-            depth = self._manager._queued_depth(parent_session_key)
-            loop.create_task(self._manager._fire_event("subagent_queued", info, {"queued": depth}))
+            depth = manager._queued_depth(parent_session_key)
+            loop.create_task(manager._fire_event("subagent_queued", info, _extra(depth)))
             return
         # The store half of the count (rows outside the window) runs on the
         # writer thread; the window half and the emit stay on the loop.
         from kiro_crew.taskq import KIND_SUBAGENT
 
         in_window = sum(
-            1 for q in self._manager._queue if q.get("parent_session_key", "") == parent_session_key
+            1 for q in manager._queue if q.get("parent_session_key", "") == parent_session_key
         )
         exclude_ids = admission.taskq_excluded_ids()
         live_store = store
@@ -809,9 +837,7 @@ class RunEventCoordinator(ManagerComponent):
                 )
             except Exception:
                 overflow = 0
-            await self._manager._fire_event(
-                "subagent_queued", info, {"queued": in_window + int(overflow)}
-            )
+            await manager._fire_event("subagent_queued", info, _extra(in_window + int(overflow)))
 
         loop.create_task(_emit())
 
@@ -1253,6 +1279,8 @@ class RunEventCoordinator(ManagerComponent):
                     session_key,
                     agent=agent or None,
                     approval_policy=parent_policy,
+                    on_gate_acquired=self._manager._gate_exit_reset(info),
+                    on_gate_queued=self._manager._gate_wait_mark(info),
                     **extra_kwargs,
                 )
                 is_cc = self._manager._is_cc_provider(client)
@@ -1261,10 +1289,17 @@ class RunEventCoordinator(ManagerComponent):
                 _resumed = False
                 is_cc = False
         else:
+            # The dedicated process's ``session/new`` runs under the same
+            # ``SessionStartGate`` as a shared session's; hand it the same
+            # gate clock callbacks (``_gate_wait_mark`` at entry,
+            # ``_gate_exit_reset`` at exit), threaded through the provider
+            # factory to ``AcpProvider``.
             client, is_new, _resumed = await self._manager._sessions.get_or_create(
                 session_key,
                 agent=agent or None,
                 approval_policy=parent_policy,
+                on_gate_acquired=self._manager._gate_exit_reset(info),
+                on_gate_queued=self._manager._gate_wait_mark(info),
                 **extra_kwargs,
             )
             is_cc = self._manager._is_cc_provider(client)
@@ -1500,6 +1535,9 @@ class RunEventCoordinator(ManagerComponent):
             pid = self._manager._sessions.get_pid(session_key)
             if pid:
                 info._pid = pid  # make available for _write_tombstone
+                # Out of startup: a queued spawn held by the in-startup bound
+                # may start now (``_note_startup_progress``).
+                self._manager._note_startup_progress(info)
                 await self._manager._write_state_off_loop(
                     info, "PID record", pid=pid, pid_recorded_at=time.time()
                 )
@@ -1778,6 +1816,12 @@ class RunEventCoordinator(ManagerComponent):
         # Includes transient-retry backoff, which is real wall time the caller
         # waited for this turn.
         info._first_stream_started = time.time()
+        # The last way out of startup that is not a PID (a provider may create
+        # its child lazily from ``stream()``, so a run can reach here with
+        # ``_pid`` still None): wake a spawn the in-startup bound is holding.
+        # Only the FIRST turn's stream is a transition; this line runs per turn.
+        if info.turns == 0:
+            self._manager._note_startup_progress(info)
         _turn_t0 = time.monotonic()
         async for event in _stream_with_transient_retry():
             # Refresh the activity clock for every event kind that BELONGS to
@@ -2978,6 +3022,66 @@ class RunEventCoordinator(ManagerComponent):
             return False
         return self._manager._sessions.is_session_sharing_eligible(info.parent_session_key)
 
+    def _gate_exit_reset_impl(self, info: SubagentInfo) -> "Callable[[float], None]":
+        """The ``on_gate_acquired`` callback for *info*'s ``session/new``.
+
+        Gate EXIT is the start of this run's start budget: the startup watchdog
+        (``_exec_started``) and the stall clock must not count the time spent
+        queued behind other ``session/new`` requests at the ``SessionStartGate``
+        -- that wait is admission's cost, not this start's. ONE definition for
+        both start paths: ``_create_shared_session`` hands it to the parent
+        runtime's ``create_session`` directly, and ``_run_inner`` threads it
+        through ``get_or_create`` -> provider factory -> ``AcpProvider`` to the
+        dedicated process's own ``create_session``. Without the reset on the
+        dedicated path -- every ``model`` / ``reasoning_effort`` spawn -- a wide
+        fan-out's gate queue time would be charged to the fixed startup deadline
+        and healthy starts reaped as failed. The reset fires only once the
+        permit is HELD; its companion :meth:`_gate_wait_mark_impl` marks gate
+        ENTRY, and between the two the watchdog reads the clock as frozen. So a
+        start wedged before the gate keeps its original, running clock and is
+        caught; one queued at the gate is not charged for the queue; and one
+        wedged after the permit is caught at the base deadline from gate exit.
+        """
+
+        def _on_gate_acquired(queue_wait_ms: float) -> None:
+            now = time.time()
+            info._exec_started = now
+            info._gate_wait_started = None
+            info.last_activity = now
+            info._start_queue_wait_ms = float(queue_wait_ms)
+            if queue_wait_ms > 0:
+                logger.info(
+                    "Subagent %s: session-start gate held %.0fms; start clock reset",
+                    info.id,
+                    queue_wait_ms,
+                )
+
+        return _on_gate_acquired
+
+    def _gate_wait_mark_impl(self, info: SubagentInfo) -> "Callable[[], None]":
+        """The ``on_gate_queued`` callback for *info*'s ``session/new``.
+
+        Fires immediately before the wait for a ``SessionStartGate`` permit
+        begins. It stamps ``_gate_wait_started``, and while that is set the
+        startup watchdog (:meth:`_is_startup_stalled`) reads the start clock as
+        frozen at that moment: a run queued for a permit is not starting, and
+        the queue's length is set by the starts ahead of it, not by anything
+        this run does. Without the freeze a waiter's clock keeps running through
+        the whole queue while the holders ahead of it have theirs reset at
+        acquisition, so the last waiter in a round can be reaped as it is about
+        to be served with nothing wrong. Same ONE definition for both start
+        paths as :meth:`_gate_exit_reset_impl`, which clears the mark at
+        acquisition. The wait is finite: every permit holder is itself on a
+        running clock from acquisition and is reaped at the base deadline if its
+        ``session/new`` has not returned, the request has its own budget, and
+        the gate keeps a headroom of permits no late-start collector may hold.
+        """
+
+        def _on_gate_queued() -> None:
+            info._gate_wait_started = time.time()
+
+        return _on_gate_queued
+
     async def _create_shared_session_impl(
         self,
         info: SubagentInfo,
@@ -3002,21 +3106,11 @@ class RunEventCoordinator(ManagerComponent):
         shared_runtime: AcpRuntime = runtime
 
         cwd = info.cwd or str(getattr(self._manager._sessions, "_pool_cwd", ""))
-
-        def _on_gate_acquired(queue_wait_ms: float) -> None:
-            # Gate EXIT is the start of this run's start budget: the startup
-            # watchdog (``_exec_started``) and the stall clock must not count
-            # the time spent queued behind other session/new requests.
-            now = time.time()
-            info._exec_started = now
-            info.last_activity = now
-            info._start_queue_wait_ms = float(queue_wait_ms)
-            if queue_wait_ms > 0:
-                logger.info(
-                    "Subagent %s: session-start gate held %.0fms; start clock reset",
-                    info.id,
-                    queue_wait_ms,
-                )
+        # The clock freezes at gate ENTRY (``_gate_wait_mark``) and restarts at
+        # gate EXIT (``_gate_exit_reset``); the dedicated-process path in
+        # ``_run_inner`` installs the same pair.
+        _on_gate_acquired = self._manager._gate_exit_reset(info)
+        _on_gate_queued = self._manager._gate_wait_mark(info)
 
         async def _late_adopter(handle: Any) -> bool:
             # A late session/new answer arrived. Keep the session only when this
@@ -3047,6 +3141,7 @@ class RunEventCoordinator(ManagerComponent):
             session_key=session_key,
             memory_mode=info.memory_mode,
             on_gate_acquired=_on_gate_acquired,
+            on_gate_queued=_on_gate_queued,
             late_adopter=_late_adopter,
         )
         return await self._manager._bind_shared_handle(info, session_key, runtime, handle)
@@ -3185,6 +3280,9 @@ class RunEventCoordinator(ManagerComponent):
             )
         if runtime.pid:
             info._pid = runtime.pid
+            # Out of startup (see the dedicated-process PID record in
+            # ``_run_inner``): wake a spawn the in-startup bound is holding.
+            self._manager._note_startup_progress(info)
             try:
                 # Keep the shared handle alive on a storage error, but route the
                 # write through the run-owned off-loop drain so cancellation

@@ -4149,7 +4149,7 @@ _AUDIT_ONLY_READ_IDS: dict[str, str] = {
     "kiro_prerequisite.identity_fingerprint": ".local/share/kiro-cli/data.sqlite3",
     # Same store, read read-only by
     # ``kiro_crew.apps.builtins.aws_control.backend.backup._export_cli_conversations``
-    # to copy ONLY the terminal conversation allowlist (``conversations_v2``) into
+    # to copy ONLY the terminal conversation allowlist (its chat tables) into
     # the off-host sessions archive. No token row is read and no credential value
     # leaves the function -- the export writes a fresh database of the allowlisted
     # tables alone -- but the file holds live bearer tokens whatever this reader
@@ -4725,11 +4725,15 @@ def _audit_governance_hook_decision(
 
 
 async def run_script_hook(
-    hook: ScriptHook, context: str = "", hook_event: dict | None = None
+    hook: ScriptHook,
+    context: str = "",
+    hook_event: dict | None = None,
+    cwd: str | None = None,
 ) -> ScriptHookResult:
     """Execute a script hook's command with timeout.
 
-    Passes hook event as JSON via STDIN (Kiro CLI compatible).
+    Passes hook event as JSON via STDIN (Kiro CLI compatible). ``cwd`` is the
+    directory the command runs in; ``None`` keeps the gateway's own.
     """
     start = time.monotonic()
     # Governance: the ``capabilities.script_hooks`` gate (default OFF) may forbid
@@ -4739,7 +4743,9 @@ async def run_script_hook(
     sk = ""
     if hook_event:
         sk = str(hook_event.get("parent_session_key") or hook_event.get("session_key") or "")
-    gov_denied = _script_hooks_capability_denied(sk)
+    # Offloaded: resolving the governance scope can walk the profile store, which
+    # must not run on the gateway's shared event loop.
+    gov_denied = await asyncio.to_thread(_script_hooks_capability_denied, sk)
     if gov_denied:
         hook.last_run = time.time()
         hook.last_status = "blocked"
@@ -4761,6 +4767,7 @@ async def run_script_hook(
         hook_event = {"hook_event_name": hook.event, "cwd": os.getcwd()}
     stdin_data = json.dumps(hook_event).encode()
 
+    proc: Any = None
     try:
         # circular import: sandbox → registry → apps → hooks, so import at call time
         from kiro_crew.sandbox import (
@@ -4820,6 +4827,7 @@ async def run_script_hook(
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
+                cwd=cwd,
                 creationflags=platform_compat.CREATE_NEW_PROCESS_GROUP,
             )
         else:
@@ -4829,6 +4837,7 @@ async def run_script_hook(
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
+                cwd=cwd,
                 start_new_session=platform_compat.IS_POSIX,
                 creationflags=platform_compat.CREATE_NEW_PROCESS_GROUP,
             )
@@ -4895,6 +4904,15 @@ async def run_script_hook(
             exit_code=exit_code,
             duration_ms=elapsed,
         )
+    except asyncio.CancelledError:
+        # A cancelled caller (a torn-down session, a cancelled turn) must not leave
+        # the hook running: kill its tree, then let the cancellation propagate.
+        if proc is not None and proc.returncode is None:
+            try:
+                await platform_compat.kill_process_tree_async(proc.pid, platform_compat.SIGKILL)
+            except Exception:
+                logger.debug("hook tree kill on cancel failed", exc_info=True)
+        raise
     except asyncio.TimeoutError:
         # Kill the whole process tree (shell + grandchildren) to prevent orphans.
         # platform_compat: killpg on POSIX, taskkill /T on Windows (os.killpg /
@@ -5252,8 +5270,17 @@ class ScriptHookStore:
         parent_session_key: str | None = None,
         agent_role: str | None = None,
         hook_continuation_count: int = 0,
+        extra_hooks: Sequence[ScriptHook] = (),
+        extra_hooks_cwd: str | None = None,
     ) -> list[ScriptHookResult]:
         """Fire all enabled hooks matching the given event. Returns results.
+
+        ``extra_hooks`` run after the stored ones, through the same matcher, gate
+        and spawn, and are never persisted: they belong to the caller (an agent
+        spec's own ``hooks`` on a backend that cannot run them, see
+        :mod:`kiro_crew.agent_sdk.spec_hooks`), not to this store. They run in
+        ``extra_hooks_cwd`` -- the session's workspace, where the harness that
+        would otherwise run them runs them -- and their payload's ``cwd`` says so.
 
         For PreToolUse/PostToolUse, matcher filters by tool name.
         For AgentSpawn/UserPromptSubmit/Stop, all hooks for that event fire.
@@ -5303,7 +5330,8 @@ class ScriptHookStore:
         if agent_role:
             hook_event["agent_role"] = agent_role
 
-        for hook in list(self._hooks.values()):
+        extra_ids = {id(h) for h in extra_hooks}
+        for hook in [*self._hooks.values(), *extra_hooks]:
             if not hook.enabled or hook.event != event:
                 continue
             # Matcher filtering: for tool hooks, match tool name; for others, match context
@@ -5335,7 +5363,9 @@ class ScriptHookStore:
                 # gate as command hooks — a disabled capabilities.script_hooks
                 # must not be bypassable by omitting the command field.
                 sk = parent_session_key or ""
-                gov_denied = _script_hooks_capability_denied(sk)
+                # Off the loop, as in run_script_hook: the scope lookup can walk
+                # the governance profile store.
+                gov_denied = await asyncio.to_thread(_script_hooks_capability_denied, sk)
                 if gov_denied:
                     hook.last_run = time.time()
                     hook.last_status = "blocked"
@@ -5379,7 +5409,12 @@ class ScriptHookStore:
                     len(hook.skills),
                 )
                 continue
-            result = await run_script_hook(hook, context, hook_event)
+            if id(hook) in extra_ids and extra_hooks_cwd:
+                result = await run_script_hook(
+                    hook, context, {**hook_event, "cwd": extra_hooks_cwd}, cwd=extra_hooks_cwd
+                )
+            else:
+                result = await run_script_hook(hook, context, hook_event)
             results.append(result)
             logger.info(
                 "Hook %s (%s): %s in %dms (exit=%d)",

@@ -27,6 +27,7 @@ import logging
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
 from kiro_crew.config import live
@@ -47,6 +48,8 @@ from kiro_crew.discord.commands import (
     unknown_command_usage,
 )
 from kiro_crew.discord.renderer import (
+    _STYLE_DANGER,
+    _STYLE_SUCCESS,
     DiscordApprovalDecider,
     DiscordRenderer,
     build_model_components,
@@ -78,17 +81,24 @@ from kiro_crew.messaging.dispatch import (
     consume_reinjection,
     delivery_is_muted,
     driver_turn_landed,
+    open_turn_crew_log,
+    predecessor_sid,
     rearm_reinjection,
+    requested_model_sid,
+    slot_workspace,
 )
+from kiro_crew.messaging.display_safety import redact_for_display
 from kiro_crew.messaging.driver import APPROVAL_INTERACTIVE, TurnDriver
 from kiro_crew.messaging.identity import channel_inbound_permitted, publish_turn_identity
 from kiro_crew.messaging.inbound_spool import InboundRoute, spool_refused_turn
 from kiro_crew.messaging.link import (
+    CHAT_TYPE_DIRECT,
     DM_SCOPE_UNIFIED,
     ChannelLink,
     bind_origin_mirror,
     build_dm_session_key,
     channel_namespace_of,
+    parse_session_key,
     rebind_conversation_location,
     release_conversation_location,
     seed_generation,
@@ -173,6 +183,16 @@ _ORIGIN_PREFIX = "discord_"
 #: it under is defined in that module, not here: a per-module copy of the string fails
 #: silently, making this channel's entries unowned to every drain.
 _CHANNEL = "discord"
+
+#: This channel's own ``chat_type`` spelling, for the routes it mints session keys
+#: under (``build_dm_session_key``): a guild thread is a group route. The direct
+#: route's spelling is :data:`kiro_crew.messaging.link.CHAT_TYPE_DIRECT`, imported
+#: above rather than restated, because ``build_dm_session_key`` defaults to it and
+#: the unified-scope collapse compares against it. ONE definition, because the
+#: spawn-approval reverse lookup (``_spawn_chat_target``) has to recognise the very
+#: spelling ``_session_key`` wrote -- a second copy of either string would read as
+#: an unaddressable key and silently send the prompt somewhere else, or nowhere.
+_CHAT_TYPE_THREAD = "group"
 
 #: Origin fields that are NOT part of "who sent this, and where does the reply go",
 #: so they are excluded from :attr:`_QueuedOrigin.sender_key`. Empty today: every
@@ -815,6 +835,24 @@ class DiscordDispatcher:
                 logger.exception("Discord monitor session claim failed")
                 return MonitorDispatchResult.UNAVAILABLE
             _acquired = True
+            # Own session by construction (resumed keys were rejected above). Opened
+            # HERE, at the allocation and before any further await -- see the
+            # regular site below for why the moment matters. The predecessor is
+            # the allocation boundary's own capture, consumed after the claim; the
+            # workspace is the dashboard slot's, the source a tab on this
+            # conversation states it from.
+            open_turn_crew_log(
+                provider,
+                session_key=session_key,
+                agent=agent,
+                resumed=resumed,
+                ctx_builder=self.ctx_builder,
+                previous_sid=predecessor_sid(self.sessions, session_key),
+                model_requested=requested_model_sid(self.sessions, session_key),
+                workspace=slot_workspace(
+                    getattr(self._session_resume, "dashboard_state", None), session_key
+                ),
+            )
         elif resumed_key is not None:
             # A resumed session must run as ITSELF, not as Discord's agent. On a
             # cold start get_or_create applies the agent we pass, so handing it
@@ -938,6 +976,43 @@ class DiscordDispatcher:
                     model=self._model_pref.get(scope_id) or None,
                 )
                 _acquired = True
+                if resumed_key is None or channel_namespace_of(session_key):
+                    # The session's crew log, opened the moment the allocation
+                    # lands and before ANY further await: the work ledger appends
+                    # every write to the acting session's log and rolls back one it
+                    # cannot record, so a DM admitted as a conductor needs its log
+                    # to exist before its first ledger call -- and a turn that bails
+                    # between the allocation and a later opener (a failed
+                    # attachment fetch, a renderer error) would leave a live session
+                    # whose log is first created on the NEXT turn, by then a warm
+                    # reuse, so the previous edge would never be written. The
+                    # predecessor is the allocation boundary's own capture, taken
+                    # inside its critical section and consumed here after the
+                    # claim -- no read of the mapping around the call, which a
+                    # concurrent turn's allocate-and-recycle could stale while this
+                    # turn waited inside the allocation. Every CHANNEL session this
+                    # dispatcher runs is opened here, including a same-DM native
+                    # history picked through ``!sessions`` (``resumed_key`` naming a
+                    # channel key): no dashboard runner ever handles its turns, so
+                    # this is its only opener. Only a resumed DASHBOARD session is
+                    # left alone -- its opener is the dashboard's, which alone holds
+                    # its lineage. The workspace is read off the dashboard slot this
+                    # conversation is surfaced under, the source a tab on it states
+                    # the same fact from, so the two writers of this log agree.
+                    # Never raises, never suspends.
+                    open_turn_crew_log(
+                        provider,
+                        session_key=session_key,
+                        agent=agent,
+                        resumed=resumed,
+                        ctx_builder=self.ctx_builder,
+                        previous_sid=predecessor_sid(self.sessions, session_key),
+                        model_requested=requested_model_sid(self.sessions, session_key),
+                        workspace=slot_workspace(
+                            getattr(self._session_resume, "dashboard_state", None),
+                            session_key,
+                        ),
+                    )
             assert provider is not None
             renderer.authorize_upload_root(provider.cwd)
             # The turn footer's context chip reads usage off the session provider,
@@ -1753,6 +1828,14 @@ class DiscordDispatcher:
         # Auth first (deny-by-default short-circuit).
         if not self._authorized(itx.user_id):
             return
+        if not itx.guild_id:
+            # A DM interaction names its peer, and every callback below answers
+            # that SAME channel without ever opening it, so this is where the
+            # pairing can be learned for the interaction direction. Recorded
+            # before any callback is issued, because the mid-send re-check runs
+            # inside the first one; and on the authorized path only, so a denied
+            # presser cannot plant a pairing. Mirrors transport.receive().
+            self.client.remember_dm_recipient(itx.channel_id, itx.user_id)
         # Guild interactions are accepted only in an allow-listed channel that
         # Discord confirms is a thread. This mirrors transport.receive().
         thread_id = itx.channel_id if itx.guild_id else ""
@@ -1769,6 +1852,13 @@ class DiscordDispatcher:
             # wider disclosure boundary than the thread allow-list grants and
             # turns are deliberately never run in one.
             if itx.is_command:
+                # No destination, deliberately: this notice exists BECAUSE the
+                # channel is not on the roster, so passing it would have the
+                # re-check refuse the explanation for the very reason it is being
+                # given, and the presser would see Discord's red "did not respond"
+                # instead. It is ephemeral -- visible to the presser alone, never
+                # posted into the channel -- so it discloses nothing the ceiling
+                # governs.
                 await self.client.respond_interaction(
                     itx.interaction_id,
                     itx.interaction_token,
@@ -1792,6 +1882,11 @@ class DiscordDispatcher:
                 # Named, not silent, for the same reason as the guild refusal
                 # above. The wording stays generic: the governance profile is the
                 # operator's ceiling and its contents are not the user's to read.
+                # No destination, for the same reason as well, and more sharply: the
+                # outbound ceiling reads the SAME `channels` allowlist that just
+                # denied this command, so a re-check would refuse the notice in
+                # exactly the case it is written for. Ephemeral, so nothing the
+                # ceiling governs is disclosed.
                 await self.client.respond_interaction(
                     itx.interaction_id,
                     itx.interaction_token,
@@ -1806,7 +1901,9 @@ class DiscordDispatcher:
         # the governance check below does off-loop profile-store I/O that can, on a
         # slow FS, exceed Discord's ~3s interaction-ack deadline. Acking is a no-op
         # UI dismissal; it does NOT resolve the approval or start a turn.
-        await self.client.ack_component_interaction(itx.interaction_id, itx.interaction_token)
+        await self.client.ack_component_interaction(
+            itx.interaction_id, itx.interaction_token, destination=itx.channel_id
+        )
 
         data = itx.custom_id or ""
 
@@ -1821,9 +1918,31 @@ class DiscordDispatcher:
         # kiro-cli approval until timeout, ~300s). Approve presses and [OPTIONS:]
         # turns stay blocked.
         _is_reject_press = data.startswith("a:") and data.rpartition(":")[2] == "0"
-        if not _is_reject_press and not await channel_inbound_permitted("discord"):
-            logger.info("discord interaction dropped: denied by channels governance policy")
-            return
+        if not _is_reject_press:
+            # The rosters are read ONCE before the ack, and the ack itself serves the
+            # REST ladder's waits while the governance read is deliberately off-loop,
+            # so authorization can be withdrawn across that window. Re-read the same
+            # things the pre-ack gate established before anything resolves: without
+            # this a stale Approve press executes the governed tool after the operator
+            # has already withdrawn it. The channel TYPE is immutable and so is not
+            # re-resolved -- only membership moves.
+            #
+            # ORDER: the governance ceiling first, the rosters LAST. The ceiling read
+            # is an `await` doing profile-store I/O, so a roster reading taken before
+            # it describes a state that can have changed by the time anything
+            # resolves; reading the rosters last makes them the final word, which is
+            # the same contract the client's own mid-send predicate states.
+            if not await channel_inbound_permitted("discord"):
+                logger.info("discord interaction dropped: denied by channels governance policy")
+                return
+            if not self._authorized(itx.user_id) or (
+                itx.guild_id and thread_id not in self._allowed_threads
+            ):
+                logger.info(
+                    "discord interaction dropped: authorization withdrawn during the "
+                    "acknowledgement"
+                )
+                return
 
         # Session picker: "s:<nonce>:<index>". The controller binds the nonce
         # to the owner, channel, message, TTL, and exact server-side choice list.
@@ -1860,6 +1979,43 @@ class DiscordDispatcher:
                 # No pending decision — already timed out (deny-by-default) or
                 # answered. Don't imply the press took effect.
                 verdict = "⌛ This approval already expired."
+            # The confirmation is an outbound write, and a reject press reaches here
+            # without the re-read above: resolving a denial is what a withdrawal
+            # wants, but writing into the channel afterwards is not. The edit may
+            # also serve no wait, in which case the ladder's own re-check never runs
+            # and nothing else judges it. So both authorities are read once more.
+            #
+            # A channel the ceiling refuses gets NO edit at all, whichever
+            # verdict it would have carried. The card is an ordinary channel message,
+            # visible to everyone who can read that channel, and it was posted while
+            # the channel was still permitted; leaving it exactly as the operator last
+            # allowed it writes nothing new, while replacing its text names a tool and
+            # its outcome into a channel the ceiling now refuses as a destination.
+            # The pending approval is resolved before this point, so a withheld edit
+            # costs the presser a confirmation and never the decision.
+            #
+            # ORDER: the ceiling first, the rosters LAST -- the ceiling read is an
+            # `await`, so a roster reading taken before it can be stale by the time the
+            # edit is issued, which is the same contract the client's own mid-send
+            # predicate states. Read here even on the arm that already read it above,
+            # rather than carrying that answer forward: a value taken before a
+            # suspension is exactly the defect this change exists to close, and on an
+            # ungoverned install the read permits without writing a row, so the second
+            # reading costs a row only where an operator asked for the audit trail.
+            if not await channel_inbound_permitted("discord"):
+                logger.info(
+                    "discord approval confirmation withheld: denied by channels "
+                    "governance policy"
+                )
+                return
+            if not self._authorized(itx.user_id) or (
+                itx.guild_id and thread_id not in self._allowed_threads
+            ):
+                logger.info(
+                    "discord approval confirmation withheld: authorization withdrawn "
+                    "before the verdict could be written"
+                )
+                return
             await self.client.edit_message(itx.channel_id, itx.message_id, verdict, components=[])
             return
 
@@ -1979,6 +2135,260 @@ class DiscordDispatcher:
         """The user's CURRENT DM session key (dm_scope + ``!new`` generation)."""
         return self._session_key(user_id)
 
+    # ── Spawn-approval channel delivery ────────────────────────────────────
+
+    async def deliver_spawn_approval(
+        self, request_id: str, description: str, parent_session_key: str
+    ) -> bool | None:
+        """Post a spawn-approval prompt to the ORIGINATING Discord conversation.
+
+        Registered into the channel-neutral
+        :mod:`~kiro_crew.messaging.spawn_approval_delivery` seam so the single
+        host spawn gate can reach the same Approve/Deny buttons the main-agent
+        tool ladder already uses here. Returns the user's decision
+        (``True``/``False``), or ``None`` to tell the gate "not surfaced here,
+        fall through to Slack/dashboard": for a key this dispatcher cannot turn
+        back into a conversation (a ``unified`` dm_scope drops the peer, a
+        non-``discord`` key, an unparseable one), when the client is not up, when
+        the channels governance profile denies this channel, when the
+        destination's authorization has since been withdrawn, or when the post
+        fails.
+
+        The wait is the SAME deny-by-default one a tool prompt uses
+        (:class:`DiscordApprovalDecider`, ``APPROVAL_TIMEOUT_S``): the press
+        resolves through the ``on_interaction`` ``a:`` branch exactly as a tool
+        approval does, so a spawn id (``spawn:<agent_id>``) cannot collide with an
+        opaque tool id in a registry keyed by ``session_key:request_id``.
+
+        The prompt is armed under ``parent_session_key`` VERBATIM (its ``:genN``
+        suffix included), while a press recomputes the key from the LIVE
+        conversation (``_inbound_session_key``). Anything that moves that key
+        between the spawn and the press — a generation rotation from ``!new``, an
+        idle or daily reset, or a resumed session taking the channel over — means
+        the recomputed key does not match the armed one, the press resolves
+        nothing, and the prompt deny-by-defaults at its timeout (the user sees
+        "already expired"). This mirrors how a mid-run tool prompt behaves across a
+        rotation. An elapsed wait is a DENY and NOT a fall-through: the prompt WAS
+        surfaced, so ``False`` is a real decision and the gate refuses the spawn on
+        it rather than re-offering it on Slack/dashboard.
+        """
+        client = self.client
+        if client is None:
+            return None
+        target = self._spawn_chat_target(parent_session_key)
+        if target is None:
+            # A key this channel does not own or cannot address (unified DM
+            # bucket, non-discord key, malformed). Let the gate fall through.
+            return None
+        channel_id, thread_id, user_id, session_key = target
+        if not channel_id:
+            # A direct route names its PEER, not a channel, so the DM channel has
+            # to be opened before anything can be posted into it. Resolved here,
+            # ahead of the authorization check below, so that check has no
+            # suspension point between it and the send it guards.
+            try:
+                channel_id = await client.create_dm_channel(user_id)
+            except Exception:
+                logger.warning(
+                    "Discord: could not open a DM channel for the spawn-approval prompt for %s",
+                    request_id,
+                    exc_info=True,
+                )
+                return None
+            # The seam reads the operator's ceiling once, before it invokes any
+            # hook, which is the authority for entering here at all. This open is
+            # a full round trip INSIDE the hook, so the seam's answer can go stale
+            # across it and the seam cannot see that happen. Re-read on this route
+            # only: everything from here to the send is synchronous, which makes
+            # this the latest point a read can speak for, and a thread route
+            # arrives with its channel already resolved and never suspends.
+            if not await self._spawn_prompt_channel_permitted(request_id):
+                return None
+        if not channel_id:
+            return None
+
+        rid = str(request_id)
+        key = DiscordApprovalDecider.key(session_key, rid)
+        # Detached: the gate awaits this in its own task and the agent is told to
+        # end its turn, so the arming turn's sweep must not close the window while
+        # the user is still looking at the prompt.
+        nonce = DiscordApprovalDecider.register_nonce(key, detached=True)
+        components = [
+            {
+                "type": 1,
+                "components": [
+                    {
+                        "type": 2,
+                        "style": _STYLE_SUCCESS,
+                        "label": "✅ Approve",
+                        "custom_id": f"a:{rid}:{nonce}:1",
+                    },
+                    {
+                        "type": 2,
+                        "style": _STYLE_DANGER,
+                        "label": "🚫 Deny",
+                        "custom_id": f"a:{rid}:{nonce}:0",
+                    },
+                ],
+            }
+        ]
+        # ``description`` is the gate's own ``spawn_run(<task-preview>)`` string.
+        # The upstream credential pass scans the literal text, so a secret split by
+        # zero-width format characters survives it and Discord reassembles it on
+        # display: clear the preview in display form over both outbound redactors,
+        # the same pass embed alt text and renderer-borne text go through. It is
+        # synchronous, so it adds no suspension point between the destination check
+        # below and the send. Two markdown concerns ride along, because Discord
+        # renders the message as markdown and the task text is agent-authored:
+        # collapse whitespace so a multi-line preview stays one block, and drop
+        # backticks so the preview cannot close the fence it sits in and style the
+        # rest of the message.
+        detail, _ = redact_for_display(
+            " ".join((description or "spawn_run").split()).replace("`", "'"),
+            lambda s: redact_credentials(redact_exfiltration_urls(s)[0])[0],
+        )
+        if not self._spawn_prompt_destination_permitted(channel_id, thread_id, user_id):
+            # Authorization for this destination was withdrawn between the turn that
+            # asked for the spawn and this delivery. Retire the armed nonce and fall
+            # through, so the spawn is still answerable on Slack/dashboard.
+            DiscordApprovalDecider.retire(key)
+            logger.info(
+                "Discord: not posting the spawn-approval prompt for %s; the "
+                "originating conversation is not an authorized destination",
+                rid,
+            )
+            return None
+        try:
+            posted = await client.send_message(
+                channel_id,
+                f"🔐 Approve sub-agent spawn?\n```\n{detail}\n```",
+                components=components,
+            )
+        except Exception:
+            # Could not surface it: retire the armed nonce and fall through so the
+            # spawn can still be answered on Slack/dashboard rather than denied by a
+            # timeout nobody could see.
+            DiscordApprovalDecider.retire(key)
+            logger.warning(
+                "Discord: failed to post the spawn-approval prompt for %s",
+                rid,
+                exc_info=True,
+            )
+            return None
+        if not posted:
+            # This client reports a failed send by RETURNING no message id rather
+            # than by raising (a revoked token, a dead network, a channel it cannot
+            # write to), so the ``except`` above does not cover it. Same conclusion:
+            # nothing was surfaced, so fall through instead of waiting out the
+            # decision window on a prompt nobody can see and calling that a denial.
+            DiscordApprovalDecider.retire(key)
+            logger.warning(
+                "Discord: the spawn-approval prompt for %s was not accepted by the "
+                "channel; falling through",
+                rid,
+            )
+            return None
+
+        decider = DiscordApprovalDecider(session_key=session_key)
+        return bool(await decider(SimpleNamespace(request_id=rid)))
+
+    async def _spawn_prompt_channel_permitted(self, request_id: str) -> bool:
+        """Is the operator's channels ceiling open for this channel RIGHT NOW?
+
+        The delivery seam reads this once before it invokes any hook, so entering
+        this dispatcher at all is already gated and this is not that authority
+        again. It answers a narrower question the seam cannot: the peer's DM
+        channel is opened INSIDE the hook, that open is a full round trip, and the
+        ceiling can close across it.
+
+        Closing matters because a denied channel drops the Approve press that
+        would answer a prompt -- only an explicit reject is exempt there -- so a
+        prompt posted under a deny can never be answered, its wait
+        deny-by-defaults at the timeout, and the gate reads that elapsed wait as a
+        decision nobody made. Answering False makes the delivery fall through
+        instead, leaving the spawn answerable on Slack and the dashboard.
+        """
+        if await channel_inbound_permitted("discord"):
+            return True
+        logger.info(
+            "Discord: not posting the spawn-approval prompt for %s; the channel is "
+            "denied by channels governance policy",
+            request_id,
+        )
+        return False
+
+    def _spawn_prompt_destination_permitted(
+        self, channel_id: str, thread_id: str, user_id: str
+    ) -> bool:
+        """May a spawn-approval prompt be posted here RIGHT NOW? Fails closed.
+
+        The gate can hold a spawn for as long as its approval takes, so the
+        authorization that admitted the originating turn is not evidence about this
+        instant: an operator can drop the peer from ``discord.allowed_user_ids``, or
+        a thread from the thread roster, while the prompt is still being prepared.
+        The prompt carries a task preview, so it is a send that must be re-decided
+        against the LIVE rosters rather than the one the turn started under.
+
+        Called SYNCHRONOUSLY with no suspension point between it and the send it
+        gates — an await in between would reopen the window it closes.
+
+        Two authorities, both consulted, neither sufficient alone:
+
+        * this dispatcher's own live rosters, which are exactly the ones a PRESS is
+          judged by in ``on_interaction`` (``_authorized`` for the peer of a direct
+          route; ``_allowed_threads`` for a thread route), so a prompt is never
+          posted where its own button could not be honored;
+        * ``transport.may_send_to``, the transport's revocation-at-egress decision,
+          when a transport is wired. Absent (no transport, as in a unit harness) the
+          rosters above stand alone; a raise is read as a denial.
+        """
+        if thread_id:
+            if thread_id not in self._allowed_threads:
+                return False
+        elif not self._authorized(user_id):
+            return False
+        gate = getattr(self.transport, "may_send_to", None)
+        if gate is None:
+            return True
+        try:
+            # A thread route is recognised by its CONVERSATION id, which for a
+            # Discord thread is the thread's own snowflake; a direct route carries
+            # no usable conversation id for the roster, so it is judged by its
+            # principal. This is the split ``may_send_to`` itself documents.
+            return bool(gate(channel_id, thread_id or None, principal=user_id))
+        except Exception:
+            logger.warning(
+                "Discord: may_send_to raised for the spawn-approval destination; "
+                "treating it as revoked",
+                exc_info=True,
+            )
+            return False
+
+    def _spawn_chat_target(self, parent_session_key: str) -> tuple[str, str, str, str] | None:
+        """``(channel_id, thread_id, user_id, session_key)`` for a Discord spawn parent.
+
+        ``None`` for anything this channel cannot address. Reconstructs the
+        conversation from the parent session key's grammar
+        (``discord:{agent}:{chat_type}:{scope}``): a thread route's scope is the
+        thread's own snowflake, which IS the channel to post into; a direct route's
+        scope is the peer's user id, whose DM channel the caller opens, so
+        ``channel_id`` comes back empty and ``user_id`` carries the peer. A
+        ``unified`` DM bucket (``unified:{agent}``) parses as a non-discord surface
+        and returns ``None`` — it names no single conversation to post into, the
+        same reason the origin mirror declines it. ``session_key`` is returned so
+        the caller arms the decider under the exact key ``on_interaction``
+        recomputes for a press in that conversation.
+        """
+        parsed = parse_session_key(parent_session_key)
+        if parsed is None or parsed.surface != _CHANNEL or len(parsed.scope) != 1:
+            return None
+        scope = parsed.scope[0]
+        if parsed.chat_type == _CHAT_TYPE_THREAD:
+            return scope, scope, "", parent_session_key
+        if parsed.chat_type == CHAT_TYPE_DIRECT:
+            return "", "", scope, parent_session_key
+        return None
+
     # ── Helpers ────────────────────────────────────────────────────────────
 
     def _authorized(self, user_id: str) -> bool:
@@ -2046,7 +2456,7 @@ class DiscordDispatcher:
             thread_id or user_id,
             gen=gen,
             dm_scope=("per-channel-peer" if thread_id else str(self.cfg.messaging.dm_scope)),
-            chat_type=("group" if thread_id else "direct"),
+            chat_type=(_CHAT_TYPE_THREAD if thread_id else CHAT_TYPE_DIRECT),
         )
 
     def _inbound_session_key(
@@ -2066,7 +2476,7 @@ class DiscordDispatcher:
                 self._resolve_agent(),
                 thread_id,
                 dm_scope="per-channel-peer",
-                chat_type="group",
+                chat_type=_CHAT_TYPE_THREAD,
             )
             return self.sessions.max_generation(bucket)
         user_id = scope_id.removeprefix("user:")
@@ -2662,7 +3072,11 @@ class DiscordDispatcher:
         async def _respond(text: str) -> None:
             assert self.client is not None
             await self.client.respond_interaction(
-                itx.interaction_id, itx.interaction_token, text, ephemeral=True
+                itx.interaction_id,
+                itx.interaction_token,
+                text,
+                ephemeral=True,
+                destination=itx.channel_id,
             )
 
         return _respond
@@ -2714,7 +3128,11 @@ class DiscordDispatcher:
             return
         if name == "help":
             await self.client.respond_interaction(
-                itx.interaction_id, itx.interaction_token, build_help_text(), ephemeral=True
+                itx.interaction_id,
+                itx.interaction_token,
+                build_help_text(),
+                ephemeral=True,
+                destination=itx.channel_id,
             )
             return
         if name == "model" and thread_id:
@@ -2732,6 +3150,7 @@ class DiscordDispatcher:
                 "private here. DM me `/model`, or send `!model` if you are happy "
                 "for the list to be visible in this thread.",
                 ephemeral=True,
+                destination=itx.channel_id,
             )
             return
         # Everything else is session-scoped. Acknowledge the interaction first so
@@ -2743,6 +3162,7 @@ class DiscordDispatcher:
             itx.interaction_token,
             f"Running `/{name}`…",
             ephemeral=True,
+            destination=itx.channel_id,
         )
         argument = " ".join(itx.options.values()).strip()
         synthetic = InboundMessage(

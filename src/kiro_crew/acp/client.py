@@ -140,6 +140,7 @@ from kiro_crew.acp.types import (
     EVENT_TOOL_RESULT,
     JSONRPC_METHOD_NOT_FOUND,
     KNOWN_SESSION_UPDATES,
+    MCP_ROSTER_COMPLETE_NOTE,
     METHOD_AGENT_SWITCHED,
     METHOD_CANCEL,
     METHOD_CLEAR_STATUS,
@@ -5664,6 +5665,7 @@ class AcpClient:
         # single progress frame.  Gates the _TOOL_STALL_TIMEOUT watchdog so a
         # dispatched-but-never-resolved tool can't hang the whole turn.
         self._tool_dispatched: bool = False
+        self._active_tool_calls: set[str] = set()
         # Armed by _handle_compaction_status on a `failed` status and cleared at
         # turn start: gates the _COMPACTION_FAILED_TURN_BUDGET check in
         # _prompt_loop. _compaction_failed_turn records that the check fired, so
@@ -10904,14 +10906,21 @@ class AcpClient:
             return ", ".join(head) + suffix
 
         reported = ready | set(failed)
+        # "session-injected", and a note once the roster is complete: the same
+        # wording as AcpRuntime._mcp_init_progress, for the same reason -- a bare
+        # ``N/N MCP server(s) reported`` read as an MCP verdict it never was.
         parts = (
-            [f"{len(reported & set(roster))}/{len(roster)} MCP server(s) reported"]
+            [f"{len(reported & set(roster))}/{len(roster)} session-injected MCP server(s) reported"]
             if roster
             else []
         )
         missing = [name for name in roster if name not in reported]
         if missing:
             parts.append(f"no report from {names(missing)}")
+        elif roster and not set(failed) & set(roster):
+            # Same rule as the runtime: the verdict is withheld when a roster
+            # member reported an init failure, which the ``failed:`` bucket names.
+            parts.append(MCP_ROSTER_COMPLETE_NOTE)
         if failed:
             parts.append(
                 "failed: "
@@ -11646,6 +11655,7 @@ class AcpClient:
         self._permission_options.clear()
         self._stale_eligible = False
         self._tool_dispatched = False
+        self._active_tool_calls.clear()
         got_complete = False
         saw_agent_switch = False
 
@@ -11684,7 +11694,7 @@ class AcpClient:
                             if name:
                                 yield AcpEvent(kind=EVENT_AGENT_SWITCHED, text=name)
                 # Flush any remaining tool results before completing
-                for tr_event in await asyncio.to_thread(self._read_new_tool_results_sync):
+                for tr_event in await self._read_new_tool_results():
                     yield tr_event
                 # An automatic claude compaction never sends its own terminal —
                 # close it out here, BEFORE EVENT_COMPLETE, so a consumer that
@@ -11721,7 +11731,7 @@ class AcpClient:
                     # the filtered inference would otherwise have its result
                     # dropped, or emitted into the NEXT turn.
                     reason, _refusal = self.last_prompt_stats.terminal_refusal("")
-                    for tr_event in await asyncio.to_thread(self._read_new_tool_results_sync):
+                    for tr_event in await self._read_new_tool_results():
                         yield tr_event
                     self._tool_dispatched = False
                     self._last_stop_reason = reason
@@ -11773,12 +11783,12 @@ class AcpClient:
                         _notice_chunk = True
                 if chunk:
                     # Before yielding text, check for tool results from JSONL
-                    for tr_event in await asyncio.to_thread(self._read_new_tool_results_sync):
+                    for tr_event in await self._read_new_tool_results():
                         yield tr_event
                     kind = EVENT_THINKING_CHUNK if is_thinking else EVENT_TEXT_CHUNK
                     if not is_thinking:
                         self.last_prompt_stats.text_chunks += 1
-                        self._stale_eligible = True
+                        self._stale_eligible = not self._active_tool_calls
                         self._prompt_or_tool_seen = True
                     yield AcpEvent(kind=kind, text=chunk, control_notice=_notice_chunk)
                     if not is_thinking and _is_tool_interrupted_marker(chunk):
@@ -11788,7 +11798,7 @@ class AcpClient:
                         # (_emit_tool_interrupted_sel logs + audits the cancellation.)
                         self._emit_tool_interrupted_sel("_dispatch_events")
                         got_complete = True
-                        for tr_event in await asyncio.to_thread(self._read_new_tool_results_sync):
+                        for tr_event in await self._read_new_tool_results():
                             yield tr_event
                         yield AcpEvent(
                             kind=EVENT_COMPLETE,
@@ -11802,6 +11812,7 @@ class AcpClient:
                     # Arm the tool-stall watchdog: if no further data arrives
                     # within _TOOL_STALL_TIMEOUT, _prompt_loop treats the turn
                     # as dead instead of hanging to the full prompt timeout.
+                    self._active_tool_calls.add(tool_event.tool_call_id or "")
                     self._tool_dispatched = True
                     # Record every observed tool_call so PostToolUse can recover
                     # tool_name from _observed_tool_calls (see
@@ -11812,7 +11823,7 @@ class AcpClient:
                             tool_event.tool_kind or "",
                         )
                     # Check for results from previous tool before yielding new tool_call
-                    for tr_event in await asyncio.to_thread(self._read_new_tool_results_sync):
+                    for tr_event in await self._read_new_tool_results():
                         yield tr_event
                     # ACP-layer tool audit for clients with no external audit
                     # loop (e.g. app worker pools). No-op unless audit_source is set.
@@ -11835,11 +11846,10 @@ class AcpClient:
                 await self._tripwire_goose_mode(msg)
                 tool_result_event = self._extract_tool_call_update(msg)
                 if tool_result_event:
-                    # The dispatched tool produced a result — disarm the stall
-                    # watchdog.  (Cleared here, not on every inbound frame, so a
-                    # tool that streams progress then silently stalls is still
-                    # caught.)
-                    self._tool_dispatched = False
+                    if tool_result_event.tool_status in TERMINAL_TOOL_STATUSES:
+                        self._active_tool_calls.discard(tool_result_event.tool_call_id or "")
+                        self._tool_dispatched = bool(self._active_tool_calls)
+                        self._stale_eligible = not self._active_tool_calls
                     # Fire the PostToolUse HOOK ENGINE now that the tool RESULT
                     # (and its output) exists — the Pre-vs-Post split is required
                     # because fire_tool_hooks above is PreToolUse-only. No-op
@@ -13395,6 +13405,7 @@ class AcpClient:
                 )
             # For edit tools with diff content blocks, generate unified diff
             found_diff = False
+            _diff_path = ""
             content_blocks = update.get("content", [])
             if isinstance(content_blocks, list):
                 for cb in content_blocks:
@@ -13404,6 +13415,7 @@ class AcpClient:
                         path = cb.get("path", "")
                         if tool_call_id and path:
                             self._tool_call_diff_path[tool_call_id] = path
+                            _diff_path = path
                         diff_str = _make_unified_diff(old, new, path)
                         if diff_str:
                             input_str = diff_str
@@ -13514,6 +13526,7 @@ class AcpClient:
                 mcp_server_name=identity.mcp_server_name,
                 tool_identity_trusted=identity.tool_identity_trusted,
                 mcp_identity_trusted=identity.identity_trusted,
+                diff_path=_diff_path,
             )
         return None
 
@@ -13676,6 +13689,7 @@ class AcpClient:
             input_str = raw_input
         # Edit-style diff content blocks: prefer the rendered unified diff over
         # the raw input dict (mirrors `_extract_tool_event`).
+        _diff_path = ""
         content_blocks = update.get("content", [])
         if isinstance(content_blocks, list):
             for cb in content_blocks:
@@ -13685,6 +13699,7 @@ class AcpClient:
                     path = cb.get("path", "")
                     if path:
                         self._tool_call_diff_path[tool_use_id] = path
+                        _diff_path = path
                     diff_str = _make_unified_diff(old, new, path)
                     if diff_str:
                         input_str = diff_str
@@ -13747,7 +13762,16 @@ class AcpClient:
             tool_call_id=tool_use_id,
             raw_tool_params=raw_input if isinstance(raw_input, dict) else None,
             is_shell=is_shell,
+            diff_path=_diff_path,
         )
+
+    async def _read_new_tool_results(self) -> list[AcpEvent]:
+        results = await asyncio.to_thread(self._read_new_tool_results_sync)
+        if results:
+            self._active_tool_calls.difference_update(event.tool_call_id or "" for event in results)
+            self._tool_dispatched = bool(self._active_tool_calls)
+            self._stale_eligible = not self._active_tool_calls
+        return results
 
     def _read_new_tool_results_sync(self) -> list[AcpEvent]:
         """Read new ToolResults entries from the kiro-cli session JSONL file."""

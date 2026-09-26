@@ -6332,6 +6332,10 @@
       "artifact": "아티팩트",
       "changed": "변경됨",
       "diff_unavailable_file_exceeds_snapshot_limit": "차이를 표시할 수 없습니다. 파일이 너무 커서 비교할 수 없습니다({{limit}}자 초과).",
+      "file_only": "파일만",
+      "diff_unavailable_turn_snapshot_budget": "이번 턴의 변경이 너무 커서 모든 파일의 차이를 보관하지 못했습니다(합계 {{limit}}자 초과).",
+      "turn_snapshot_budget_open_hint": "파일 이름을 클릭하면 열립니다.",
+      "omitted_files_notice_other": "이번 턴에서 변경된 파일 {{files}}개는 목록에 없습니다.",
       "file_other": "파일 {{count}}개",
       "large_file_change_region_view": "큰 파일 — 음영 띠는 영역을 표시하며 정확한 줄을 뜻하지 않습니다",
       "large_file_simplified_view": "큰 파일 — 간소화된 보기",
@@ -6973,7 +6977,11 @@
       "diagram_source": "다이어그램 소스",
       "copy_failed": "복사 실패",
       "mermaid_render_failed": "이 다이어그램을 렌더링할 수 없습니다. 대신 소스를 표시합니다.",
-      "image_position": "{{total}}개 중 {{index}}번째"
+      "image_position": "{{total}}개 중 {{index}}번째",
+      "copy_chip_name": "{{text}} 복사",
+      "open_path_chip_name": "{{path}} 열기",
+      "browse_path_chip_name": "{{path}} 찾아보기",
+      "switch_to_session_chip_name": "{{label}} 세션으로 전환"
     },
     "markdownToc": {
       "contents": "목차",
@@ -7096,7 +7104,8 @@
       "close_editor": "편집기 닫기",
       "copied": "복사했습니다!",
       "copy": "복사",
-      "edit_code_block": "코드 블록 편집"
+      "edit_code_block": "코드 블록 편집",
+      "not_saved_hint": "채팅에는 저장되지 않습니다. 닫으면 편집 내용이 삭제됩니다."
     },
     "notifications": {
       "notifMeta": {
@@ -8297,7 +8306,15 @@
       "temporary_active_switch_to_persistent": "임시 — 영구 모드로 전환",
       "temporary_desc": "메모리를 사용하지 않고 새로운 학습 내용도 만들지 않습니다. 탭 복구를 위해 대화 기록은 보관합니다.",
       "try_create_a_plan_to_analyze_kirocrew_code_packa": "예시: ‘{{productName}} 코드 패키지를 분석하고 주요 구성 요소별 파일 수를 보고하는 계획을 만드세요’",
-      "what_can_i_do_for_you": "무엇을 도와드릴까요?"
+      "what_can_i_do_for_you": "무엇을 도와드릴까요?",
+      "greeting_what_are_we_building_today": "오늘은 무엇을 만들어 볼까요?",
+      "greeting_where_should_we_start": "어디서부터 시작할까요?",
+      "greeting_whats_on_your_mind": "무슨 생각을 하고 계신가요?",
+      "greeting_ready_when_you_are": "준비되시면 언제든지요.",
+      "greeting_good_to_see_you": "반가워요. 다음은 무엇인가요?",
+      "greeting_good_morning": "좋은 아침이에요. 어디서부터 시작할까요?",
+      "greeting_good_afternoon": "좋은 오후예요. 어디서부터 시작할까요?",
+      "greeting_good_evening": "좋은 저녁이에요. 어디서부터 시작할까요?"
     },
     "widgetFrame": {
       "cannot_star_widget_has_no_slug_or_message_contex": "즐겨찾기할 수 없습니다: 위젯에 slug 또는 메시지 컨텍스트가 없습니다",
@@ -9803,7 +9820,8 @@
         "sign_in": "Kiro에 로그인",
         "sign_in_hint": "설정 → 개요 → Kiro 로그인을 열어 다시 로그인한 후 메시지를 다시 보내세요.",
         "feature_request_form": "기능 요청 양식 열기",
-        "feature_request_form_hint": "이번 달 사용량을 모두 사용했습니다 — 대신 이 양식으로 GitHub에 요청을 제출하세요. 이 양식은 에이전트를 거치지 않습니다. GitHub 이슈 양식이 열리며 직접 작성하므로 이번 달 사용량을 소모하지 않습니다."
+        "feature_request_form_hint": "이번 달 사용량을 모두 사용했습니다 — 대신 이 양식으로 GitHub에 요청을 제출하세요. 이 양식은 에이전트를 거치지 않습니다. GitHub 이슈 양식이 열리며 직접 작성하므로 이번 달 사용량을 소모하지 않습니다.",
+        "session_start_repeat_hint": "에이전트 세션 시작이 연속으로 여러 번 실패했으므로 재개해도 같은 시작만 반복됩니다. 터미널에서 {{command}} 로 gateway를 재시작한 후 메시지를 다시 보내세요."
       },
       "folderPanel": {
         "clear_search": "검색 지우기",
@@ -10051,6 +10069,13 @@
         "stop_failed": "서브에이전트 {{name}}을(를) 중지할 수 없습니다",
         "stop_all_failed": "서브에이전트를 중지할 수 없습니다",
         "retry_failed_error": "실패한 서브에이전트 중 일부를 다시 시도할 수 없습니다"
+      },
+      "subagentQueued": {
+        "adaptive_cap_zero": "시작 대기 중 — 이 컴퓨터의 메모리가 부족하거나 과부하 상태여서 새 시작이 일시 중지되었습니다. 회복되면 자동으로 다시 시작됩니다",
+        "low_memory": "시작 대기 중 — 여유 메모리 {{required}} 필요, 현재 {{available}} 여유. 계속하려면 메모리를 확보하세요",
+        "low_memory_no_figures": "시작 대기 중 — 여유 메모리가 부족합니다. 계속하려면 메모리를 확보하세요",
+        "posture_critical": "시작 대기 중 — 이 컴퓨터의 메모리가 심각하게 부족합니다(여유 {{available}}). 계속하려면 메모리를 확보하세요",
+        "posture_critical_no_figures": "시작 대기 중 — 이 컴퓨터의 메모리가 심각하게 부족합니다. 계속하려면 메모리를 확보하세요"
       },
       "subagentRunCard": {
         "agent_finished_other": "에이전트 {{count}}개 완료",
@@ -10720,7 +10745,6 @@
       "hidden_folders": "숨긴 폴더",
       "hide": "숨기기",
       "hide_folder": "폴더 숨기기",
-      "hide_from_flat_view": "플랫 보기에서 {{name}} 숨기기",
       "hide_when_empty": "비어 있으면 숨기기",
       "hours": "시간",
       "include_untagged_sessions": "태그 없는 세션 포함",
@@ -10804,7 +10828,6 @@
       "show_all_older_sessions": "이전 세션 모두 보기",
       "show_folder": "폴더 표시",
       "show_hidden_folder_other": "숨긴 폴더 {{count}}개 표시",
-      "show_in_flat_view": "플랫 보기에 {{name}} 표시",
       "show_only_sessions_tagged": "{{name}} 태그가 지정된 세션만 표시",
       "show_the_folder_list": "폴더 목록 표시",
       "skip": "건너뛰기",
@@ -10980,6 +11003,7 @@
       "block_semantic_memory": "사용자가 알려준 사실",
       "block_skill_hint": "관련 스킬",
       "block_skill_index": "스킬 인덱스",
+      "block_task_facts": "이 작업을 위해 떠올린 사실",
       "block_unclassified": "분류되지 않음",
       "block_your_message": "사용자 메시지",
       "cat_memory": "나에 대한 기억",
@@ -12232,6 +12256,8 @@
         "confirm_reapply_body": "구성된 모델을 다시 로드하고 저장된 메모리 벡터를 지운 후 재구축합니다."
       },
       "kiroCrewCfgTab": {
+        "agent_for_pool_processes_empty_uses_default_agent": "풀 프로세스용 에이전트. 비워 두면 기본 에이전트를 사용합니다.",
+        "applies_to_sessions_started_after_the_change": "변경 후 시작된 세션에 적용됩니다. ‘auto’는 에이전트를 샌드박스에 넣되 자격 증명 도구는 계속 동작하고, ‘strict’는 클라우드, SSH, kube, 레지스트리 자격 증명도 숨기므로 에이전트 안에서 해당 도구가 동작하지 않습니다. 단, {{productName}} 자체 샌드박스가 프로세스를 가두는 경우에만 적용되며 Windows나 kiro-cli 내부 샌드박스에 위임된 macOS 프로세스에는 적용되지 않습니다. ‘off’는 {{productName}} 샌드박스를 건너뜁니다(macOS에서는 kiro-cli 자체 샌드박스가 켜져 있으면 계속 적용됩니다).",
         "approval_mode": "승인 모드",
         "auto": "자동",
         "auto_size_max": "자동 크기 조정 최대값",
@@ -12247,9 +12273,9 @@
         "embedding_provider": "임베딩 제공자",
         "enable_dynamic_mcp_tool_discovery_via_kiro_cli_t": "kiro-cli를 통한 동적 MCP 도구 검색을 활성화합니다. 다음 세션부터 적용됩니다.",
         "immediate_auto_approves_all_tools_interactive_as": "즉시 적용됩니다. ‘auto’는 모든 도구를 승인하고, ‘interactive’는 도구마다 확인합니다.",
-        "immediate_auto_enables_sandbox_for_untrusted_too": "즉시 적용됩니다. ‘auto’는 신뢰할 수 없는 도구에 샌드박스를 활성화합니다.",
         "inherited_provider": "상속됨 ({{provider}})",
         "kirocrew_agents": "{{productName}} 에이전트",
+        "max_age_for_pooled_processes_0_disables_expiry": "풀링된 프로세스의 최대 수명. 0이면 만료를 비활성화합니다.",
         "max_channel_agents": "최대 채널 에이전트 수",
         "max_channels": "최대 채널 수",
         "max_concurrent_subagents": "최대 동시 서브에이전트 수",
@@ -12265,6 +12291,7 @@
         "next_update_check_cycle": "다음 업데이트 확인 주기.",
         "no_agents_defined": "정의된 에이전트 없음",
         "no_memory_stores": "메모리 저장소 없음",
+        "number_of_pre_spawned_processes_0_disables": "미리 생성할 프로세스 수. 0이면 비활성화됩니다.",
         "pool_agent": "풀 에이전트",
         "pool_size": "풀 크기",
         "pool_ttl": "풀 TTL",
@@ -12281,12 +12308,9 @@
         "using_global_memory_settings": "전역 메모리 설정 사용 중",
         "using_legacy_mode_agent_default_agent_as_agent_t": "레거시 모드 사용 중 — agent.default_agent를 에이전트 템플릿으로 사용",
         "warm_pool": "웜 풀",
-        "workspace": "워크스페이스",
-        "workspaces": "워크스페이스",
-        "number_of_pre_spawned_processes_0_disables": "미리 생성할 프로세스 수. 0이면 비활성화됩니다.",
-        "agent_for_pool_processes_empty_uses_default_agent": "풀 프로세스용 에이전트. 비워 두면 기본 에이전트를 사용합니다.",
         "warm_pool_description": "세션을 즉시 시작할 수 있도록 ACP CLI 프로세스를 미리 실행합니다.",
-        "max_age_for_pooled_processes_0_disables_expiry": "풀링된 프로세스의 최대 수명. 0이면 만료를 비활성화합니다."
+        "workspace": "워크스페이스",
+        "workspaces": "워크스페이스"
       },
       "mcpTab": {
         "actions": "동작",
@@ -12342,6 +12366,21 @@
         "probe_failing_help": "연속 {{failures}}회 프로브 실패. 서버는 그대로 마운트되어 있으며, 이는 상태 표시이지 변경이 아닙니다.",
         "reset_failures": "횟수 초기화",
         "reset_failures_help": "이 서버의 연속 실패 횟수를 지웁니다.",
+        "disabled_in_config": "구성에서 비활성화됨",
+        "disabled_in_config_invalid": "구성 오류",
+        "status_invalid_value": "잘못된 값",
+        "copy_path": "경로 복사",
+        "copy_path_named": "경로 {{file}} 복사",
+        "path_copied": "복사됨",
+        "copy_path_failed": "복사 실패",
+        "disabled_in_config_help": "Kiro IDE도 읽는 공유 Kiro MCP 구성에서 비활성화되었습니다. 시작되지 않으며 이 패널에서 다시 활성화할 수 없습니다. 해당 구성에서 플래그를 변경하세요.",
+        "disabled_in_config_where": "<file>{{file}}</file>에서 비활성화되었습니다. 이 파일을 편집하면 이 비활성화는 해제되지만, 다른 구성이 서버를 계속 꺼 둘 수 있습니다. 스위치는 추가될 예정입니다.",
+        "disabled_in_config_where_unknown": "공유 MCP 구성에서 비활성화되었습니다. 해당 구성을 편집하면 이 비활성화는 해제되지만, 다른 구성이 서버를 계속 꺼 둘 수 있습니다. 스위치는 추가될 예정입니다.",
+        "disabled_in_config_invalid_where": "비활성화됨: <file>{{file}}</file>의 \"disabled\" 값이 잘못되었습니다. 해당 파일에서 true 또는 false로 설정하세요.",
+        "disabled_in_config_invalid_where_unknown": "비활성화됨: 공유 MCP 구성의 \"disabled\" 값이 잘못되었습니다. 해당 구성에서 true 또는 false로 설정하세요.",
+        "uninstall_disabled_in_config_help": "비활성화된 공유 구성을 포함해 모든 MCP 구성에서 이 서버를 제거합니다.",
+        "scope_disabled_in_config": "{{label}}: 꺼짐 (공유 MCP 구성에서 비활성화됨. 거기에서 변경하세요)",
+        "disabled_count_other": "{{count}}개 비활성화됨",
         "sign_in": "로그인",
         "sign_in_authorize": "{{name}} 승인",
         "sign_in_mint_failed": "로그인을 시작할 수 없습니다. 다시 시도하세요.",
@@ -13836,6 +13875,11 @@
         "status_unavailable": "상태를 확인할 수 없음"
       },
       "chatPanel": {
+        "advanced": "고급",
+        "discovery": "알아보기",
+        "rail_label": "채팅 설정",
+        "side_panel": "사이드 패널",
+        "transcript": "대화 내용",
         "about_you": "사용자 정보",
         "answer_only_details_on_request": "답변만 — 가장 쉬운 말로, 자세한 내용은 요청 시",
         "auto_add_documents": "문서 자동 추가",
@@ -13957,7 +14001,6 @@
         "maximum_characters_retained_in_the_completion_ev": "잘라내기 모드를 적용한 뒤 완료 이벤트에 유지되는 최대 문자 수입니다. 0으로 설정하면 잘라내기를 완전히 비활성화합니다. 기본값은 {{n}}.",
         "mcp_apps_in_side_panel": "사이드 패널의 MCP 앱",
         "merge_queued_messages": "대기 중인 메시지 병합",
-        "messages": "메시지",
         "minimal_stats_only_name_on_hover": "최소(통계만, 이름은 마우스 오버 시)",
         "mirror_documents_you_save_as_artifacts_into_the_l": "아티팩트로 저장하는 문서를 라이브러리에 함께 반영하고, 편집할 때 동기화를 유지하며, 아티팩트를 삭제할 때 함께 제거합니다.",
         "mod_enter_for_newline": "{{mod}}+Enter로 줄바꿈",
@@ -13992,7 +14035,6 @@
         "restore_window": "복원 시간 범위",
         "retry": "다시 시도",
         "role_background": "백그라운드",
-        "role_chat": "채팅",
         "role_effort_hint": "추론 가능한 모델에만 적용됩니다. ‘모델 기본값’은 아무것도 재정의하지 않으며, 이 작업은 기본 추론 강도를 상속하지 않습니다.",
         "role_model_auto": "자동(공급자가 선택)",
         "role_model_auto_hint": "‘자동’은 공급자가 선택하며, 기본 모델을 상속하지 않습니다. 이 작업을 특정 모델에서 실행하려면 해당 모델을 고정하세요.",
@@ -14052,7 +14094,6 @@
         "failed_to_start_feature_video_download": "다운로드를 시작할 수 없습니다",
         "minimap_side_left": "왼쪽",
         "minimap_side_right": "오른쪽",
-        "minimap": "미니맵",
         "minimap_location": "미니맵 위치",
         "minimap_location_desc": "오른쪽 가장자리에 있으면 미니맵이 스크롤바를 대체합니다.",
         "message_font_size": "메시지 글꼴 크기",
@@ -14209,6 +14250,11 @@
         "zoom_level": "확대/축소 수준",
         "font_family_option_opendyslexic": "OpenDyslexic",
         "config_load_failed": "저장된 표시 설정을 불러올 수 없습니다. 불러올 때까지 셸, 최근 세션, 명령 자동 완성 설정은 사용할 수 없습니다.",
+        "installed_themes_load_failed": "테마 목록을 불러올 수 없습니다. 자동으로 다시 시도하고 있습니다. 로드될 때까지 설치된 테마를 선택하거나 적용할 수 없습니다.",
+        "installed_themes_refresh_failed": "테마 목록을 새로 고칠 수 없습니다. 목록이 최신 상태가 아닙니다.",
+        "installed_themes_refresh_failed_after_install": "테마는 설치되었지만 테마 목록을 새로 고칠 수 없었습니다. 다시 시도를 눌러 목록을 새로 고치고 적용하거나, 테마 목록이 새로 고쳐지면 목록에서 선택하세요.",
+        "retry_theme_list": "다시 시도",
+        "retrying_theme_list": "다시 시도 중…",
         "recent_tint_save_failed": "최근 세션 강조 개수를 저장할 수 없습니다."
       },
       "importPanel": {
@@ -14700,7 +14746,25 @@
         "file_delivery_destination_help": "즉 파일은 이 컴퓨터의 발신함 폴더에 저장되고 대시보드의 파일 보기에 표시됩니다. 제3자가 볼 수 있는 곳에는 전달되지 않습니다. Slack이나 채팅 채널로는 결코 전송되지 않습니다.",
         "file_delivery_armed_help": "이 컴퓨터에서 한 단계 더: {{productName}}을(를) 실행 중인 컴퓨터의 터미널에서 이 명령을 실행하여 전달 허용을 마치세요. 이는 사람이 컴퓨터 앞에 있음을 확인합니다. 브라우저 세션만으로는 허용할 수 없습니다.",
         "file_delivery_armed_expires": "이 요청은 약 {{duration}} 후에 만료됩니다.",
-        "file_delivery_arm_status_failed": "승인이 진행 중인지 확인할 수 없습니다."
+        "file_delivery_arm_status_failed": "승인이 진행 중인지 확인할 수 없습니다.",
+        "credential_redaction_section": "파일 보기의 자격 증명 마스킹",
+        "credential_redaction_toggle": "대시보드가 열어 주는 파일의 자격 증명 마스킹",
+        "credential_redaction_toggle_help": "끄면 대시보드가 열어 주는 파일(채팅 사이드 패널의 파일 탭, 라이브러리와 아티팩트 미리보기)이 쓰인 그대로, 본인의 대시보드에서만 표시됩니다. 기본값은 켜짐입니다. 이 대시보드의 대화, Slack, 메시징 채널은 계속 마스킹됩니다. 변경하면 열려 있는 파일이 다시 로드되고(저장하지 않은 편집은 유지됨) 파일 비교(diff) 보기는 닫힙니다.",
+        "credential_redaction_off_notice": "여는 파일은 마스킹 없이 표시되고, 채팅과 메시징 채널은 계속 마스킹됩니다.",
+        "credential_redaction_off_since": "{{time}}부터 꺼짐.",
+        "credential_redaction_read_failed": "마스킹 설정을 읽을 수 없습니다. 여기에 아무것도 표시되지 않는 것은 읽기에 실패했기 때문이며, 마스킹이 꺼져 있기 때문이 아닙니다. '에이전트와 채팅 열기' 링크는 이 오류 메시지만 공유합니다.",
+        "credential_redaction_write_failed": "변경 내용을 저장할 수 없습니다. {{state}} '에이전트와 채팅 열기' 링크는 이 오류 메시지만 공유합니다.",
+        "credential_redaction_retry": "다시 시도",
+        "credential_redaction_desc_intro": "{{productName}}은(는) 에이전트 출력이 사용자에게 도달하기 전에 자격 증명처럼 보이는 모든 항목(액세스 키, 토큰, 개인 키)을 마스킹합니다. 다시 읽어야 하는 본인의 값이 마스킹되면, 다음 네 단계로 그 값을 확인할 수 있습니다.",
+        "credential_redaction_step_write": "에이전트에게 값을 파일에 쓰게 하세요.",
+        "credential_redaction_step_off": "아래 스위치를 끄세요.",
+        "credential_redaction_step_open": "채팅 사이드 패널의 파일 탭에서 그 파일을 여세요.",
+        "credential_redaction_step_on": "스위치를 다시 켜세요.",
+        "credential_redaction_desc_tail": "이것은 에이전트가 사용할 값을 저장하는 시크릿 페이지와는 별개입니다. 이 설정은 대시보드가 열어 주는 파일에서 자격 증명 모양의 값을 볼 수 있는지만 제어합니다. 데이터를 외부로 내보내는 것처럼 보이는 링크(예: URL에 긴 토큰이 포함된 승인 링크)는 어느 경우에도 계속 마스킹되며, 모든 명령 차단 규칙도 계속 적용됩니다.",
+        "credential_redaction_owner_only": "대시보드 소유자만 이 설정을 읽거나 변경할 수 있습니다. '에이전트와 채팅 열기' 링크는 이 오류 메시지만 공유합니다.",
+        "credential_redaction_still_on": "마스킹은 여전히 켜져 있습니다.",
+        "credential_redaction_still_off": "마스킹은 여전히 꺼져 있습니다.",
+        "credential_redaction_ask_agent": "이 오류에 대해 에이전트와 채팅 열기"
       },
       "shortcutsPanel": {
         "bind_chat_tab_switching_to_ctrl_digit_instead_of": "채팅 탭 전환을 Option+숫자 대신 Ctrl+숫자에 할당합니다",
@@ -15255,7 +15319,6 @@
         "code_ready_for": "{{name}}의 로그인 코드가 준비되었습니다",
         "confirm_cancel_remove": "예, ‘{{tag}}’ 제거",
         "confirm_delete_of": "‘{{name}}’을(를) 삭제하시겠습니까?",
-        "connect_after_sign_in": "로그인 후 연결",
         "copied": "Copied",
         "copy_code_aria": "로그인 코드 {{code}} 복사",
         "copy_command": "Copy command",
@@ -15569,7 +15632,12 @@
       "window_tokens_col": "윈도(토큰)",
       "off_body": "<settingRef/>로 활성화하세요. 메트릭은 로컬(<metricsDir/>)에 유지되며 이 컴퓨터를 벗어나지 않습니다.",
       "gauges": "게이지",
-      "gauges_latest": "최신 샘플"
+      "gauges_latest": "최신 샘플",
+      "credits_by_origin": "출처별 크레딧",
+      "credits_by_model": "모델별 크레딧",
+      "top_sessions": "상위 세션",
+      "other_group": "기타 ({{n}})",
+      "full_table": "전체 표"
     },
     "terminalPopoutFrame": {
       "return": "독으로 돌아가기",

@@ -324,6 +324,77 @@ invariants:
   wait ended) is granted before the stagger check and does not bump
   `_last_spawn_ts`: the run is already resident, so there is no process burst
   to smooth, and an in-place recovery no longer pays the stagger interval.
+- **The in-startup population is bounded separately from both the cap and the
+  stagger.** The cap bounds how many RUN, the stagger bounds the RATE of
+  starts, and neither bounds how many admitted agents are still STARTING:
+  one start was admitted per interval however long each took, so under slow
+  starts (a dedicated process per `model` / `reasoning_effort` override, a
+  queue at the `SessionStartGate`, a throttled handshake) a wide fan-out piled
+  dozens of agents into startup at once and the fixed 120s startup watchdog
+  reaped healthy ones as `Failed to start within 120s` (measured ~50% loss on a
+  120-item wave against ~2% at 24-45). `_should_stagger_queue_impl` therefore
+  has a third clause: `_startup_population() >= _startup_cap()` queues the
+  spawn like a full cap does, and `_drain_queue_sync_impl` holds its pick under
+  the same test (after the resume grants -- a resume is not a start). The
+  population is `_in_startup`: `_exec_started` set, `turns == 0`, no `_pid`,
+  no `_first_stream_started`, not done or reaping -- the watchdog's own shape
+  -- plus `_startup_reservations` (a `ClaimPoint` reserved but not yet
+  re-entered and registered, whose re-entry skips this gate). An agent parked
+  at the spawn-approval prompt is NOT counted: it starts nothing, and counting
+  it would let N unanswered prompts stall every spawn on the host (pinned by
+  `test_ignored_prompts_do_not_block_an_unrelated_auto_approved_spawn`). Its
+  RELEASE is what is bounded: `tool_approval:bulk_trust` / `bulk_yolo` resolves
+  every pending prompt in one pass, so `_spawn_with_approval` does not go
+  straight to `_run` -- it awaits `_admit_released_start`, which appends a
+  resident entry (`_resume_id` + `_startup_release` + the waiter's info, so
+  every unstarted-spawn scan already leaves it alone) to the EXISTING queue
+  and waits on `info._start_release`. The pump's first phase
+  (`_release_admitted_start`, before the capacity check because the run
+  already holds its slot, before the resume grants because it is older) meters
+  ONE released start per pass under the same stagger and
+  `_startup_population() >= _startup_cap()` test a fresh spawn faces, stamps
+  `_last_spawn_ts`, wakes the waiter, and re-arms at the stagger boundary. It
+  answers `"released"`, `"held"` or `""` (none waiting), and the pass continues
+  on every answer: a resume waits on a lane slot, never on the startup bound or
+  the stagger, so the resume grants run whether a start was released or is
+  being held (pinned by `test_a_held_release_does_not_starve_a_queued_resume`);
+  the fresh-spawn pick applies the same two checks itself, so a hold here holds
+  it too. A start whose prompt resolves while gateway admission is closed is
+  refused at release (`spawn rejected: the gateway closed admission ...`) --
+  the same guard every registration in the admission package sits behind; a stop or reap while waiting wakes it with False and drops
+  the entry, and a slow self-re-arming re-pump (`_RELEASE_REPUMP_SECS`) backs
+  the edge-driven wake. Pinned by
+  `test_bulk_approval_cannot_release_more_than_the_startup_cap` and
+  `test_a_released_start_that_is_stopped_while_waiting_never_runs`, both
+  driving `spawn()` through the real `_spawn_with_approval`. The watchdog
+  (`_is_startup_stalled`) stays blind to a parked or released-waiting agent: a
+  human prompt has no deadline. The bound is `_startup_cap()` =
+  `2 × session_start_concurrency` (`_STARTUP_CAP_GATE_ROUNDS` rounds of the
+  gate's width) clamped to `[1, _max_concurrent]` -- so `1`, not `0`, at a cap
+  of `0`. It is tied to the GATE and not to the cap because the gate is the
+  one resource every start in startup contends for: `session/new` runs under
+  `G` permits, so at most `G` starts progress at once and every other admitted
+  start is a spawned process or a claimed slot holding a place in the gate's
+  queue. That queue time is not charged to the startup deadline (the watchdog's
+  clock freezes at gate entry, `_gate_wait_mark`, and restarts at acquisition,
+  `_gate_exit_reset`), so the queue's length reaps nothing; the bound decides
+  how much of the running cap may sit in startup contending for `G` permits.
+  `2G` is the smallest value that never idles the gate (one round holding, one
+  admitted to take over) and admitting more buys no starts -- the gate serves
+  `G` per round however many queue -- only a longer queue of idle admitted
+  starts. A cap-derived term (`ceil(cap / 4)`, say) would admit 16 into startup
+  at cap 64 against a 2-permit gate -- seven rounds queued for two permits --
+  which is why the bound is gate-tied and never cap-tied. There is deliberately
+  no config key: `2G` is both floor and ceiling of the useful range (below
+  idles the gate, above adds only idle admitted starts), so an override could
+  only make it worse, and `agent.session_start_concurrency`
+  is already the operator's lever -- the bound tracks it. No second queue and
+  no timer: a held
+  drain arms nothing, because every edge that frees a startup slot already pumps --
+  `_note_startup_progress` from `_run_inner` at the PID record and the first
+  stream, and the slot-release drain on every terminal, including the
+  watchdog's reap of a wedged start, so a wedged population cannot hold the
+  queue past its reap. Pinned by `test_subagent_startup_pressure.py`.
 - **Lowering the cap cancels nothing.** In-flight runs keep going; the gate
   simply admits no new spawn until `_running_count` drains below the new cap on
   its own.
@@ -387,6 +458,52 @@ Admission order (`subagent_manager/admission/gate.py::spawn_impl`):
    Registration consumes the reservation; a durable refusal releases it.
 6. Register, take the slot, `starting`; then the approval branch below.
 
+**Every wait is labelled with the verdict that caused it.** Steps 3 and 4 set
+`SubagentInfo.queued_reason` on the `queued` record they return — one of the
+kinds defined in the leaf module `kiro_crew.subagent_wait_reasons` (re-exported by
+`kiro_crew.subagent`; the channel command layer reads them from the leaf so it never
+imports `kiro_crew.subagent` at runtime): `QUEUED_REASON_LOW_MEMORY` / `QUEUED_REASON_POSTURE_CRITICAL` (step 3, with
+`queued_reason_detail` = the gate's own sentence, the same text the task store's
+`deferred` event records), `QUEUED_REASON_ADAPTIVE_CAP_ZERO` (step 4 when the
+effective cap is 0) or `QUEUED_REASON_CONCURRENCY_LIMIT` (step 4 otherwise: a
+taken slot or the stagger tick). The label is a report of a decision already
+made; no gate reads it back. Two consumers:
+
+- The advisory `subagent_queued` lifecycle event (`_emit_queue_depth`) carries
+  `reason` and, for the memory kinds, `available_gb` / `required_gb` beside
+  `queued`. The label is remembered per parent (`_queue_wait`) so the drain's and
+  the cancel path's re-emits — which carry no verdict of their own — keep it, and
+  forgotten at depth 0, where the event is once again the bare `{"queued": 0}`.
+  One label per parent, last writer wins: it is the verdict on the most recent
+  row the gate judged for that parent, not a per-row ledger. A parent holding a
+  memory-deferred row and then a capacity-queued one shows `concurrency_limit`
+  until the deferred row is re-checked — which the pump does within
+  `admit_wait_secs` (default 30 s), re-labelling it or starting it — so the
+  label is never more than one admit wait stale. This is accepted: the
+  alternative is a per-row label reconciled on every emit, for a chip that
+  states a count, and a stale-by-one-wait label always reads as a wait that
+  does exist for that parent.
+  An event without `reason` (nothing labelled, or an older gateway) leaves the
+  dashboard on its default "queued behind the concurrency limit" text; the
+  memory and adaptive kinds render their own sentence
+  (`website/src/pages/chat/subagentQueuedReason.ts`), visibly on the run card
+  and the composer chip as well as in their tooltips, and with a figure-less
+  sentence when the event names the kind but not the numbers.
+- `POST /api/spawn` answers the three DEFERRED kinds (`DEFERRED_QUEUED_REASONS`)
+  with `status: "queued"`, `reason` and `reason_detail` under the same `id`;
+  every reader of that answer relays it: `spawn_run` prints a
+  `Queued N subagent(s). Not started yet: <detail> …` group apart from the
+  `Spawned` group (same `N subagent(s).` marker and `  <id> (<agent>): <task>`
+  lines, which is what the dashboard's inline run card parses — a queued-only
+  wave still gets its card), `spawn_sub_agents` appends a
+  `{"status": "queued", ...}` record for a deferred member that never settled
+  within its wait, `kirocrew spawn run` prints `Queued subagent <id> …`, and the
+  channel `spawn <task>` keyword (`messaging/commands.py`) replies
+  `⏳ Queued subagent …` with the reason instead of `🚀 Spawned subagent …`. A
+  `concurrency_limit` wait keeps `status: "spawned"`: it is the ordinary wave
+  shape and clears within seconds. Neither the admission verdicts nor the memory
+  pricing (`_startup_cost_gb`, #13489) are touched by the label.
+
 Spawn flow:
 1. **YOLO mode**: skips approval, runs immediately
 2. **Parent trusted**: parent session has `approval_policy="auto"` (set by
@@ -410,10 +527,23 @@ surface is attached. Telegram implements the hook over its existing
 Approve/Deny/Trust inline keyboard (`TelegramDispatcher.deliver_spawn_approval`):
 the press resolves through the same `on_callback` `a:` path as a tool approval, so
 **Trust** grants parent-session trust via `add_trusted_session` and a later spawn
-from that session is auto-approved by the parent-trusted rung. The seam is
-in-memory only (dies with the process); the hook is registered on Telegram startup
-and unregistered on client shutdown. The per-agent `auto_approve_spawn` rung
-(issue #2381 item 2) is deferred to #4751/#4693 and is NOT added here.
+from that session is auto-approved by the parent-trusted rung. Discord implements it
+too (`DiscordDispatcher.deliver_spawn_approval`), over its existing Approve/Deny
+buttons on the same `on_interaction` `a:` path, with three differences: no Trust rung
+(standing spawn trust is granted from the dashboard), a `unified` dm_scope key is
+unaddressable and falls through, and a refused send is reported by an absent message
+id rather than an exception and is read the same way. Consulting the channels
+governance ceiling (`channel_inbound_permitted`) before anything is armed is not a
+Discord peculiarity but a requirement of the seam: every channel's press path drops a
+non-reject press under a governance deny, so a prompt posted into a denied channel
+can never be answered and its wait hands the gate a deny-by-default nobody pressed.
+The seam reads it once for every hook, before invoking one. Discord adds a single
+re-read of its own on the direct route, after the peer's DM channel is opened: that
+open is a full round trip inside the hook, so the seam's answer can go stale across a
+gap the seam cannot see. The seam is in-memory
+only (dies with the process); each hook is registered on its channel's startup and
+unregistered on client shutdown. The per-agent `auto_approve_spawn` rung (issue #2381
+item 2) is deferred to #4751/#4693 and is NOT added here.
 
 **Delivery order.** A spawn-approval prompt that reaches `_spawn_with_approval`
 is offered to surfaces in this fixed order, and the search stops at the first one
@@ -862,6 +992,7 @@ An unmarked `CancelledError` (see intentional-cancel rule) triggers `_schedule_c
 - **taskq pump** (`OrphanStallMonitor.taskq_pump`, facade `_taskq_pump`): `start_reaper` runs it once after `taskq_boot_dispatch` (building the manager's `DependencyCoordinator` from `agent.dependency_*` over the admission store, `capacity = _max_concurrent`, and running `coordinator.rebuild()` after `open_default_store` ran `WaitLedger.rebuild()`), every sweep re-runs it as the backstop, and every run that parks on a wait calls it. One pass = `admission.taskq_expire_waits()` (wait deadlines) + `coordinator.tick()` (due scopes) + a one-shot `loop.call_later` re-armed at `coordinator.next_deadline()`, so a scope is woken when it is due, not on the next 60s sweep. The coordinator is registered process-wide (`taskq.dependency.register_coordinator`) for the main chat's read of scope schedules. Terminal runs call `coordinator.forget(id)` from `_run`'s finally (a finished probe is the scope's recovery signal) and withdraw any pending resume entry.
 - `_force_reap`: reset with 30s timeout → SIGKILL fallback → mark done → fire `subagent_done` WS event
 - **Startup-stall admission ends when the first provider stream begins.** A provider may create its child process lazily from `stream()`, so a missing PID before the first response is not proof that execution never started. The marker resets for every recovery execution; the startup watchdog may reap only a subagent with no first stream, no runtime PID, and no completed turn. The ordinary wall-clock deadline remains unchanged.
+- **The startup deadline is fixed; the clock starts at gate exit.** `_is_startup_stalled` compares `now - _exec_started` against the bare `_startup_deadline` however many other agents are `_in_startup`. The crowd is handled at the two ends of the start, not in the deadline: `_gate_exit_reset` moves `_exec_started` to `SessionStartGate` exit on both start paths, so the deadline measures time spent starting with a permit held, and the in-startup population is bounded at admission (`_startup_cap`). The deadline is deliberately NOT pressure-aware (no term per other agent in startup): with queue time uncharged and the crowd bounded there is no evidence that a healthy start misses the base deadline, and a term sampled at sweep time against a clock spanning the whole crowded period would not be monotonic -- it would shrink as the crowd drained and could reap at one sweep an agent the sweep before had left inside its window. The reaper's warning names the in-startup population, as diagnostics only. Pinned by `test_subagent_startup_pressure.py` and `test_subagent_startup_watchdog.py`.
 - **Terminal completion is arbitrated by FOUR separate guards, not by `reaped` alone.** Two paths can finish a subagent — `_force_reap` and `_run`'s `finally` — and between them there are four distinct one-time concerns. Earlier revisions tried to arbitrate them with `reaped` plus `done` and every attempt satisfied two while breaking a third (duplicate delivery when the marker was set late; a lost outcome when it was set early and the reaper was cancelled; a lost outcome when the claim was handed back to a run that had already exited; and finally **no reporter at all plus a leaked concurrency slot** when the report claim was gated on `not info.done`). The guards are now:
   1. **`info.reaped` — classification.** Was this a deliberate reap? The cancel-recovery scheduler reads it, and the marker MUST precede the intentional cancel (see the intentional-cancel rule above) or an unexpected-cancel respawn fires on the run being killed. Unchanged.
   2. **`if not info.done` — the terminal RECORD.** Error synthesis, failure stat, tombstone, cost. First-arrival-wins, so it is never written twice (pinned by `test_subagent.py::TestOnDoneTimeout::test_force_reap_skips_tombstone_when_already_done`).
@@ -2044,9 +2175,37 @@ Decision + lifecycle:
   record the shared path.
 - `runtime.create_session()` runs under the ACP `SessionStartGate`
   (`agent.session_start_concurrency`, see acp-client.md). `_create_shared_session`
-  passes `on_gate_acquired`, which resets `info._exec_started` / `last_activity`
-  at gate EXIT so the 120s startup watchdog and the stall clock never count
-  queue time, and records the wait in `info._start_queue_wait_ms`.
+  passes `on_gate_acquired` = `_gate_exit_reset(info)`, which resets
+  `info._exec_started` / `last_activity` at gate EXIT and records the wait in
+  `info._start_queue_wait_ms`; its companion `on_gate_queued` =
+  `_gate_wait_mark(info)` fires immediately before the wait for a permit begins
+  and stamps `info._gate_wait_started`, and while that is set
+  `_is_startup_stalled` reads the start clock as frozen at that moment. So the
+  startup deadline never counts time queued for a permit, however long the
+  queue: a start wedged BEFORE the gate is on a running clock and is reaped; a
+  start queued at the gate is not; a start wedged after its permit is reaped at
+  the base deadline from gate exit. The wait itself is finite: every holder is
+  on a running clock from acquisition and is reaped at the base deadline if its
+  `session/new` has not returned, the request has its own budget, and the gate
+  keeps a headroom of permits no `StartCollector` may hold.
+- **The dedicated-process path gets the SAME gate-exit reset.** Every `model` /
+  `reasoning_effort` / `allowed_tools` / `bare` spawn takes `get_or_create`, and
+  its own `AcpRuntime.create_session` runs under the same `SessionStartGate`;
+  without the reset that queue time would be charged to the fixed startup
+  deadline, and a wide model-pinned fan-out would reap healthy starts as `Failed
+  to start within 120s` -- the strongest single mechanism behind the measured
+  ~50% loss at 120 items. `_run_inner` passes `on_gate_acquired=_gate_exit_reset(info)`
+  into `get_or_create`; it rides `extra_factory_kwargs` to the provider factory
+  (`config/loader.py` `_acp`, where it is a NAMED parameter -- the `**_kwargs`
+  catch-all would swallow it silently), into `AcpProvider(on_gate_acquired=...)`,
+  and from `_start_kiro_runtime_impl` into the process's `create_session`. It is
+  not passed to `load_session`: a `session/load` resume takes no gate permit.
+  ONE definition each (`RunEventCoordinator._gate_exit_reset_impl`,
+  `_gate_wait_mark_impl`) serves both paths, so the clock rule cannot drift
+  between them; `on_gate_queued` rides the same plumbing as `on_gate_acquired`.
+  Pinned by `test_subagent_startup_pressure.py` (`TestDedicatedPathGateExitReset`,
+  `TestGateExitResetIsOneDefinition`) and `test_session_start_gate.py`
+  (`test_gate_entry_callback_fires_before_the_wait_and_exit_after`).
 - **A `session/new` timeout is congestion, never a reason for a dedicated
   process.** `AcpRequestTimeout` from the shared runtime goes to
   `_await_late_start`: the row is marked `recovering`, and the run waits for

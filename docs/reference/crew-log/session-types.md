@@ -136,15 +136,18 @@ same-slot rule below rather than trusting it. It reports WHY it stopped, and onl
 `first` means it reached the slot's first crew log; no shipped route calls it yet.
 
 `previous` always names a crew log of the SAME slot, and that is verified rather
-than assumed. The id reaches the emitter from the slot-to-session mapping, read
-without pruning and latched by whichever allocation observes it first. One limit
-is recorded rather than worked around: an allocation whose replay is still pending
-does not publish its fresh id over the mapping, so for that window a mapping read
-names the crew log BEFORE the newest one — two successive crew logs then cite one
-predecessor and the crew log between them is cited by nobody, which a chain walker
-steps over without any sign that a crew log is missing. Closing that needs a
-deferral that resumes once the predecessor's own writes settle, and it is tracked
-with the rest of the supersede work in #12148. The mapping can also name a crew log
+than assumed. The id is the store this slot last handed to a `session/opened`,
+recorded on the slot as that entry's edge is spent and latched by whichever
+allocation observes it first. That record is the authority because it is the
+writer's own statement about which store the slot is on, taken with no clock and
+no store read. The slot-to-session mapping, read without pruning, is the fallback
+for a slot this process has not opened a crew log for, and it cannot be the
+authority: an allocation whose replay is still pending holds the prior resumable
+id in the mapping on purpose, so that a restart can still resume it, and the
+mapping is then a generation behind — two successive crew logs would cite one
+predecessor and the crew log between them would be cited by nobody, which a chain
+walker steps over without any sign that a crew log is missing. The mapping can also
+name a crew log
 the slot never wrote, since an entry can be stale or recycled by the time a
 successor cold-starts, so the emitter reads the named crew log's own header —
 written once at create, never rewritten — and records the edge only when that
@@ -1325,7 +1328,17 @@ is derived from the entry's own `time` and is not repeated in `data`.
 **Reader hint** — Read the fold for the member's own DM slot, then select the record
 under the asking crew's `crew_key`; an empty `template` is the fold's way of saying
 this crew has published nothing. Do not key on the slug alone — on a collided slug
-that serves whichever crew published last to both of them.
+that serves whichever crew published last to both of them. Finding NO record under
+your own `crew_key` is the case to handle, because eviction deletes the owner's entry
+rather than emptying it. Absence is all there is to read, and it is the same absence
+whether the crew was evicted or never published here, so the per-owner shape does not
+answer which happened. No field on it can, because the entry that would have carried
+one is the entry eviction removed. What the fold does answer is on its top-level
+record: `owners_omitted` counts this slot's evictions, so `0` says this fold evicted
+nobody and a non-zero value says it truncated without naming whom. "Did this crew
+publish" is answered by the durable `crew-panels/<slug>.json`, not here: the append is
+best-effort, so a publish whose entry never landed leaves the fold with no record while
+the file still serves that crew's panel.
 
 **Since** — the change that gave the member panel a crew-log record beside its file.
 

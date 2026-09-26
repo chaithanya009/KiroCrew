@@ -370,9 +370,24 @@ class TestDoctor:
         assert "composition failed" in out
         assert "KIROCREW_PROFILE=standalone" in out
 
-    def test_doctor_without_kiro(self, tmp_path):
+    def test_doctor_without_kiro(self, tmp_path, monkeypatch):
+        """A host with no kiro-cli: ``which`` finds nothing, and neither do the
+        trusted-directory resolvers the credentials, memory-pressure and
+        source-checkout sections spawn through. Left unpinned, those sections ran
+        the REAL ``aws configure list-profiles``, ``systemctl is-active`` and
+        ``git -C <this checkout>`` on the developer's host; ``None`` from each
+        resolver is the product's own "cannot ask" arm, so no binary is reached.
+        The one spawn that resolves through no seam -- the runtime section's
+        ``<venv>/bin/python3 --version`` -- is mocked like every sibling here."""
+        import kiro_crew.cli_doctor as _doc
+
+        monkeypatch.setattr(_doc.platform_compat, "trusted_aws_bin", lambda: None)
+        monkeypatch.setattr(_doc.platform_compat, "trusted_system_bin", lambda _name: None)
+        monkeypatch.setattr(_doc.platform_compat, "trusted_git_bin", lambda: None)
+        mock_run = MagicMock(returncode=0, stdout="Python 3.10.0", stderr="")
         with (
             patch("kiro_crew.cli_doctor.shutil.which", return_value=None),
+            patch("kiro_crew.cli_doctor.subprocess.run", return_value=mock_run),
             patch("urllib.request.urlopen", side_effect=urllib.error.URLError("no gateway")),
             patch("kiro_crew.cli_doctor.is_local_only", return_value=True),
             patch("kiro_crew.cli_doctor.config_dir", return_value=tmp_path),
@@ -5596,101 +5611,6 @@ class TestSpawnCliAuth:
         out = capsys.readouterr().out
         assert "Error" in out
         assert "gateway not running" not in out
-
-
-class TestArtifactCli:
-    """CLI-side coverage for security-critical paths in `_artifact`.
-
-    The bulk of artifact behavior is exercised via the HTTP handler tests; this
-    class focuses on the CLI's own gates (e.g. `is_sensitive_path()` refusal on
-    `--content-file`).
-    """
-
-    def test_save_parses_an_explicit_slug(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        # A subparser that never declared the flag exits at parse time, so this
-        # pins the whole argv -> namespace -> command hop rather than the
-        # forwarding alone.
-        seen: dict[str, object] = {}
-        from kiro_crew import cli
-
-        monkeypatch.setattr(
-            "kiro_crew.cli_commands._artifact",
-            lambda args: seen.update(slug=args.slug, name=args.name),
-        )
-        monkeypatch.setattr(
-            sys,
-            "argv",
-            [
-                "kirocrew",
-                "artifact",
-                "save",
-                "--name",
-                "Run Summary",
-                "--slug",
-                "chosen-by-hand",
-                "--content",
-                "body",
-            ],
-        )
-        cli.main()
-        assert seen == {"slug": "chosen-by-hand", "name": "Run Summary"}
-
-    def test_save_refuses_sensitive_content_file(
-        self, capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        # AUTOSDE security-controls: --content-file must be gated by
-        # is_sensitive_path() before Path.read_text(encoding="utf-8") so a user (or script)
-        # cannot exfiltrate ~/.aws/credentials by piping it into an artifact.
-        from kiro_crew.cli_commands import _artifact
-
-        monkeypatch.setattr("kiro_crew.cli_commands.is_sensitive_path", lambda _p: True)
-        # Surface any HTTP call as a fatal so we can prove the function exited
-        # at the security check, not at the network layer.
-        monkeypatch.setattr(
-            "kiro_crew.cli_commands.loopback_urlopen",
-            lambda *_a, **_kw: pytest.fail("_artifact must refuse before opening any HTTP request"),
-        )
-
-        args = argparse.Namespace(
-            artifact_action="save",
-            name="x",
-            kind="widget",
-            content=None,
-            content_file="/tmp/should-be-refused",
-            description="",
-            tags=None,
-        )
-        with pytest.raises(SystemExit) as excinfo:
-            _artifact(args)
-        assert excinfo.value.code == 1
-        err = capsys.readouterr().err
-        assert "refusing to read sensitive path" in err
-
-    def test_update_refuses_sensitive_content_file(
-        self, capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        from kiro_crew.cli_commands import _artifact
-
-        monkeypatch.setattr("kiro_crew.cli_commands.is_sensitive_path", lambda _p: True)
-        monkeypatch.setattr(
-            "kiro_crew.cli_commands.loopback_urlopen",
-            lambda *_a, **_kw: pytest.fail("_artifact must refuse before opening any HTTP request"),
-        )
-
-        args = argparse.Namespace(
-            artifact_action="update",
-            slug="x",
-            content=None,
-            content_file="/tmp/should-be-refused",
-            name=None,
-            description=None,
-            tags=None,
-        )
-        with pytest.raises(SystemExit) as excinfo:
-            _artifact(args)
-        assert excinfo.value.code == 1
-        err = capsys.readouterr().err
-        assert "refusing to read sensitive path" in err
 
 
 class TestMcpBuiltinDispatch:

@@ -3480,9 +3480,8 @@ class GatewayOrchestrator:
         # Only in-memory wiring belongs on the boot path. The closed barrier
         # refuses memory consumers until the preparation worker has restored and
         # initialized every shared tier. No old store is opened in the meantime.
-        from kiro_crew.memory_startup import MemoryStartup
-
         from kiro_crew.fork_profile import MEMORY_ENABLED
+        from kiro_crew.memory_startup import MemoryStartup
 
         self._memory_startup = MemoryStartup.begin() if MEMORY_ENABLED else None
 
@@ -15418,6 +15417,12 @@ async def run_gateway(
                         kiro_agents_dir(),
                         sweep_backups=cfg.agent.sweep_agents_backups,
                     )
+                    # The per-spawn skill-view prune is capped, so a backlog
+                    # left by earlier builds would take hundreds of spawns to
+                    # clear. Drain it once here, in lock-bounded batches.
+                    from kiro_crew.agent_sdk.drivers import acp as acp_driver
+
+                    acp_driver.drain_skill_view_aliases()
 
                 await asyncio.to_thread(_sweep_in_thread)
             except Exception:

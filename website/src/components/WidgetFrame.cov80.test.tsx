@@ -9,8 +9,7 @@ import WidgetFrame, {
   PROGRAMMATIC_BUILD_DELAY_MS,
 } from './WidgetFrame'
 import { ThemeProvider } from '../hooks/useTheme'
-import { api, ApiError } from '../api/client'
-import { effectiveWidgetSlug } from '../lib/widgetSlug'
+import { api } from '../api/client'
 import { i18nT } from '../i18n/t'
 
 let queryClient: QueryClient
@@ -34,8 +33,6 @@ beforeEach(() => {
   // The frame mints a gateway document instead of building a blob for itself.
   vi.spyOn(api, 'sandboxDocUrl').mockResolvedValue({ url: '/sandbox-doc/test/tok' })
   vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {})
-  // Unsaved artifact so the toolbar renders its default (hollow-star) shape.
-  vi.spyOn(api, 'artifact').mockRejectedValue(new ApiError(404, 'zzq missing'))
 })
 
 afterEach(() => {
@@ -364,157 +361,5 @@ describe('WidgetFrame widget actions', () => {
     const { container } = wrap(<WidgetFrame html="<p>zzq</p>" title="zzq widget" />)
     await post(container, { type: 'mc-widget-action', action: 'z'.repeat(200) })
     expect(sent[0].detail.action).toHaveLength(64)
-  })
-})
-
-describe('WidgetFrame artifact star', () => {
-  const TS = '1700000000.001'
-  const SLUG = effectiveWidgetSlug({ messageTs: TS, body: '<p>zzq-star</p>' })!
-  const derived = (over: Record<string, unknown> = {}) => (
-    <WidgetFrame html="<p>zzq-star</p>" title="zzq-title" messageTs={TS} {...over} />
-  )
-  const starName = i18nT('components.widgetFrame.star_as_artifact')
-  const unstarName = i18nT('components.widgetFrame.remove_artifact_from_library', { name: SLUG })
-  const star = () => screen.getByRole('button', { name: starName })
-
-  let setPinned: ReturnType<typeof vi.spyOn>
-  let createArtifact: ReturnType<typeof vi.spyOn>
-
-  beforeEach(() => {
-    setPinned = vi.spyOn(api, 'setArtifactPinned').mockResolvedValue({} as never)
-    createArtifact = vi.spyOn(api, 'createArtifact').mockResolvedValue({} as never)
-  })
-
-  it('disables the star for a widget with no slug context', () => {
-    wrap(<WidgetFrame html="<p>zzq</p>" title="zzq widget" />)
-    expect(star()).toBeDisabled()
-    expect(star()).toHaveAttribute(
-      'title',
-      i18nT('components.widgetFrame.cannot_star_widget_has_no_slug_or_message_contex'),
-    )
-  })
-
-  it('links the title once the artifact exists but leaves the star hollow', async () => {
-    vi.spyOn(api, 'artifact').mockResolvedValue({ pinned: false } as never)
-    wrap(derived())
-    const link = await screen.findByRole('link')
-    expect(link).toHaveAttribute('href', `/artifacts/${SLUG}`)
-    expect(star()).toBeEnabled()
-  })
-
-  it('treats an empty probe response as no artifact at all', async () => {
-    vi.spyOn(api, 'artifact').mockResolvedValue(null as never)
-    wrap(derived())
-    await act(async () => {})
-    expect(screen.queryByRole('link')).toBeNull()
-  })
-
-  it('a probe failure that is not a 404 leaves the widget unstarred', async () => {
-    vi.spyOn(api, 'artifact').mockRejectedValue(new Error('zzq-probe-exploded'))
-    wrap(derived())
-    await act(async () => {})
-    expect(screen.queryByRole('link')).toBeNull()
-    expect(star()).toBeEnabled()
-  })
-
-  it('starring an existing artifact pins it without re-creating it', async () => {
-    vi.spyOn(api, 'artifact').mockResolvedValue({ pinned: false } as never)
-    wrap(derived())
-    await screen.findByRole('link')
-    fireEvent.click(star())
-    await screen.findByRole('button', { name: unstarName })
-    expect(setPinned).toHaveBeenCalledWith(SLUG, true)
-    expect(createArtifact).not.toHaveBeenCalled()
-  })
-
-  it('starring a missing artifact creates it first and refreshes the session lists', async () => {
-    const invalidate = vi.spyOn(queryClient, 'invalidateQueries')
-    wrap(derived({ slotKey: 'zzq-slot' }))
-    await act(async () => {})
-    fireEvent.click(star())
-    await screen.findByRole('button', { name: unstarName })
-    expect(createArtifact).toHaveBeenCalledWith(expect.objectContaining({
-      name: 'zzq-title',
-      content: '<p>zzq-star</p>',
-      kind: 'widget',
-      source: 'chat',
-      slug: SLUG,
-      origin_session_key: 'zzq-slot',
-    }))
-    expect(invalidate).toHaveBeenCalledWith({ queryKey: ['session-artifacts', 'zzq-slot'] })
-    expect(invalidate).toHaveBeenCalledWith({ queryKey: ['session-artifact-records', 'zzq-slot'] })
-  })
-
-  it('falls back to the generic name when the widget carries the default title', async () => {
-    wrap(derived({ title: undefined }))
-    await act(async () => {})
-    fireEvent.click(star())
-    await screen.findByRole('button', { name: unstarName })
-    expect(createArtifact).toHaveBeenCalledWith(expect.objectContaining({ name: 'Widget' }))
-  })
-
-  it('a 409 on create means it raced into existence, so the pin still happens', async () => {
-    createArtifact.mockRejectedValue(new ApiError(409, 'zzq exists'))
-    wrap(derived())
-    await act(async () => {})
-    fireEvent.click(star())
-    await screen.findByRole('button', { name: unstarName })
-    expect(setPinned).toHaveBeenCalledWith(SLUG, true)
-  })
-
-  it('any other create failure is surfaced beside the title', async () => {
-    createArtifact.mockRejectedValue(new ApiError(500, 'zzq-create-broke'))
-    wrap(derived())
-    await act(async () => {})
-    fireEvent.click(star())
-    expect(await screen.findByText(i18nT('components.widgetFrame.save_failed')))
-      .toHaveAttribute('title', 'zzq-create-broke')
-    expect(setPinned).not.toHaveBeenCalled()
-  })
-
-  it('a non-Error rejection is stringified into the save error', async () => {
-    createArtifact.mockRejectedValue('zzq-not-an-error')
-    wrap(derived())
-    await act(async () => {})
-    fireEvent.click(star())
-    expect(await screen.findByText(i18nT('components.widgetFrame.save_failed')))
-      .toHaveAttribute('title', 'zzq-not-an-error')
-  })
-
-  it('un-starring unpins the artifact and keeps it in the library', async () => {
-    vi.spyOn(api, 'artifact').mockResolvedValue({ pinned: true } as never)
-    wrap(derived())
-    fireEvent.click(await screen.findByRole('button', { name: unstarName }))
-    await screen.findByRole('button', { name: starName })
-    expect(setPinned).toHaveBeenCalledWith(SLUG, false)
-    // Unpin is metadata-only: the artifact must still be linked.
-    expect(screen.getByRole('link')).toBeInTheDocument()
-  })
-
-  it('a 404 on unpin reconciles the widget to not-exists', async () => {
-    vi.spyOn(api, 'artifact').mockResolvedValue({ pinned: true } as never)
-    setPinned.mockRejectedValue(new ApiError(404, 'zzq gone'))
-    wrap(derived())
-    fireEvent.click(await screen.findByRole('button', { name: unstarName }))
-    await screen.findByRole('button', { name: starName })
-    expect(screen.queryByRole('link')).toBeNull()
-    expect(screen.queryByText(i18nT('components.widgetFrame.save_failed'))).toBeNull()
-  })
-
-  it('any other unpin failure is surfaced instead of silently reverting', async () => {
-    vi.spyOn(api, 'artifact').mockResolvedValue({ pinned: true } as never)
-    setPinned.mockRejectedValue(new ApiError(500, 'zzq-unpin-broke'))
-    wrap(derived())
-    fireEvent.click(await screen.findByRole('button', { name: unstarName }))
-    expect(await screen.findByText(i18nT('components.widgetFrame.save_failed')))
-      .toHaveAttribute('title', 'zzq-unpin-broke')
-  })
-
-  it('an explicit slug renders as starred before the probe resolves', () => {
-    vi.spyOn(api, 'artifact').mockReturnValue(new Promise(() => {}) as never)
-    wrap(<WidgetFrame html="<p>zzq</p>" title="zzq widget" slug="zzq-explicit" />)
-    expect(screen.getByRole('button', {
-      name: i18nT('components.widgetFrame.remove_artifact_from_library', { name: 'zzq-explicit' }),
-    })).toBeInTheDocument()
   })
 })

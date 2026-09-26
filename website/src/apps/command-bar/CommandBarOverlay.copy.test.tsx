@@ -7,10 +7,8 @@ import CommandBarOverlay from './CommandBarOverlay'
  * The Command Bar's copy gesture.
  *
  * What is worth pinning here is that copy is a LAYER, not a command: no row in the
- * launcher was written to be copyable, and these tests assert that rows of three
- * different origins — a settings row from the root index, an artifact row from a
- * scoped view's provider, a deployed artifact carrying its own address — all answer
- * ⌘C without any of them knowing about copying.
+ * launcher was written to be copyable, and the settings row answers ⌘C
+ * without knowing about copying.
  *
  * The rest pins the failures a reader cannot see: a confirmation shown over a
  * clipboard that never changed, and a copy that silently takes the chord away from a
@@ -73,41 +71,12 @@ vi.mock('../../hooks/useTheme', () => ({ useTheme: () => ({ cycle: vi.fn() }) })
 
 const listApps = vi.fn(async () => [])
 const chatFolders = vi.fn(async () => [])
-const artifacts = vi.fn(async (_filters?: Record<string, unknown>) => ({ artifacts: [] }))
 vi.mock('../../api/client', () => ({
   api: {
     listApps: (...a: unknown[]) => listApps(...(a as [])),
     chatFolders: (...a: unknown[]) => chatFolders(...(a as [])),
-    artifacts: (...a: unknown[]) => artifacts(...(a as [])),
   },
 }))
-
-/**
- * One plain artifact and one DEPLOYED one.
- *
- * The pair is the whole point of the override: both rows open a page on this
- * dashboard, and only the second has an address that means anything to someone who
- * cannot reach this dashboard at all.
- */
-const PLAIN = {
-  slug: 'onboarding-runbook',
-  name: 'Onboarding Runbook',
-  kind: 'markdown',
-  description: 'How a new hire gets set up',
-  tags: [],
-  version: 1,
-  updated_at: '2026-08-01T00:00:00Z',
-}
-const DEPLOYED = {
-  slug: 'kanban-board',
-  name: 'Kanban Board',
-  kind: 'webapp',
-  description: 'Deployed board',
-  tags: [],
-  version: 2,
-  updated_at: '2026-09-01T00:00:00Z',
-  webapp_metadata: { deploy_target: { public_url: 'https://d2nzmpzyp0.cloudfront.net/kanban/' } },
-}
 
 function mount() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
@@ -128,20 +97,6 @@ const pressCopy = () => fireEvent.keyDown(input(), { key: 'c', metaKey: true })
 const selectedRow = (): HTMLElement => {
   const hit = screen.queryAllByRole('option').find(r => r.getAttribute('aria-selected') === 'true')
   if (!hit) throw new Error('no row is selected')
-  return hit
-}
-
-const hasRow = (text: string): boolean =>
-  screen.queryAllByRole('option').some(r => (r.textContent || '').includes(text))
-
-const rowByText = (text: string): HTMLElement => {
-  const rows = screen.queryAllByRole('option')
-  const hit = rows.find(r => (r.textContent || '').includes(text))
-  if (!hit) {
-    throw new Error(
-      `no option row containing "${text}"; rows: ${rows.map(r => r.textContent).join(' | ')}`,
-    )
-  }
   return hit
 }
 
@@ -169,20 +124,9 @@ const selectSettingsRow = async (): Promise<HTMLElement> => {
   )
 }
 
-/** Enter the artifacts view the way a user does: activate its root row. */
-const enterArtifacts = async () => {
-  type('artifact')
-  await waitFor(() => expect(hasRow('Search Artifacts')).toBe(true))
-  fireEvent.mouseDown(rowByText('Search Artifacts'))
-  await waitFor(() =>
-    expect(screen.getByRole('button', { name: /Back to all commands/ })).toBeTruthy(),
-  )
-}
-
 beforeEach(() => {
   vi.clearAllMocks()
   copyToClipboard.mockResolvedValue(true)
-  artifacts.mockResolvedValue({ artifacts: [] })
   dispatch.mockReturnValue({ unwrap: () => Promise.resolve('slot-1') })
   storeState.dashboard = { slots: [], unreadSlots: [] }
   storeState.chat = { slotStatusDetail: {}, activeSlot: null }
@@ -201,42 +145,17 @@ describe('command bar — copy the selected row', () => {
     const copied = copyToClipboard.mock.calls[0][0]
     expect(copied).toMatch(new RegExp(`^${window.location.origin}/settings/`))
     // The address travels with the word: "Copied" alone left the reader to find out
-    // WHICH address on paste, and a deployed artifact yields a different one.
+    // WHICH address on paste.
     await waitFor(() => expect(screen.getByRole('status').textContent).toContain('Copied'))
     expect(screen.getByRole('status').textContent).toContain(copied)
-  })
-
-  it('copies an artifact row as a link to that artifact', async () => {
-    artifacts.mockResolvedValue({ artifacts: [PLAIN] })
-    mount()
-    await enterArtifacts()
-    await waitFor(() => expect(selectedRow().textContent).toContain('Onboarding Runbook'))
-    pressCopy()
-    await waitFor(() => expect(copyToClipboard).toHaveBeenCalledTimes(1))
-    expect(copyToClipboard.mock.calls[0][0]).toBe(
-      `${window.location.origin}/artifacts/onboarding-runbook`,
-    )
-  })
-
-  it('copies a DEPLOYED artifact as its public URL, not as a link to this dashboard', async () => {
-    // The row still OPENS the dashboard page. What is worth handing to another person
-    // is the address that does not require this dashboard, and only the provider
-    // holding the deployment record knows it.
-    artifacts.mockResolvedValue({ artifacts: [DEPLOYED] })
-    mount()
-    await enterArtifacts()
-    await waitFor(() => expect(selectedRow().textContent).toContain('Kanban Board'))
-    pressCopy()
-    await waitFor(() => expect(copyToClipboard).toHaveBeenCalledTimes(1))
-    expect(copyToClipboard.mock.calls[0][0]).toBe('https://d2nzmpzyp0.cloudfront.net/kanban/')
   })
 
   it('says so, and writes nothing, for a row that has no address', async () => {
     // A `view` row opens a surface INSIDE the bar, so there is nothing to hand
     // anybody. Silence would read as a copy that worked.
     mount()
-    type('artifact')
-    await waitFor(() => expect(selectedRow().textContent).toContain('Search Artifacts'))
+    type('toggle theme')
+    await waitFor(() => expect(selectedRow().textContent).toContain('Toggle Theme'))
     pressCopy()
     await waitFor(() => expect(screen.getByRole('status').textContent).toBe('Nothing here to copy.'))
     expect(copyToClipboard).not.toHaveBeenCalled()

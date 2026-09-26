@@ -58,7 +58,7 @@ from kiro_crew.stt import models as stt_models
 
 
 @pytest.mark.parametrize("enabled,keep", [(False, 30), (True, 2)])
-def test_memory_backup_controls_survive_load_and_save(tmp_path, monkeypatch, enabled, keep):
+def test_memory_backup_stays_disabled_on_load_and_save(tmp_path, monkeypatch, enabled, keep):
     path = tmp_path / "config.json"
     path.write_text(
         json.dumps({"memory": {"backup_enabled": enabled, "backup_keep": keep}}),
@@ -66,24 +66,24 @@ def test_memory_backup_controls_survive_load_and_save(tmp_path, monkeypatch, ena
     )
     monkeypatch.setattr(loader_module, "config_path", lambda: path)
     config = KiroCrewConfig.load()
-    assert config.memory.backup_enabled is enabled
+    assert config.memory.backup_enabled is False
     assert config.memory.backup_keep == keep
     config.save()
     saved = json.loads(path.read_text(encoding="utf-8"))
-    assert saved["memory"]["backup_enabled"] is enabled
+    assert saved["memory"]["backup_enabled"] is False
     assert saved["memory"]["backup_keep"] == keep
 
 
 @pytest.mark.parametrize(
     ("memory_data", "expected"),
     [
-        pytest.param({}, True, id="missing-defaults-on"),
+        pytest.param({}, False, id="missing-defaults-off"),
         pytest.param({"backup_enabled": False}, False, id="boolean-false"),
-        pytest.param({"backup_enabled": True}, True, id="boolean-true"),
-        pytest.param({"backup_enabled": 0}, True, id="integer-zero-is-invalid"),
-        pytest.param({"backup_enabled": ""}, True, id="empty-string-is-invalid"),
-        pytest.param({"backup_enabled": "false"}, True, id="string-false-is-invalid"),
-        pytest.param({"backup_enabled": [False]}, True, id="list-is-invalid"),
+        pytest.param({"backup_enabled": True}, False, id="boolean-true"),
+        pytest.param({"backup_enabled": 0}, False, id="integer-zero-is-invalid"),
+        pytest.param({"backup_enabled": ""}, False, id="empty-string-is-invalid"),
+        pytest.param({"backup_enabled": "false"}, False, id="string-false-is-invalid"),
+        pytest.param({"backup_enabled": [False]}, False, id="list-is-invalid"),
     ],
 )
 def test_memory_backup_enabled_requires_json_boolean_without_jsonschema(
@@ -115,7 +115,7 @@ logger = logging.getLogger("kiro_crew.config.loader")
 _ENUM_FIELDS: list[tuple[str, str, list[str]]] = [
     ("agent", "approval_mode", ["auto", "interactive"]),
     ("agent", "provider", ["acp"]),
-    ("agent", "sandbox", ["auto", "off"]),
+    ("agent", "sandbox", ["auto", "strict", "off"]),
     ("agent", "log_level", ["DEBUG", "INFO", "WARNING", "ERROR"]),
     ("memory", "embedding_provider", ["llama_cpp"]),
 ]
@@ -4697,36 +4697,15 @@ class TestKnowledgeAutoIngest:
 
 
 class TestMemoryPersistenceAndInjectionToggles:
-    """``memory.persistence_enabled`` / ``inject_memory`` / ``inject_lessons``:
-    default on, override reads, junk falls back to the default (``_safe_bool``
-    accepts only real booleans)."""
+    """Persistent memory stays off regardless of saved toggle values."""
 
-    def test_defaults_are_on(self) -> None:
-        mc = _load_from_dict({}).memory
-        assert (mc.persistence_enabled, mc.inject_memory, mc.inject_lessons) == (
-            True,
-            True,
-            True,
-        )
-
-    def test_an_empty_memory_section_leaves_every_toggle_on(self) -> None:
-        mc = _load_from_dict({"memory": {}}).memory
-        assert (mc.persistence_enabled, mc.inject_memory, mc.inject_lessons) == (
-            True,
-            True,
-            True,
-        )
-
-    @pytest.mark.parametrize("key", ["persistence_enabled", "inject_memory", "inject_lessons"])
-    def test_false_reads_false(self, key: str) -> None:
-        mc = _load_from_dict({"memory": {key: False}}).memory
-        assert getattr(mc, key) is False
-
-    @pytest.mark.parametrize("key", ["persistence_enabled", "inject_memory", "inject_lessons"])
-    @pytest.mark.parametrize("bad", ["false", 0, 1, None, [], {}])
-    def test_junk_falls_back_to_on(self, key: str, bad: object) -> None:
+    @pytest.mark.parametrize(
+        "key", ["persistence_enabled", "inject_memory", "inject_lessons", "inject_activity"]
+    )
+    @pytest.mark.parametrize("bad", [True, False, "true", 0, None, [], {}])
+    def test_saved_values_cannot_enable_memory(self, key: str, bad: object) -> None:
         mc = _load_from_dict({"memory": {key: bad}}).memory
-        assert getattr(mc, key) is True
+        assert getattr(mc, key) is False
 
 
 class TestKnowledgePoolIdleTtl:

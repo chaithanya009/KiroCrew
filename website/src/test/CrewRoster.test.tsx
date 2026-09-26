@@ -13,7 +13,7 @@
  * (`columnheader`, the row's own control) rather than cell positions, so
  * reordering a column does not break them.
  */
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, within, act } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { Provider } from 'react-redux'
@@ -24,7 +24,6 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import dashboardReducer from '../store/dashboardSlice'
 import chatReducer from '../store/chatSlice'
 import notificationsReducer from '../store/notificationsSlice'
-import { i18nT } from '../i18n/t'
 
 /* Render framer-motion elements as plain DOM. The side sheet is an
    AnimatePresence child with a 240ms x-translate exit, so a real
@@ -240,7 +239,6 @@ describe('crew roster — cards', () => {
 
     // Bindings are on the card itself — that is the whole point of the grid.
     expect(within(otherCard).getByText('oncall-agent')).toBeInTheDocument()
-    expect(within(otherCard).getByText('oncall-mem')).toBeInTheDocument()
     expect(within(otherCard).getByText('claude-opus-5')).toBeInTheDocument()
     // No per-crew pin on the default crew → the model reads as inherited.
     expect(within(defaultCard).getByText('Inherited')).toBeInTheDocument()
@@ -249,15 +247,11 @@ describe('crew roster — cards', () => {
     expect(within(defaultCard).queryByText('shared')).not.toBeInTheDocument()
   })
 
-  it('flags only the store that a second crew also points at', async () => {
-    // Both crews on one memory store, distinct workspaces: the marker must land
-    // on MEMORY STORE and nowhere else. A bare "Shared" badge in the header was
-    // read by a first-run reviewer as "shared with my teammates", so the point
-    // of this shape is that it names WHICH store is doubled up.
+  it('flags a workspace shared by two crews', async () => {
     mockApi.kirocrewAgents.mockResolvedValue({
       agents: [
         { ...DEFAULT_CREW, memory_store: 'core-mem' },
-        { ...OTHER_CREW, workspace: 'oncall', memory_store: 'core-mem' },
+        { ...OTHER_CREW, workspace: 'core-ws' },
       ],
       default_agent: 'kirocrew',
     })
@@ -265,69 +259,9 @@ describe('crew roster — cards', () => {
 
     for (const name of ['kirocrew', 'oncall']) {
       const card = crewCard(name)
-      // One marker per card — the workspaces are distinct, so files are not shared.
+      // One marker per card for the shared workspace.
       expect(within(card).getAllByText('shared')).toHaveLength(1)
     }
-  })
-})
-
-describe('crew roster — memory ownership notice', () => {
-  /* Anchored on the one clause of each string that carries the disclosure, not
-     on the whole sentence: the copy is reworded whenever the isolation surface
-     grows, and a whole-sentence match would then fail for a wording change
-     while a match on incidental words would keep passing after the disclosure
-     itself was dropped. The assertions below are about STRUCTURE — one
-     page-level notice, two per-binding tips. */
-  const NOTICE = i18nT('pages.kiroCrewAgentsPage.bindings_member_memory_notice')
-  const TIP = i18nT('pages.kiroCrewAgentsPage.bindings_preview_info')
-
-  /* The view choice persists to localStorage, so a test here that switches to
-     List would otherwise hand every later block a table instead of the cards
-     they query. Cleared on both edges: before, so this block starts on cards
-     whatever ran earlier; after, so it cannot leak forward. */
-  beforeEach(() => localStorage.clear())
-  afterEach(() => localStorage.clear())
-
-  it('keeps the ownership explanation in both views', async () => {
-    await renderRoster()
-    // Page-level, so it is on screen before the user picks a view.
-    expect(screen.getByText(NOTICE)).toBeInTheDocument()
-
-    fireEvent.click(screen.getByRole('button', { name: 'List' }))
-    await screen.findByRole('table')
-    // Switching the layout must not take the caveat away with the cards.
-    expect(screen.getByText(NOTICE)).toBeInTheDocument()
-  })
-
-  it('is not repeated on every card', async () => {
-    await renderRoster()
-    // The claim is about the whole surface. Two crews, one notice — a per-card
-    // copy would put the same sentence on the page as many times as there are
-    // crews, and the roster runs to dozens.
-    expect(screen.getAllByText(NOTICE)).toHaveLength(1)
-  })
-
-  it('keeps workspace guidance and explains that existing V1 memory stays unchanged', async () => {
-    await renderRoster()
-    const sheet = await openEditor('oncall')
-    gotoPane(sheet, 'place')
-    // Two tips, one per binding the notice is about. The editor is an overlay,
-    // so the page-level notice is not readable from here — the tooltip is the
-    // only place this caveat reaches a user who is mid-edit.
-    expect(within(sheet).getAllByTitle(TIP)).toHaveLength(1)
-    const memory = within(sheet).getByText(/This member keeps its current memory \(V1\)\./)
-    expect(memory).toHaveTextContent(/^This member keeps its current memory \(V1\)\. Member memory \(V2\) is only available when creating a new crew member\.$/)
-    expect(within(sheet).queryByText(/This member cannot return to its previous memory/)).toBeNull()
-  })
-
-  it('marks the workspace and memory columns in the list view', async () => {
-    await renderRoster()
-    fireEvent.click(screen.getByRole('button', { name: 'List' }))
-    const table = await screen.findByRole('table')
-    expect(within(table).getAllByTitle(TIP)).toHaveLength(2)
-    // Each tip is a named control rather than announcing as "question mark",
-    // and the header above keeps its own short name regardless.
-    expect(within(table).getAllByRole('button', { name: 'More information' })).toHaveLength(2)
   })
 })
 
@@ -466,12 +400,9 @@ describe('crew roster — view toggle', () => {
     expect(screen.getAllByTestId('crew-row')).toHaveLength(2)
     // The cards are gone, not merely hidden underneath.
     expect(screen.queryAllByTestId('crew-card')).toHaveLength(0)
-    // Bindings move into columns, so the header names them once instead of
-    // repeating a label per card. Exact names: the workspace and memory headers
-    // carry the preview InfoTip, and each `th` pins its own `aria-label` so the
-    // tip's name is not concatenated into the column's.
+    // Bindings move into columns, so the header names them once.
     expect(within(table).getByRole('columnheader', { name: 'Workspace' })).toBeInTheDocument()
-    expect(within(table).getByRole('columnheader', { name: 'Memory Store' })).toBeInTheDocument()
+    expect(within(table).queryByRole('columnheader', { name: 'Memory Store' })).not.toBeInTheDocument()
   })
 
   it('carries each crew’s bindings into its row', async () => {
@@ -481,7 +412,6 @@ describe('crew roster — view toggle', () => {
 
     const row = screen.getByRole('button', { name: 'Edit agent oncall' }).closest('tr')!
     expect(within(row).getByText('oncall-agent')).toBeInTheDocument()
-    expect(within(row).getByText('oncall-mem')).toBeInTheDocument()
     expect(within(row).getByText('claude-opus-5')).toBeInTheDocument()
   })
 
@@ -520,11 +450,11 @@ describe('crew roster — view toggle', () => {
     await waitFor(() => expect(screen.getAllByTestId('crew-row')).toHaveLength(2))
   })
 
-  it('flags a doubled-up store in the row, naming which one', async () => {
+  it('flags a shared workspace in the row', async () => {
     mockApi.kirocrewAgents.mockResolvedValue({
       agents: [
         { ...DEFAULT_CREW, memory_store: 'core-mem' },
-        { ...OTHER_CREW, workspace: 'oncall', memory_store: 'core-mem' },
+        { ...OTHER_CREW, workspace: 'core-ws' },
       ],
       default_agent: 'kirocrew',
     })
@@ -533,7 +463,7 @@ describe('crew roster — view toggle', () => {
     await screen.findByRole('table')
 
     const row = screen.getByRole('button', { name: 'Edit agent oncall' }).closest('tr')!
-    // Memory is doubled; the workspaces are distinct, so exactly one marker.
+    // The shared workspace carries exactly one marker.
     expect(within(row).getAllByText('shared')).toHaveLength(1)
   })
 
@@ -558,7 +488,6 @@ describe('crew editor — opening', () => {
     // routes to the right one.
     gotoPane(sheet, 'place')
     expect(within(sheet).getByRole('combobox', { name: 'Workspace' })).toHaveTextContent('oncall')
-    expect(within(sheet).getByText('oncall-mem')).toBeInTheDocument()
     expect(within(sheet).queryByRole('combobox', { name: 'Memory Store' })).not.toBeInTheDocument()
 
     gotoPane(sheet, 'template')
@@ -576,7 +505,6 @@ describe('crew editor — opening', () => {
     // Create mode has no crew to edit yet, so the bindings start on the defaults.
     expect(within(sheet).getByRole('combobox', { name: 'Workspace' })).toHaveTextContent('default')
     expect(within(sheet).queryByRole('combobox', { name: 'Memory Store' })).not.toBeInTheDocument()
-    expect(within(sheet).getByText(/empty member memory/i)).toBeInTheDocument()
     // The Agent Template is the exception: it has NO safe default, because
     // pre-filling the built-in made a new crew an alias for the default agent.
     expect(within(sheet).getByRole('combobox', { name: 'Agent Template' }))

@@ -6532,6 +6532,12 @@
       "artifact": "Artefatto",
       "changed": "modificato",
       "diff_unavailable_file_exceeds_snapshot_limit": "Diff non disponibile: il file è troppo grande per il confronto (oltre {{limit}} caratteri).",
+      "file_only": "Solo file",
+      "diff_unavailable_turn_snapshot_budget": "Le modifiche di questo turno erano troppo grandi per conservare il diff di ogni file (oltre {{limit}} caratteri in totale).",
+      "turn_snapshot_budget_open_hint": "Fai clic sul nome di un file per aprirlo.",
+      "omitted_files_notice_one": "{{files}} altro file modificato in questo turno non è nell’elenco.",
+      "omitted_files_notice_many": "{{files}} altri file modificati in questo turno non sono nell’elenco.",
+      "omitted_files_notice_other": "{{files}} altri file modificati in questo turno non sono nell’elenco.",
       "file_many": "{{count}} file",
       "file_one": "{{count}} file",
       "file_other": "{{count}} file",
@@ -7183,7 +7189,11 @@
       "diagram_source": "Codice sorgente del diagramma",
       "copy_failed": "Copia non riuscita",
       "mermaid_render_failed": "Impossibile visualizzare questo diagramma. Viene mostrato il codice sorgente.",
-      "image_position": "{{index}} di {{total}}"
+      "image_position": "{{index}} di {{total}}",
+      "copy_chip_name": "Copia {{text}}",
+      "open_path_chip_name": "Apri {{path}}",
+      "browse_path_chip_name": "Esplora {{path}}",
+      "switch_to_session_chip_name": "Passa alla sessione {{label}}"
     },
     "markdownToc": {
       "contents": "Contenuto",
@@ -7306,7 +7316,8 @@
       "close_editor": "Chiudi l'editor",
       "copied": "Copiato!",
       "copy": "Copia",
-      "edit_code_block": "Modifica il blocco di codice"
+      "edit_code_block": "Modifica il blocco di codice",
+      "not_saved_hint": "Non salvato nella chat. Chiudendo si perdono le modifiche."
     },
     "notifications": {
       "notifMeta": {
@@ -8531,7 +8542,15 @@
       "temporary_active_switch_to_persistent": "Temporaneo — passa alla modalità persistente",
       "temporary_desc": "Non usa la memoria e non apprende lezioni. Conserva la trascrizione per ripristinare la scheda.",
       "try_create_a_plan_to_analyze_kirocrew_code_packa": "Prova: \"Crea un piano per analizzare il pacchetto di codice di {{productName}} e riportare il numero di file per componenti principali\"",
-      "what_can_i_do_for_you": "Cosa posso fare per te?"
+      "what_can_i_do_for_you": "Cosa posso fare per te?",
+      "greeting_what_are_we_building_today": "Cosa costruiamo oggi?",
+      "greeting_where_should_we_start": "Da dove iniziamo?",
+      "greeting_whats_on_your_mind": "Cosa hai in mente?",
+      "greeting_ready_when_you_are": "Pronto quando lo sei tu.",
+      "greeting_good_to_see_you": "Che piacere vederti. Cosa facciamo ora?",
+      "greeting_good_morning": "Buongiorno. Da dove iniziamo?",
+      "greeting_good_afternoon": "Buon pomeriggio. Da dove iniziamo?",
+      "greeting_good_evening": "Buonasera. Da dove iniziamo?"
     },
     "widgetFrame": {
       "cannot_star_widget_has_no_slug_or_message_contex": "Impossibile aggiungere ai preferiti: il widget non ha slug nè contesto del messaggio",
@@ -10079,7 +10098,8 @@
         "sign_in": "Accedi a Kiro",
         "sign_in_hint": "Apri Impostazioni → Panoramica → Accesso a Kiro, accedi di nuovo e reinvia il messaggio.",
         "feature_request_form": "Apri il modulo di richiesta funzionalità",
-        "feature_request_form_hint": "Il tuo utilizzo mensile è esaurito — invia invece la richiesta su GitHub con questo modulo. Questo modulo salta l’agente: apre il modulo delle issue di GitHub che compili tu e non consuma nulla del tuo utilizzo mensile."
+        "feature_request_form_hint": "Il tuo utilizzo mensile è esaurito — invia invece la richiesta su GitHub con questo modulo. Questo modulo salta l’agente: apre il modulo delle issue di GitHub che compili tu e non consuma nulla del tuo utilizzo mensile.",
+        "session_start_repeat_hint": "La sessione dell’agente non è riuscita ad avviarsi più volte di seguito, quindi riprendere ripeterebbe solo lo stesso avvio. Riavvia il gateway da un terminale con {{command}} e reinvia il messaggio."
       },
       "folderPanel": {
         "clear_search": "Cancella ricerca",
@@ -10331,6 +10351,13 @@
         "stop_failed": "Impossibile arrestare il subagente {{name}}",
         "stop_all_failed": "Impossibile arrestare i subagenti",
         "retry_failed_error": "Impossibile riprovare alcuni subagenti non riusciti"
+      },
+      "subagentQueued": {
+        "adaptive_cap_zero": "in attesa di avvio — gli avvii sono in pausa finché questo computer ha poca memoria o è sovraccarico; riprendono da soli quando si ristabilisce",
+        "low_memory": "in attesa di avvio — richiede {{required}} di memoria libera, ora {{available}} liberi; libera memoria per continuare",
+        "low_memory_no_figures": "in attesa di avvio — memoria libera insufficiente; libera memoria per continuare",
+        "posture_critical": "in attesa di avvio — la memoria di questo computer è criticamente bassa ({{available}} liberi); libera memoria per continuare",
+        "posture_critical_no_figures": "in attesa di avvio — la memoria di questo computer è criticamente bassa; libera memoria per continuare"
       },
       "subagentRunCard": {
         "agent_finished_many": "{{count}} agenti completati",
@@ -11022,7 +11049,6 @@
       "hidden_folders": "cartelle nascoste",
       "hide": "Nascondi",
       "hide_folder": "Nascondi la cartella",
-      "hide_from_flat_view": "Nascondi {{name}} dalla vista piatta",
       "hide_when_empty": "Nascondi quando è vuoto",
       "hours": "ore",
       "include_untagged_sessions": "Includi le sessioni senza tag",
@@ -11118,7 +11144,6 @@
       "show_hidden_folder_many": "Mostra {{count}} cartelle nascoste",
       "show_hidden_folder_one": "Mostra {{count}} cartella nascosta",
       "show_hidden_folder_other": "Mostra {{count}} cartelle nascoste",
-      "show_in_flat_view": "Mostra {{name}} nella vista piatta",
       "show_only_sessions_tagged": "Mostra solo le sessioni con il tag {{name}}",
       "show_the_folder_list": "Mostra l'elenco delle cartelle",
       "skip": "Salta",
@@ -11306,6 +11331,7 @@
       "block_semantic_memory": "Fatti che gli hai detto",
       "block_skill_hint": "Skill pertinenti",
       "block_skill_index": "Indice delle skill",
+      "block_task_facts": "Fatti richiamati per questo compito",
       "block_unclassified": "Non classificato",
       "block_your_message": "Il tuo messaggio",
       "cat_memory": "Memoria su di te",
@@ -12584,6 +12610,8 @@
         "confirm_reapply_body": "Questa operazione ricarica il modello configurato e cancella e ricostruisce i vettori di memoria archiviati."
       },
       "kiroCrewCfgTab": {
+        "agent_for_pool_processes_empty_uses_default_agent": "Agente per i processi del pool. Se vuoto usa l'agente predefinito.",
+        "applies_to_sessions_started_after_the_change": "Si applica alle sessioni avviate dopo la modifica. 'auto' isola l'agente nella sandbox ma gli strumenti per le credenziali continuano a funzionare; 'strict' nasconde inoltre le credenziali cloud, SSH, kube e dei registri, quindi quegli strumenti smettono di funzionare nell'agente, solo dove la sandbox di {{productName}} confina il processo: non su Windows né per un processo macOS delegato alla sandbox interna di kiro-cli; 'off' salta la sandbox di {{productName}} (su macOS la sandbox di kiro-cli resta attiva se abilitata).",
         "approval_mode": "Modalità di approvazione",
         "auto": "automatico",
         "auto_size_max": "Dimensione automatica massima",
@@ -12599,9 +12627,9 @@
         "embedding_provider": "Provider di embedding",
         "enable_dynamic_mcp_tool_discovery_via_kiro_cli_t": "Attiva il rilevamento dinamico degli strumenti MCP tramite kiro-cli. Ha effetto dalla prossima sessione.",
         "immediate_auto_approves_all_tools_interactive_as": "Immediato. 'auto' approva tutti gli strumenti; 'interactive' chiede prima di ciascuno.",
-        "immediate_auto_enables_sandbox_for_untrusted_too": "Immediato. 'auto' attiva la sandbox per gli strumenti non attendibili.",
         "inherited_provider": "ereditato ({{provider}})",
         "kirocrew_agents": "Agenti {{productName}}",
+        "max_age_for_pooled_processes_0_disables_expiry": "Età massima per i processi del pool. 0 disattiva la scadenza.",
         "max_channel_agents": "Numero massimo di agenti per canale",
         "max_channels": "Numero massimo di canali",
         "max_concurrent_subagents": "Numero massimo di subagenti in parallelo",
@@ -12617,6 +12645,7 @@
         "next_update_check_cycle": "Prossimo ciclo di controllo degli aggiornamenti.",
         "no_agents_defined": "Nessun agente definito",
         "no_memory_stores": "Nessun archivio della memoria",
+        "number_of_pre_spawned_processes_0_disables": "Numero di processi pre-avviati. 0 disattiva la funzione.",
         "pool_agent": "Agente del pool",
         "pool_size": "Dimensione del pool",
         "pool_ttl": "TTL del pool",
@@ -12633,12 +12662,9 @@
         "using_global_memory_settings": "Vengono usate le impostazioni globali della memoria",
         "using_legacy_mode_agent_default_agent_as_agent_t": "Modalità legacy in uso — agent.default_agent come modello di agente",
         "warm_pool": "Pool caldo",
-        "workspace": "Workspace",
-        "workspaces": "Workspace",
-        "number_of_pre_spawned_processes_0_disables": "Numero di processi pre-avviati. 0 disattiva la funzione.",
-        "agent_for_pool_processes_empty_uses_default_agent": "Agente per i processi del pool. Se vuoto usa l'agente predefinito.",
         "warm_pool_description": "Pre-avvia i processi ACP CLI per un avvio istantaneo della sessione.",
-        "max_age_for_pooled_processes_0_disables_expiry": "Età massima per i processi del pool. 0 disattiva la scadenza."
+        "workspace": "Workspace",
+        "workspaces": "Workspace"
       },
       "mcpTab": {
         "actions": "Azioni",
@@ -12698,6 +12724,23 @@
         "probe_failing_help": "{{failures}} probe fallite consecutive. Il server resta montato: e una lettura di stato, non una modifica.",
         "reset_failures": "Azzera conteggio",
         "reset_failures_help": "Azzera il conteggio degli errori consecutivi di questo server.",
+        "disabled_in_config": "Disattivato nella configurazione",
+        "disabled_in_config_invalid": "Errore di configurazione",
+        "status_invalid_value": "Valore non valido",
+        "copy_path": "Copia percorso",
+        "copy_path_named": "Copia il percorso {{file}}",
+        "path_copied": "Copiato",
+        "copy_path_failed": "Copia non riuscita",
+        "disabled_in_config_help": "Disattivato nella configurazione Kiro MCP condivisa, che anche Kiro IDE legge. Non viene mai avviato e questo pannello non può riattivarlo: modifica il flag in quella configurazione.",
+        "disabled_in_config_where": "Disattivato in <file>{{file}}</file>. Modificare questo file rimuove la sua disattivazione; un’altra configurazione può ancora tenere spento il server. Un interruttore è in programma.",
+        "disabled_in_config_where_unknown": "Disattivato nella configurazione MCP condivisa. Modificare quella configurazione rimuove la sua disattivazione; un’altra configurazione può ancora tenere spento il server. Un interruttore è in programma.",
+        "disabled_in_config_invalid_where": "Disattivato: il valore di \"disabled\" in <file>{{file}}</file> non è valido. Impostalo su true o false in quel file.",
+        "disabled_in_config_invalid_where_unknown": "Disattivato: il valore di \"disabled\" nella configurazione MCP condivisa non è valido. Impostalo su true o false in quella configurazione.",
+        "uninstall_disabled_in_config_help": "Rimuove questo server da tutte le configurazioni MCP, inclusa quella condivisa in cui è disattivato.",
+        "scope_disabled_in_config": "{{label}}: spento (disabilitato nella configurazione MCP condivisa; modificala lì)",
+        "disabled_count_one": "{{count}} disattivato",
+        "disabled_count_many": "{{count}} disattivati",
+        "disabled_count_other": "{{count}} disattivati",
         "sign_in": "Accedi",
         "sign_in_authorize": "Autorizza {{name}}",
         "sign_in_mint_failed": "Impossibile avviare l’accesso. Riprova.",
@@ -14248,6 +14291,11 @@
         "status_unavailable": "Stato non disponibile"
       },
       "chatPanel": {
+        "advanced": "Avanzate",
+        "discovery": "Scoperta",
+        "rail_label": "Impostazioni chat",
+        "side_panel": "Pannello laterale",
+        "transcript": "Conversazione",
         "about_you": "Su di te",
         "answer_only_details_on_request": "Solo risposta — parole semplicissime, dettagli su richiesta",
         "auto_add_documents": "Aggiungi documenti automaticamente",
@@ -14369,7 +14417,6 @@
         "maximum_characters_retained_in_the_completion_ev": "Numero massimo di caratteri conservati nell’evento di completamento dopo l’applicazione della modalità di troncamento. 0 disattiva completamente il troncamento. Predefinito {{n}}.",
         "mcp_apps_in_side_panel": "App MCP nel pannello laterale",
         "merge_queued_messages": "Unisci i messaggi in coda",
-        "messages": "Messaggi",
         "minimal_stats_only_name_on_hover": "Minimo (solo statistiche, nome al passaggio del mouse)",
         "mirror_documents_you_save_as_artifacts_into_the_l": "Rispecchia nella libreria i documenti che salvi come artefatti, li mantiene sincronizzati mentre li modifichi e li rimuove quando elimini l’artefatto.",
         "mod_enter_for_newline": "{{mod}}+Enter per andare a capo",
@@ -14404,11 +14451,10 @@
         "restore_window": "Ripristina la finestra",
         "retry": "Riprova",
         "role_background": "Background",
-        "role_chat": "Chat",
         "role_effort_hint": "Si applica solo ai modelli capaci di ragionamento. 'Predefinito del modello' non applica alcun override: questo lavoro non eredita il tuo sforzo di ragionamento predefinito.",
         "role_model_auto": "Automatico (scelto dal provider)",
         "role_model_auto_hint": "Con 'Automatico' scegle il provider: non eredita il tuo modello predefinito. Fissa un modello per eseguire questo lavoro su di esso.",
-        "role_subagents": "Subagent",
+        "role_subagents": "Subagenti",
         "send_shortcut": "Scorciatoia di invio",
         "session_summaries": "Riepiloghi delle sessioni",
         "sessions": "Sessioni",
@@ -14464,7 +14510,6 @@
         "failed_to_start_feature_video_download": "Impossibile avviare il download",
         "minimap_side_left": "Sinistra",
         "minimap_side_right": "Destra",
-        "minimap": "Minimappa",
         "minimap_location": "Posizione della minimappa",
         "minimap_location_desc": "Sul bordo destro, la minimappa sostituisce la barra di scorrimento.",
         "message_font_size": "Dimensione del carattere dei messaggi",
@@ -14621,6 +14666,11 @@
         "zoom_level": "Livello di zoom",
         "font_family_option_opendyslexic": "OpenDyslexic",
         "config_load_failed": "Impossibile caricare le impostazioni di visualizzazione salvate. Le impostazioni di shell, sessioni recenti e completamento dei comandi non sono disponibili finché non vengono caricate.",
+        "installed_themes_load_failed": "Impossibile caricare l'elenco dei temi; nuovo tentativo automatico. Finché non viene caricato, un tema installato non può essere selezionato né applicato.",
+        "installed_themes_refresh_failed": "Impossibile aggiornare l'elenco dei temi. Non è aggiornato.",
+        "installed_themes_refresh_failed_after_install": "Il tema è stato installato, ma l'elenco dei temi non è stato aggiornato. Premi Riprova per aggiornare l'elenco e applicarlo, oppure scegliilo dall'elenco dei temi quando si aggiorna.",
+        "retry_theme_list": "Riprova",
+        "retrying_theme_list": "Nuovo tentativo…",
         "recent_tint_save_failed": "Impossibile salvare il numero di sessioni recenti evidenziate."
       },
       "importPanel": {
@@ -15112,7 +15162,25 @@
         "file_delivery_destination_help": "Significa che il file finisce nella cartella posta in uscita di questo computer e compare nella vista File della tua dashboard — in nessun luogo visibile a terzi. Non viene mai inviato a Slack o a un canale di chat.",
         "file_delivery_armed_help": "Ancora un passaggio, su questa macchina: esegui questo comando in un terminale sul computer che esegue {{productName}} per completare l'autorizzazione alla consegna. Questo conferma che una persona è alla macchina — una sola sessione del browser non può autorizzarla.",
         "file_delivery_armed_expires": "Questa richiesta scade tra circa {{duration}}.",
-        "file_delivery_arm_status_failed": "Impossibile verificare se un'approvazione è in corso."
+        "file_delivery_arm_status_failed": "Impossibile verificare se un'approvazione è in corso.",
+        "credential_redaction_section": "Oscuramento delle credenziali nelle viste dei file",
+        "credential_redaction_toggle": "Oscura le credenziali nei file che la dashboard apre per te",
+        "credential_redaction_toggle_help": "Disattivato, i file che la dashboard apre per te (la scheda File del pannello laterale della chat e le anteprime di Libreria e Artefatti) vengono mostrati com'è stati scritti, solo nella tua dashboard. Attivo per impostazione predefinita. Le conversazioni in questa dashboard, Slack e i canali di messaggistica restano oscurati. Modificarlo ricarica i file aperti (le modifiche non salvate vengono conservate) e chiude le viste di confronto file (diff).",
+        "credential_redaction_off_notice": "I file che apri vengono mostrati senza oscuramento; chat e canali di messaggistica restano oscurati.",
+        "credential_redaction_off_since": "Disattivato dal {{time}}.",
+        "credential_redaction_read_failed": "Impossibile leggere l'impostazione di oscuramento. Qui non compare nulla perché la lettura è fallita, non perché l'oscuramento è disattivato. Il link «Apri una chat con l'agente» condivide solo questo messaggio di errore.",
+        "credential_redaction_write_failed": "Impossibile salvare la modifica. {{state}} Il link «Apri una chat con l'agente» condivide solo questo messaggio di errore.",
+        "credential_redaction_retry": "Riprova",
+        "credential_redaction_desc_intro": "{{productName}} oscura tutto ciò che somiglia a una credenziale (chiavi di accesso, token, chiavi private) dall'output dell'agente prima che tu lo veda. Quando oscura un valore tuo che devi rileggere, questi quattro passaggi te lo mostrano.",
+        "credential_redaction_step_write": "Chiedi all'agente di scrivere il valore in un file.",
+        "credential_redaction_step_off": "Disattiva l'interruttore qui sotto.",
+        "credential_redaction_step_open": "Apri quel file dalla scheda File del pannello laterale della chat.",
+        "credential_redaction_step_on": "Riattiva l'interruttore.",
+        "credential_redaction_desc_tail": "Questo è separato dalla pagina Segreti, che conserva valori a uso dell'agente. Questa impostazione controlla solo se vedi valori a forma di credenziale nei file che la dashboard apre per te. I link che sembrano portare dati all'esterno (per esempio un link di approvazione con un token lungo nell'URL) restano oscurati in entrambi i casi, e tutte le regole di blocco dei comandi restano applicate.",
+        "credential_redaction_owner_only": "Solo il proprietario della dashboard può leggere o modificare questa impostazione. Il link «Apri una chat con l'agente» condivide solo questo messaggio di errore.",
+        "credential_redaction_still_on": "L'oscuramento è ancora attivo.",
+        "credential_redaction_still_off": "L'oscuramento è ancora disattivato.",
+        "credential_redaction_ask_agent": "Apri una chat con l'agente su questo errore"
       },
       "shortcutsPanel": {
         "bind_chat_tab_switching_to_ctrl_digit_instead_of": "Associa il cambio di scheda chat a Ctrl+cifra invece di Option+cifra",
@@ -15667,7 +15735,6 @@
         "code_ready_for": "Il codice di accesso di {{name}} è pronto",
         "confirm_cancel_remove": "Sì, rimuovi «{{tag}}»",
         "confirm_delete_of": "Confirm deleting «{{name}}»",
-        "connect_after_sign_in": "Connetti dopo l’accesso",
         "copied": "Copied",
         "copy_code_aria": "Copia il tuo codice di accesso {{code}}",
         "copy_command": "Copy command",
@@ -15991,7 +16058,12 @@
       "window_tokens_col": "Finestra (token)",
       "off_body": "Attiva con <settingRef/>. Le metriche restano locali (<metricsDir/>) — nulla esce da questa macchina.",
       "gauges": "Indicatori",
-      "gauges_latest": "ultimo campione"
+      "gauges_latest": "ultimo campione",
+      "credits_by_origin": "Crediti per origine",
+      "credits_by_model": "Crediti per modello",
+      "top_sessions": "Sessioni principali",
+      "other_group": "Altri ({{n}})",
+      "full_table": "Tabella completa"
     },
     "terminalPopoutFrame": {
       "return": "Torna al dock",

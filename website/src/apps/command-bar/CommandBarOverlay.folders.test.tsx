@@ -174,19 +174,17 @@ describe('command bar — the root', () => {
     expect(rowByText('Search Folders').textContent).toContain('View')
   })
 
-  it('keeps one row per corpus — sessions, artifacts and folders — and one tail row each', async () => {
-    // Three corpora now share this surface, each reached the same way, and the row
+  it('keeps one row per corpus — sessions and folders — and one tail row each', async () => {
+    // The corpora share this surface, each reached the same way, and the row
     // that carries a typed query into one of them must not have displaced another's.
     // The folders rows were added last, so this is the assertion that would catch
     // them landing on top of a row that was already there.
     mount()
     await waitFor(() => expect(hasRow('Search Folders')).toBe(true))
     expect(hasRow('Search Sessions')).toBe(true)
-    expect(hasRow('Search Artifacts')).toBe(true)
     type('sydney')
     await waitFor(() => expect(hasRow('Search folders for')).toBe(true))
     expect(hasRow('Search sessions for')).toBe(true)
-    expect(hasRow('Search artifacts for')).toBe(true)
   })
 
   it('carries a typed query into the folders view instead of dead-ending', async () => {

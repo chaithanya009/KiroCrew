@@ -168,9 +168,7 @@ function renderPage() {
   }
 }
 
-/* The default crew deliberately does NOT point at a workspace or memory store
-   called "default": otherwise the literal "default" appears three times inside
-   its own card and the `default` badge could not be asserted by text. */
+/* The default crew uses a distinct workspace so its badge remains unambiguous. */
 const DEFAULT_CREW = {
   name: 'kirocrew',
   kiro_agent: 'kirocrew',
@@ -247,22 +245,7 @@ async function openCreate(): Promise<HTMLElement> {
 }
 
 describe('crew editor — collision warning', () => {
-  it('explains automatic member memory without an empty field or a workspace association', async () => {
-    await renderRoster()
-    const sheet = await openCreate()
-    const guidance = within(sheet).getByText('New members start with empty Member memory (V2). Global Memory V1 stays unchanged.')
-    expect(guidance).toBeVisible()
-    expect(within(sheet).queryByText('Memory store', { exact: true })).toBeNull()
-    expect(within(sheet).getByText('Workspace', { exact: true }).parentElement).not.toContainElement(guidance)
-  })
-
-  it('distinguishes new private members from existing V1 bindings in the roster banner', async () => {
-    await renderRoster()
-    expect(screen.getByText('New crew members get Member memory (V2). Existing members keep their current memory.')).toBeVisible()
-    expect(screen.queryByText(/Every named member has its own private Memory V2/)).toBeNull()
-  })
-
-  it('keeps the Global V1 warning when an in-flight workspace overlaps', async () => {
+  it('warns when an in-flight workspace overlaps', async () => {
     // Reading the PERSISTED binding here meant the warning only appeared after
     // a save and a reopen — by which point the collision it exists to prevent
     // has already happened.
@@ -272,10 +255,10 @@ describe('crew editor — collision warning', () => {
     })
     await renderRoster()
     const sheet = await openEditor('default')
-    // Both the picker and the warning live on the workspace/memory pane.
+    // Both the picker and the warning live on the workspace pane.
     fireEvent.click(within(sheet).getByTestId('crew-rail-place'))
 
-    // The ordinary assistant starts on its own workspace and Global V1 store.
+    // The ordinary assistant starts on its own workspace.
     expect(within(sheet).queryByText(/Also used by/)).not.toBeInTheDocument()
 
     // `userEvent`, not `fireEvent`, for a Radix Select inside a Radix Dialog.
@@ -290,7 +273,7 @@ describe('crew editor — collision warning', () => {
     await user.click(within(sheet).getByRole('combobox', { name: 'Workspace' }))
     await user.click(await screen.findByRole('option', { name: 'oncall' }))
 
-    // The workspace collision appears before saving; memory stays unchanged.
+    // The workspace collision appears before saving.
     await waitFor(() =>
       expect(within(sheet).getByText(/Also used by oncall/)).toBeInTheDocument(),
     )
@@ -304,124 +287,6 @@ describe('crew editor — collision warning', () => {
     await waitFor(() =>
       expect(within(sheet).getByTestId('crew-wire-workspace')).toHaveTextContent('Shared'),
     )
-    expect(within(sheet).getByTestId('crew-wire-memory')).not.toHaveTextContent('Shared')
-  })
-
-  it('keeps V1 data and cached conversations without an update provisioning action', async () => {
-    const view = await renderRoster()
-    view.queryClient.setQueryData(['member-thread', 'oncall'], { slot_key: 'member-oncall-v1' })
-    const sheet = await openEditor('oncall')
-    fireEvent.click(within(sheet).getByTestId('crew-rail-place'))
-    expect(within(sheet).getByText('This member keeps its current memory (V1). Member memory (V2) is only available when creating a new crew member.')).toBeVisible()
-    expect(within(sheet).queryByRole('button', { name: /Create.*memory/i })).toBeNull()
-    expect(mockApi.updateKirocrewAgent).not.toHaveBeenCalled()
-    expect(view.queryClient.getQueryData(['member-thread', 'oncall'])).toEqual({ slot_key: 'member-oncall-v1' })
-  })
-
-  it('keeps an existing owned V2 on its immutable store without offering creation', async () => {
-    mockApi.kirocrewAgents.mockResolvedValue({
-      agents: [
-        { ...DEFAULT_CREW, name: 'default', memory_store: 'default' },
-        { ...OTHER_CREW, workspace: 'core-ws', memory_store: 'oncall-mem' },
-      ],
-      default_agent: 'oncall',
-    })
-    mockApi.kirocrewConfig.mockResolvedValue({ memory_stores: {
-      default: {},
-      'oncall-mem': { memory_version: 2, owner_member: 'oncall' },
-    } })
-    await renderRoster()
-    const sheet = await openEditor('oncall')
-    fireEvent.click(within(sheet).getByRole('tab', { name: 'Workspace · Memory Shared' }))
-    const panel = within(sheet).getByRole('tabpanel', { name: 'Workspace · Memory Shared' })
-
-    expect(within(panel).getByText('oncall-mem', { exact: true })).toBeVisible()
-    expect(within(panel).getByText('This member uses Member memory (V2).')).toBeVisible()
-    expect(within(panel).getByRole('button', { name: 'Manage memory' })).toBeEnabled()
-    expect(within(panel).queryByRole('button', { name: 'Create private memory' })).toBeNull()
-    expect(mockApi.updateKirocrewAgent).not.toHaveBeenCalled()
-  })
-
-  it.each([
-    ['an undeclared named store', {}, 'This member’s configured memory store is unavailable. Inspect the cause on the gateway: kirocrew doctor'],
-    ['a V2 store owned by another member', { 'oncall-mem': { memory_version: 2, owner_member: 'other' } }, 'This member’s configured memory store belongs to another member. It cannot be used here. Inspect the cause on the gateway: kirocrew doctor'],
-  ] as const)('does not present %s as usable V1 or offer a downgrade', async (_case, memoryStores, reason) => {
-    mockApi.kirocrewAgents.mockResolvedValue({
-      agents: [
-        { ...DEFAULT_CREW, name: 'default', memory_store: 'default' },
-        { ...OTHER_CREW, workspace: 'core-ws', memory_store: 'oncall-mem' },
-      ],
-      default_agent: 'oncall',
-    })
-    mockApi.kirocrewConfig.mockResolvedValue({ memory_stores: { default: {}, ...memoryStores } })
-    await renderRoster()
-    const sheet = await openEditor('oncall')
-    fireEvent.click(within(sheet).getByRole('tab', { name: 'Workspace · Memory Shared' }))
-    const panel = within(sheet).getByRole('tabpanel', { name: 'Workspace · Memory Shared' })
-
-    expect(within(panel).getByText(reason, { exact: true })).toBeVisible()
-    expect(within(panel).queryByText(/Open the crew manager/i)).toBeNull()
-    expect(within(panel).queryByText(/This member keeps its current memory \(V1\)\. Member memory \(V2\) is only available when creating a new crew member\./)).toBeNull()
-    expect(within(panel).queryByRole('button', { name: 'Create private memory' })).toBeNull()
-    expect(within(panel).queryByRole('button', { name: 'Manage memory' })).toBeNull()
-    expect(mockApi.updateKirocrewAgent).not.toHaveBeenCalled()
-  })
-})
-
-describe('crew editor — a registry write re-reads the config snapshot', () => {
-  /* The memory row is the only field on this page that reads `['kirocrewConfig']`
-     rather than the registry: `memberMemoryState` decides it from
-     `kirocrewCfg.memory_stores`. Creating a member writes BOTH records in one
-     config.json write, so a create that invalidates only `['kirocrew-agents']`
-     leaves the pre-write config in cache — the just-created store key is absent
-     from it, and the row reports a store the gateway calls valid as
-     "unavailable … kirocrew doctor". Reported against a member created at 06:48
-     whose store probed `lineage=crew`, owner matching, on the same install whose
-     `kirocrew doctor` printed `valid binding` for it. */
-  it('shows the created member as private V2 instead of unavailable', async () => {
-    // The roster and the config BOTH move with the write. First resolution is
-    // the pre-write world (no such member, no such store); every later one is
-    // the post-write world. Only a second config read can reach it.
-    mockApi.kirocrewAgents
-      .mockResolvedValueOnce(AGENTS_RESPONSE)
-      .mockResolvedValue({
-        agents: [DEFAULT_CREW, OTHER_CREW, {
-          name: 'fix', kiro_agent: 'kirocrew', workspace: 'default', memory_store: 'member-fix-1',
-        }],
-        default_agent: 'kirocrew',
-      })
-    mockApi.kirocrewConfig
-      .mockResolvedValueOnce(CONFIG_RESPONSE)
-      .mockResolvedValue({
-        memory_stores: {
-          ...CONFIG_RESPONSE.memory_stores,
-          'member-fix-1': { memory_version: 2, owner_member: 'fix' },
-        },
-      })
-
-    await renderRoster()
-    const create = await openCreate()
-    fireEvent.change(within(create).getByPlaceholderText('e.g. oncall'), { target: { value: 'fix' } })
-    // The template is required and starts unselected (see
-    // KiroCrewAgentsPage.templateRequired.test.tsx), so the create cannot be
-    // fired without choosing one. `kirocrew` names an installed template and
-    // nothing else in this sheet — the workspace and model pickers offer
-    // different values — so the option is unambiguous without scoping to the
-    // stub's listbox.
-    fireEvent.click(within(create).getByRole('combobox', { name: 'Agent Template' }))
-    fireEvent.click(within(create).getByRole('option', { name: 'kirocrew' }))
-    fireEvent.click(within(create).getByRole('button', { name: 'Create' }))
-
-    await waitFor(() => expect(mockApi.createKirocrewAgent).toHaveBeenCalled())
-    // The write's own invalidation, not a window refocus or the server's generic
-    // refresh broadcast (hooks/useWebSocket.ts), which are not firing here.
-    await waitFor(() => expect(mockApi.kirocrewConfig.mock.calls.length).toBeGreaterThanOrEqual(2))
-
-    const sheet = await openEditor('fix')
-    fireEvent.click(within(sheet).getByTestId('crew-rail-place'))
-    await waitFor(() =>
-      expect(within(sheet).getByText('This member uses Member memory (V2).')).toBeVisible())
-    expect(within(sheet).queryByText(/configured memory store is unavailable/)).toBeNull()
   })
 })
 
@@ -470,7 +335,7 @@ describe('crew editor — keyboard (via a binding select)', () => {
 })
 
 describe('crew editor — overview diagram nodes navigate to their pane', () => {
-  it('clicking the workspace node lands on the workspace/memory pane, focus following', async () => {
+  it('clicking the workspace node lands on the workspace pane, focus following', async () => {
     // The clicked node unmounts with the overview pane, which would drop
     // keyboard focus to the body — the arriving tabpanel must catch it.
     await renderRoster()

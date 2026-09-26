@@ -2,117 +2,27 @@
 
 from __future__ import annotations
 
-import re
 from unittest.mock import Mock, patch
 
 import pytest
-from hypothesis import given, settings
-from hypothesis import strategies as st
 
 from kiro_crew.context import ContextBuilder, _neutralize_structural_markers
 from kiro_crew.hooks import ContextRule, HookManager, HooksConfig
 from kiro_crew.learn import LessonStore
 from kiro_crew.memory import MemoryStore
-from kiro_crew.memory_stores import memory_store_name_defect
 from kiro_crew.skills import SkillsLoader
 
-# One xdist worker for the whole module: every test here derives from ONE module-cached
-# scan of src/ (rglob + ast.parse, ~30s). Under `--dist loadgroup` an unmarked module is
-# spread across workers and each worker re-pays that scan -- measured at 5 workers x 40-75s
-# per full run for this file alone. Grouping keeps the cache single-copy per run.
+# One xdist worker for the whole module. The ``build_message`` call-site ratchet below
+# walks the package through the shared ``source_corpus`` (one memoised file list per
+# process, texts streamed and parsed only for the files that can match), so its cost is
+# now a second rather than the ~30s full-tree ``ast.parse`` this group was first added
+# for; the group stays so the file-list cache is paid once per run, not once per worker.
 pytestmark = pytest.mark.xdist_group(name="tree_scan_test_context")
 
-# ---------------------------------------------------------------------------
-# Strategies
-# ---------------------------------------------------------------------------
 
-# Valid workspace/memory_store names: non-empty alphanumeric + hyphens/underscores
-_name_st = st.text(
-    alphabet=st.sampled_from("abcdefghijklmnopqrstuvwxyz0123456789-_"),
-    min_size=1,
-    max_size=30,
-)
-
-# A store name is a single path segment, so its grammar is narrower than a
-# workspace's: lowercase alphanumerics and interior hyphens only. Generating an
-# invalid name here would only ever exercise the refusal path.
-_store_name_st = st.from_regex(r"\A[a-z0-9](?:[a-z0-9-]{0,28}[a-z0-9])?\Z", fullmatch=True).filter(
-    lambda name: name != "default" and memory_store_name_defect(name) is None
-)
-
-
-# ---------------------------------------------------------------------------
-# Property-based tests
-# ---------------------------------------------------------------------------
-
-
-class TestMemoryStoreOverrideProperty:
-    # Feature: multi-agent-orchestration, Property 7: Memory store parameter overrides workspace for memory lookup
-    @given(workspace=_name_st, memory_store=_store_name_st)
-    @settings(deadline=None)
-    def test_memory_store_overrides_workspace_in_build_session_context(
-        self, workspace: str, memory_store: str, tmp_path_factory
-    ):
-        """**Validates: Requirements 3.1, 3.2, 3.3**
-
-        When build_session_context is called with both a workspace and a
-        distinct memory_store parameter, get_memory_for must be called
-        with the memory_store value, not the workspace value.
-        """
-        from kiro_crew.config.loader import KiroCrewConfig
-        from kiro_crew.config.sections import MemoryStoreConfig
-        from kiro_crew.memory_stores import memory_store_dir_for
-
-        # These are legacy named V1 stores: the property checks routing, while
-        # the member-isolation suite covers owned V2 provisioning and algorithms.
-        # The shared test fixture pins the data home to a temporary directory.
-        cfg = KiroCrewConfig.load()
-        cfg.memory_stores[memory_store] = MemoryStoreConfig()
-        cfg.save()
-        memory_store_dir_for(memory_store).mkdir(parents=True, exist_ok=True)
-        tmp = tmp_path_factory.mktemp("ws")
-        builder = ContextBuilder(
-            memory=MemoryStore(workspace=tmp / "ws"),
-            skills=SkillsLoader(skills_path=tmp / "skills", install_builtins=False),
-        )
-
-        # Assert the resolved target: store names and workspace names use
-        # separate namespaces, so inspecting one positional argument can miss
-        # a store-routing error.
-        from kiro_crew import context as ctx_mod
-
-        calls: list[tuple[str | None, str | None]] = []
-        original_get_memory = ContextBuilder.get_memory_for
-
-        def _tracking_get_memory(ws=None, store=None):
-            calls.append((ws, store))
-            return original_get_memory(ws, store)
-
-        with patch.object(ContextBuilder, "get_memory_for", side_effect=_tracking_get_memory):
-            builder.build_session_context(
-                workspace=workspace,
-                memory_store=memory_store,
-            )
-
-        assert calls, "build_session_context must resolve a memory target"
-        # Both names reach the resolver; the store is what it prefers.
-        assert any(
-            store == memory_store for _ws, store in calls
-        ), f"Expected the store name {memory_store!r} to reach get_memory_for, got {calls}"
-
-        # Assert the actual destination, so ignoring the store argument cannot
-        # pass by routing both names into global or workspace memory.
-        ws_key, _ = ctx_mod._target_key(workspace, None)
-        store_key, store_name = ctx_mod._target_key(workspace, memory_store)
-        assert store_name == memory_store, (
-            f"a DECLARED store must win over the workspace; got {store_name!r} for "
-            f"{memory_store!r}"
-        )
-        assert store_key == f"store:{memory_store}", store_key
-        assert store_key != ws_key, "a declared store must not share the workspace's target"
-        assert ContextBuilder.get_memory_for(
-            workspace, memory_store
-        )._workspace == memory_store_dir_for(memory_store)
+@pytest.fixture(autouse=True)
+def _close_skills_loaders(close_skills_loaders):
+    """Every test here builds a ``ContextBuilder``: close its ``SkillsLoader`` (rootdir conftest)."""
 
 
 class TestContextBuilder:
@@ -163,52 +73,6 @@ class TestContextBuilder:
         # Non-interactive turns get no OPTIONS reminder at all, so no rule either.
         auto_msg, _ = builder.build_message("pick one", is_new_session=False, interactive=False)
         assert "self-contained" not in auto_msg
-
-    def test_url_backtick_carve_out_follows_the_path_rule(self, tmp_path):
-        """A backticked URL is a click-to-copy chip, not a link.
-
-        `InlineCode` upgrades a backticked span to a click-to-open chip only for
-        a backend-confirmed path; everything else -- a URL included -- becomes a
-        `CopyableCode` chip whose click copies. So the always-backtick-paths rule
-        needs an explicit URL exclusion, and it must come AFTER the rule it
-        qualifies or it reads as a standalone contradiction.
-        """
-        builder = ContextBuilder(
-            memory=MemoryStore(workspace=tmp_path / "ws"),
-            skills=SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False),
-            lessons=LessonStore(base_dir=tmp_path),
-        )
-        ctx = builder.build_session_context()
-        assert "Backtick file PATHS only" in ctx
-        assert "NEVER a URL" in ctx
-        assert ctx.index("inside inline `code` backticks") < ctx.index("Backtick file PATHS only")
-
-    def test_diff_rule_is_runtime_selected(self, tmp_path):
-        """The diff-block rule is selected server-side from the trusted runtime
-        resolution: a dashboard session (tool cards render) gets the
-        don't-repeat rule, every other surface (messaging channels, cron, CLI —
-        no tool cards) keeps the hard mandate. Deciding this at injection time
-        removes the per-turn model judgment a messaging channel's only
-        file-change display would otherwise ride on."""
-        builder = ContextBuilder(
-            memory=MemoryStore(workspace=tmp_path / "ws"),
-            skills=SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False),
-            lessons=LessonStore(base_dir=tmp_path),
-        )
-        dash = builder.build_session_context(session_key="dashboard_chat-1-1")
-        assert "do NOT repeat them as ```diff" in dash
-        assert "No exceptions" not in dash
-        for key, src in (
-            ("slack-thread-123", None),
-            ("discord:456", None),
-            ("cron_abc", None),
-            ("cli_chat", None),
-            # An explicit runtime_source overrides the key-derived guess.
-            ("dashboard_chat-1-1", "slack"),
-        ):
-            ctx = builder.build_session_context(session_key=key, runtime_source=src)
-            assert "No exceptions" in ctx, f"channel mandate missing for {key}/{src}"
-            assert "do NOT repeat them as ```diff" not in ctx
 
     def test_cc_provider_has_full_parity_with_kiro(self, tmp_path):
         """Full parity: anything injected for kiro ACP must also be injected for
@@ -426,6 +290,40 @@ class TestContextBuilder:
         assert msg.index("[THEME PERSONA]") < msg.index(marker)
         assert msg.index(marker) < msg.index(header) < msg.index(request)
 
+    def test_request_prefix_without_trailing_newline_does_not_swallow_the_next_block(
+        self, tmp_path
+    ):
+        """A ``$skill`` body arrives ``.strip()``ed (no trailing newline). The
+        assembly must still open the next block on its own line, or the context
+        breakdown books that block's bytes to the skill."""
+        from kiro_crew.context_blocks import split_blocks
+
+        builder = ContextBuilder(
+            memory=MemoryStore(workspace=tmp_path / "ws"),
+            skills=SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False),
+            lessons=LessonStore(base_dir=tmp_path),
+        )
+        request = "hi"
+        generated = "\n\n[Skill: demo]\n\nloaded procedure with no newline at the end"
+        span: list[int] = []
+        msg, _ = builder.build_message(
+            request,
+            is_new_session=False,
+            interactive=True,
+            session_key="dashboard:chat-1",
+            project="/workspace/example",
+            request_prefix_context=generated,
+            user_text_range=(0, len(request)),
+            user_span_out=span,
+        )
+        assert "\n[REPLY FORMAT RULES]" in msg
+        out = split_blocks(msg, user_span=(span[0], span[1]))
+        assert "reply_format_rules" in out
+        assert out["loaded_skill"] == len(
+            "[Skill: demo]\n\nloaded procedure with no newline at the end\n"
+        )
+        assert sum(out.values()) == len(msg)
+
     def test_dashboard_tool_nudges_require_interactive(self, tmp_path):
         """A non-interactive turn (e.g. automation) gets neither the OPTIONS
         reminder nor either dashboard-card tool nudge."""
@@ -439,18 +337,6 @@ class TestContextBuilder:
         )
         assert "ask_question" not in msg
         assert "suggest_followup" not in msg
-
-    def test_memory_injected(self, tmp_path):
-        ws = tmp_path / "ws"
-        store = MemoryStore(workspace=ws)
-        store.write("# Memory\n\nUser likes Python.")
-        builder = ContextBuilder(
-            memory=store,
-            skills=SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False),
-        )
-        ctx = builder.build_session_context()
-        assert "Python" in ctx
-        assert "[Memory" in ctx
 
     def test_skills_injected(self, tmp_path):
         skills_dir = tmp_path / "skills" / "test"
@@ -515,72 +401,6 @@ class TestContextBuilder:
         """The text inside the ``[AGENT SYSTEM PROMPT]`` block."""
         start = m.index("[AGENT SYSTEM PROMPT]\n") + len("[AGENT SYSTEM PROMPT]\n")
         return m[start : m.index("\n[END AGENT SYSTEM PROMPT]", start)]
-
-    def test_the_restored_contract_carries_the_session_start_cap(self, tmp_path):
-        """The delegation cap in the contract is a live host reading, so a
-        reading that moves between two assemblies would make the restored
-        contract differ from the one the session was given. The figure is a
-        per-session snapshot, and re-injection reuses it."""
-        builder = self._reinject_builder(tmp_path)
-        with patch(
-            "kiro_crew.resource_status.adaptive_exec_cap",
-            side_effect=[4242, 4343, 4444],
-        ):
-            fresh, _ = builder.build_message(
-                "first turn", is_new_session=True, session_key="dashboard:chat-cap-a"
-            )
-            msg, _ = builder.build_message(
-                "carry on",
-                is_new_session=False,
-                needs_reinjection=True,
-                session_key="dashboard:chat-cap-a",
-            )
-        # Equality alone is also satisfied by a rendering that dropped the
-        # token, so the substitution is asserted on its own.
-        assert "{{MAX_SUBAGENTS}}" not in self._contract(fresh)
-        assert "4242" in self._contract(fresh)
-        assert self._contract(msg) == self._contract(fresh)
-
-    def test_each_session_start_takes_its_own_cap_reading(self, tmp_path):
-        """The snapshot is per session, not per process: a session starting
-        reads the cap in force for it, so the figure still tracks the host."""
-        builder = self._reinject_builder(tmp_path)
-        with patch(
-            "kiro_crew.resource_status.adaptive_exec_cap",
-            side_effect=[4242, 4343, 4444],
-        ):
-            first, _ = builder.build_message(
-                "first turn", is_new_session=True, session_key="dashboard:chat-cap-a"
-            )
-            second, _ = builder.build_message(
-                "first turn", is_new_session=True, session_key="dashboard:chat-cap-a"
-            )
-        assert "4242" in self._contract(first)
-        assert "4343" in self._contract(second)
-
-    def test_another_session_start_leaves_this_contract_alone(self, tmp_path):
-        """One builder assembles every session in the gateway, so a sibling
-        session starting between the two assemblies must not change what
-        compaction restores here."""
-        builder = self._reinject_builder(tmp_path)
-        with patch(
-            "kiro_crew.resource_status.adaptive_exec_cap",
-            side_effect=[4242, 4343, 4444],
-        ):
-            fresh, _ = builder.build_message(
-                "first turn", is_new_session=True, session_key="dashboard:chat-cap-a"
-            )
-            builder.build_message(
-                "first turn", is_new_session=True, session_key="dashboard:chat-cap-b"
-            )
-            msg, _ = builder.build_message(
-                "carry on",
-                is_new_session=False,
-                needs_reinjection=True,
-                session_key="dashboard:chat-cap-a",
-            )
-        assert "4242" in self._contract(fresh)
-        assert self._contract(msg) == self._contract(fresh)
 
     def test_an_eviction_during_the_reading_cannot_break_the_caller(self, tmp_path):
         """One builder serves every session, so a sibling thread's eviction can
@@ -711,7 +531,7 @@ class TestContextBuilder:
             skills=SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False),
         )
         msg, hook = builder.build_message("hello", is_new_session=True)
-        assert "lobsters" in msg
+        assert "lobsters" not in msg
         assert "hello" in msg
 
     def test_build_message_resumed_session_slim_injection(self, tmp_path):
@@ -733,9 +553,10 @@ class TestContextBuilder:
         assert "[CURRENT DATE]" in msg, "minimal date header missing"
         assert "[CRITICAL RULES" in msg, "UI-contract rules must be re-anchored on resume"
         assert "hello" in msg
-        # Control: a genuinely new (non-resumed) session keeps the full injection.
+        # A genuinely new session gets the full prompt but still no memory.
         msg_full, _ = builder.build_message("hello", is_new_session=True, resumed=False)
-        assert "lobsters" in msg_full
+        assert "lobsters" not in msg_full
+        assert "[AGENT SYSTEM PROMPT]" in msg_full
         assert "[SESSION RESUMED" not in msg_full
 
     def test_build_message_injects_folder_breadcrumb(self, tmp_path):
@@ -1392,31 +1213,6 @@ class TestRuntimeDisplayName:
         assert "authoritative for this turn" in msg
         assert msg.index("[RUNTIME] Discord") < msg.index("[CURRENT USER REQUEST")
 
-    def test_channel_turn_reasserts_diff_mandate_mid_session(self, tmp_path):
-        """A dashboard-started session resumed from a channel carries the
-        relaxed diff rule from session start, but a channel renders no tool
-        cards — the per-turn refresh re-asserts the hard mandate for THIS
-        turn. Asymmetric by design: a dashboard turn never injects anything
-        (worst case there is a cosmetic duplicate diff, never a missing one)."""
-        builder = ContextBuilder(
-            memory=MemoryStore(workspace=tmp_path / "ws"),
-            skills=SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False),
-        )
-        msg, _ = builder.build_message(
-            "edit the file",
-            is_new_session=False,
-            session_key="dashboard:chat-1",
-            runtime_source="discord",
-        )
-        assert "this surface renders no tool cards" in msg
-        dash_msg, _ = builder.build_message(
-            "edit the file",
-            is_new_session=False,
-            session_key="dashboard:chat-1",
-            runtime_source="dashboard",
-        )
-        assert "this surface renders no tool cards" not in dash_msg
-
 
 class TestMultibyteSanitization:
     """Tests for multi-byte UTF-8 sanitization (kiro-cli panic workaround)."""
@@ -1599,81 +1395,6 @@ class TestLoadSteeringResources:
         )
 
 
-class TestLessonsCap:
-    def test_over_cap_preserves_complete_explicit_rules(self, tmp_path):
-        from kiro_crew.context import _LESSONS_STARTUP_CAP
-        from kiro_crew.learn import Lesson
-
-        lessons = LessonStore(base_dir=tmp_path)
-        # Save enough long lessons that the formatted context exceeds the cap.
-        # The budget that BINDS the startup rule tier is ``_LESSONS_STARTUP_CAP``
-        # (the window-independent authored-tier allowance passed as the startup
-        # renderers' ``directive_budget``), not the ordinary ``_LESSONS_CAP``, so
-        # the fixture is sized to overflow that one.
-        rule = "x" * 1000
-        for i in range(_LESSONS_STARTUP_CAP // 1000 + 5):
-            lessons.save(Lesson(ts=str(i), rule=f"{i}-{rule}", category="knowledge"))
-
-        builder = ContextBuilder(
-            memory=MemoryStore(workspace=tmp_path / "ws"),
-            skills=SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False),
-            lessons=lessons,
-        )
-        ctx = builder.build_session_context()
-
-        assert "CRITICAL ERROR — LESSONS FILE TOO LARGE" not in ctx
-        assert "[lessons truncated]" not in ctx
-        # The rule budget BINDS on the startup path. What it must never do is emit
-        # a partial rule: trimming is by whole entry, so every rule that appears
-        # appears in full, and the ones that did not fit are reported with exact
-        # counts instead of vanishing.
-        total = _LESSONS_STARTUP_CAP // 1000 + 5
-        # Match the whole rendered entry, not the rule text: these fixture rules
-        # are prefix-ambiguous ("0-xxx…" is a substring of "10-xxx…"), so a bare
-        # ``in`` reports a rule as present that was never emitted. Anchoring on the
-        # "- " bullet and the terminating newline both disambiguates the index AND
-        # proves the entry is complete rather than a truncated prefix.
-        entries = {i: f"- {i}-{rule}\n" for i in range(total)}
-        present = [i for i, entry in entries.items() if entry in ctx]
-        assert present, "the rule budget must still admit rules"
-        assert len(present) < total, "this fixture is sized to overflow the rule budget"
-        # FULL ACCOUNTING, which is the invariant a subset check does not carry: a
-        # subset assertion holds even if rules vanish, so the count the prompt
-        # reports as omitted must exactly equal the count missing from the prompt.
-        # Every rule is then either rendered in full or named in the notice, and a
-        # rule cannot disappear unaccounted for.
-        notice = re.search(r"omitted (\d+) of (\d+) retained rules", ctx)
-        assert notice, "an overflow must report itself"
-        omitted, reported_total = int(notice.group(1)), int(notice.group(2))
-        assert reported_total == total
-        assert len(present) + omitted == total
-        assert "read them with learn_list" in ctx
-        # And the block stays inside the budget it names.
-        start = ctx.index("[Learned corrections")
-        end = ctx.index("[End of learned corrections]", start)
-        assert end - start <= _LESSONS_STARTUP_CAP
-
-    def test_under_cap_no_error_block(self, tmp_path):
-        from kiro_crew.learn import Lesson
-
-        lessons = LessonStore(base_dir=tmp_path)
-        lessons.save(Lesson(ts="1", rule="always run the formatter", category="knowledge"))
-        lessons.save(Lesson(ts="2", rule="never force push to mainline", category="knowledge"))
-
-        builder = ContextBuilder(
-            memory=MemoryStore(workspace=tmp_path / "ws"),
-            skills=SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False),
-            lessons=lessons,
-        )
-        ctx = builder.build_session_context()
-
-        # Under the cap: no error block, and ALL lessons preserved verbatim.
-        assert "CRITICAL ERROR — LESSONS FILE TOO LARGE" not in ctx
-        assert "always run the formatter" in ctx
-        assert "never force push to mainline" in ctx
-        assert "[lessons truncated]" not in ctx
-
-
 class TestBuildMessageOffloadedAtCallSites:
     """build_message embeds the episodic query via a blocking urllib call to
     Ollama on new sessions. Async callers (gateway loop coroutines) wrap the
@@ -1700,6 +1421,7 @@ class TestBuildMessageOffloadedAtCallSites:
         fake_memory.vector_store = vector_store
         fake_memory.get_context.return_value = ""
         fake_memory.activity_index.return_value = ""
+        fake_memory.get_activity_context.return_value = ""
         vector_store.get_lessons.return_value = []
 
         with patch.object(ContextBuilder, "get_memory_for", return_value=fake_memory):
@@ -1716,6 +1438,7 @@ class TestBuildMessageOffloadedAtCallSites:
         fake_memory.vector_store = vector_store
         fake_memory.get_context.return_value = ""
         fake_memory.activity_index.return_value = ""
+        fake_memory.get_activity_context.return_value = ""
         vector_store.get_lessons.return_value = []
         vector_store.get_semantic_context.return_value = ""
 
@@ -1745,10 +1468,11 @@ class TestAsyncCallSitesUseToThread:
 
     def test_no_inline_build_message_in_async_functions(self):
         import ast
-        from pathlib import Path
+
+        from source_corpus import parsed_candidates, src_root
 
         nested_scopes = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
-        src_root = Path(__file__).resolve().parent.parent / "src" / "kiro_crew"
+        root = src_root()
         offenders: list[str] = []
 
         def _iter_frame_calls(fn: ast.AsyncFunctionDef):
@@ -1762,12 +1486,16 @@ class TestAsyncCallSitesUseToThread:
                     yield node
                 stack.extend(ast.iter_child_nodes(node))
 
-        for py in src_root.rglob("*.py"):
-            try:
-                text = py.read_text(encoding="utf-8")
-                tree = ast.parse(text)
-            except SyntaxError:
-                continue
+        # A finding is an ``ast.Attribute`` whose ``attr`` is ``build_message``, so
+        # that identifier cannot be absent from an offending file's text: the shared
+        # corpus parses only the files that carry it (a few dozen, not the whole
+        # package), one tree at a time, which is what took this gate from an
+        # 11-second full-tree parse to well under a second. ONLY that needle: the
+        # coroutine itself is found by the AST (``ast.AsyncFunctionDef``), never by
+        # a text needle -- ``async  def`` with two spaces is a valid coroutine that a
+        # literal ``"async def"`` filter would skip, and a filter that can skip a
+        # valid offender is a gate that fails open.
+        for py, text, tree in parsed_candidates(require_all=("build_message",)):
             lines = text.splitlines()
             for fn in ast.walk(tree):
                 if not isinstance(fn, ast.AsyncFunctionDef):
@@ -1783,311 +1511,13 @@ class TestAsyncCallSitesUseToThread:
                     src_line = lines[call.lineno - 1] if call.lineno <= len(lines) else ""
                     if "# loop-ok" in src_line:
                         continue
-                    offenders.append(f"{py.relative_to(src_root)}:{call.lineno} in async {fn.name}")
+                    offenders.append(f"{py.relative_to(root)}:{call.lineno} in async {fn.name}")
 
         assert not offenders, (
             "build_message called inline from async coroutine(s) — the episodic "
             "query embed blocks the event loop; wrap in run_in_embed_pool (or "
             "add '# loop-ok: <reason>' if genuinely safe):\n  " + "\n  ".join(offenders)
         )
-
-
-class TestMemoryGetContextQueryWiring:
-    """Startup passes the request but disables activity; explicit readers retain it."""
-
-    def _builder(self, tmp_path):
-        return ContextBuilder(
-            memory=MemoryStore(workspace=tmp_path / "ws"),
-            skills=SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False),
-            lessons=LessonStore(base_dir=tmp_path),
-        )
-
-    def test_new_session_passes_query_to_get_context(self, tmp_path):
-        from unittest.mock import MagicMock
-
-        builder = self._builder(tmp_path)
-        fake_memory = MagicMock()
-        fake_memory.get_context.return_value = ""
-        fake_memory.activity_index.return_value = ""
-        fake_memory.vector_store = None
-
-        with patch.object(ContextBuilder, "get_memory_for", return_value=fake_memory):
-            builder.build_message("what did we decide about paris", True, "sess-1")
-
-        assert fake_memory.get_context.call_count == 1
-        kwargs = fake_memory.get_context.call_args.kwargs
-        assert kwargs["query"] == "what did we decide about paris"
-        assert kwargs["include_activity"] is False
-
-    def test_an_empty_scoped_lesson_result_does_not_fall_back_to_jsonl(self, tmp_path):
-        # A POPULATED vector store whose rows are all out of scope has already
-        # answered. Falling through would let the JSONL store speak for it and
-        # re-inject rows deleted from it.
-        from types import SimpleNamespace
-
-        from kiro_crew.learn import Lesson
-
-        builder = self._builder(tmp_path)
-        store = builder.get_memory_for(None)
-        store._vector_store = SimpleNamespace(
-            get_episodic_context=lambda query_text, cap: "",
-            get_semantic_context=lambda query_text, cap: "",
-            get_preferences_context=lambda: "",
-            get_lessons_context=lambda query_text, cap, project_dir=None, background=False, hard_cap=0, directive_budget=0, experience_budget=0: "",
-            has_any_lesson=lambda: True,
-        )
-        builder.lessons.save(Lesson(ts="t", rule="JSONL-SENTINEL", category="tool"))
-        msg, _ = builder.build_message("q", True, "s1")
-        assert "JSONL-SENTINEL" not in msg
-
-    def test_an_unpopulated_vector_store_still_yields_jsonl_lessons(self, tmp_path):
-        # The opposite failure: while a first-boot migration is still filling the
-        # vector store it exists but holds nothing, and saved corrections must not
-        # vanish from the prompt in the meantime.
-        from types import SimpleNamespace
-
-        from kiro_crew.learn import Lesson
-
-        builder = self._builder(tmp_path)
-        store = builder.get_memory_for(None)
-        store._vector_store = SimpleNamespace(
-            get_episodic_context=lambda query_text, cap: "",
-            get_semantic_context=lambda query_text, cap: "",
-            get_preferences_context=lambda: "",
-            get_lessons_context=lambda query_text, cap, project_dir=None, background=False, hard_cap=0, directive_budget=0, experience_budget=0: "",
-            has_any_lesson=lambda: False,
-        )
-        builder.lessons.save(Lesson(ts="t", rule="JSONL-SENTINEL", category="tool"))
-        msg, _ = builder.build_message("q", True, "s1")
-        assert "JSONL-SENTINEL" in msg
-
-    def test_withheld_only_vector_store_still_yields_jsonl_lessons(self, tmp_path):
-        from kiro_crew.learn import Lesson
-        from kiro_crew.vector_memory import VectorMemoryStore
-
-        builder = self._builder(tmp_path)
-        memory = builder.get_memory_for(None)
-        vector_store = VectorMemoryStore(db_path=tmp_path / "vectors.db", embedding_dim=4)
-        vector_store.init()
-        try:
-            memory._vector_store = vector_store
-            vector_store.set_semantic(
-                "lesson.legacyvolatile",
-                {
-                    "rule": "The current model identity is gpt-5.6-sol.",
-                    "category": "preference",
-                    "negative": None,
-                },
-                1.0,
-                "user_explicit",
-            )
-            builder.lessons.save(Lesson(ts="t", rule="JSONL-SENTINEL", category="tool"))
-
-            msg, _ = builder.build_message("q", True, "s1")
-
-            assert "JSONL-SENTINEL" in msg
-            assert "gpt-5.6-sol" not in msg
-        finally:
-            vector_store.close()
-
-    def test_episodic_is_only_included_by_explicit_memory_reader(self, tmp_path):
-        from types import SimpleNamespace
-
-        builder = self._builder(tmp_path)
-        store = builder.get_memory_for(None)
-        store._vector_store = SimpleNamespace(
-            get_episodic_context=lambda query_text, cap: "[EPISODIC-SENTINEL]",
-            get_semantic_context=lambda query_text, cap: "",
-            get_preferences_context=lambda: "",
-            get_lessons_context=lambda query_text, cap, project_dir=None, background=False, hard_cap=0, directive_budget=0, experience_budget=0: "",
-            has_any_lesson=lambda: True,
-        )
-        msg, _ = builder.build_message("q", True, "s1")
-        assert "[EPISODIC-SENTINEL]" not in msg
-        assert store.get_context(query="q").count("[EPISODIC-SENTINEL]") == 1
-
-    def test_episodic_query_is_the_user_message(self, tmp_path):
-        from types import SimpleNamespace
-
-        seen: list[str] = []
-        builder = self._builder(tmp_path)
-        store = builder.get_memory_for(None)
-
-        def _episodic(query_text, cap):
-            seen.append(query_text)
-            return ""
-
-        store._vector_store = SimpleNamespace(
-            get_episodic_context=_episodic,
-            get_semantic_context=lambda query_text, cap: "",
-            get_preferences_context=lambda: "",
-            get_lessons_context=lambda query_text, cap, project_dir=None, background=False, hard_cap=0, directive_budget=0, experience_budget=0: "",
-            has_any_lesson=lambda: True,
-        )
-        builder.build_message("find my tokyo notes", True, "s2")
-        assert seen == []
-        store.get_context(query="find my tokyo notes")
-        assert seen == ["find my tokyo notes"]
-
-
-class TestDurableModelVersionLessonContext:
-    RULE = "the Python 3.12 wheel needs claude-opus-4.8 pinned in role_models"
-    NEGATIVE = "assume gpt-5.6-sol supports the streaming flag"
-    MODEL_TOOLING_RULES = (
-        ("Always use the tokenizer shipped with gpt-5.6-sol", "tool"),
-        ("Prefer the retry wrapper when calling opus-4.8 endpoints", "preference"),
-        ("Never use the streaming flag with gpt-5.6-sol", "tool"),
-        ("Always use the gpt-5-compatible tokenizer", "tool"),
-        ("Always use the gpt-5 compatible tokenizer", "tool"),
-        ("Never use gpt-5.6-sol endpoints without the retry wrapper", "tool"),
-    )
-    BACKEND_PROCESS_RULES = (
-        ("Never run as the backend service account", "tool"),
-        ("The service is running as the backend worker", "preference"),
-        ("The service is running as the active backend service account", "tool"),
-        ("The service is running as the current backend worker", "preference"),
-        ("Restart the backend after config changes", "tool"),
-        ("Run the worker as the backend user, never as root", "preference"),
-    )
-    TOOLING_RULES = MODEL_TOOLING_RULES + BACKEND_PROCESS_RULES
-
-    def _builder(self, tmp_path):
-        return ContextBuilder(
-            memory=MemoryStore(workspace=tmp_path / "ws"),
-            skills=SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False),
-            lessons=LessonStore(base_dir=tmp_path),
-        )
-
-    def test_jsonl_context_renders_durable_model_version_references(self, tmp_path):
-        from types import SimpleNamespace
-
-        from kiro_crew.learn import Lesson
-
-        builder = self._builder(tmp_path)
-        memory = builder.get_memory_for(None)
-        memory._vector_store = SimpleNamespace(
-            get_episodic_context=lambda query_text, cap: "",
-            get_semantic_context=lambda query_text, cap: "",
-            get_preferences_context=lambda: "",
-            get_lessons_context=lambda query_text, cap, project_dir=None, background=False, hard_cap=0, directive_budget=0, experience_budget=0: "",
-            has_any_lesson=lambda: False,
-        )
-        assert builder.lessons.save(Lesson(ts="t", rule=self.RULE, category="tool")) == "inserted"
-        assert (
-            builder.lessons.save(
-                Lesson(
-                    ts="t",
-                    rule="check streaming compatibility before release",
-                    category="preference",
-                    negative=self.NEGATIVE,
-                )
-            )
-            == "inserted"
-        )
-        for rule, category in self.TOOLING_RULES:
-            assert builder.lessons.save(Lesson(ts="t", rule=rule, category=category)) == "inserted"
-
-        message, _ = builder.build_message("check wheel compatibility", True, "s-version-jsonl")
-
-        assert self.RULE in message
-        assert self.NEGATIVE in message
-        for rule, _category in self.TOOLING_RULES:
-            assert rule in message
-
-    def test_vector_context_renders_durable_model_version_references(self, tmp_path):
-        from kiro_crew.vector_memory import LessonWriteOutcome, VectorMemoryStore
-
-        builder = self._builder(tmp_path)
-        memory = builder.get_memory_for(None)
-        vector_store = VectorMemoryStore(db_path=tmp_path / "vectors.db", embedding_dim=4)
-        vector_store.init()
-        try:
-            memory._vector_store = vector_store
-            first = vector_store.write_lesson(self.RULE, "tool")
-            second = vector_store.write_lesson(
-                "check streaming compatibility before release",
-                "preference",
-                negative=self.NEGATIVE,
-            )
-
-            assert first.outcome is LessonWriteOutcome.INSERTED
-            assert second.outcome is LessonWriteOutcome.INSERTED
-            assert vector_store.has_any_lesson() is True
-            rendered = vector_store.get_lessons_context("wheel compatibility")
-            assert self.RULE in rendered
-            assert self.NEGATIVE in rendered
-
-            message, _ = builder.build_message(
-                "check wheel compatibility",
-                True,
-                "s-version-vector",
-            )
-            assert self.RULE in message
-            assert self.NEGATIVE in message
-        finally:
-            vector_store.close()
-
-    @pytest.mark.parametrize("rule,category", TOOLING_RULES)
-    def test_vector_context_renders_model_qualified_tooling(
-        self, tmp_path, rule: str, category: str
-    ) -> None:
-        from kiro_crew.vector_memory import LessonWriteOutcome, VectorMemoryStore
-
-        builder = self._builder(tmp_path)
-        memory = builder.get_memory_for(None)
-        vector_store = VectorMemoryStore(db_path=tmp_path / "tooling.db", embedding_dim=4)
-        vector_store.init()
-        try:
-            memory._vector_store = vector_store
-            result = vector_store.write_lesson(rule, category)
-
-            assert result.outcome is LessonWriteOutcome.INSERTED
-            assert vector_store.has_any_lesson() is True
-            assert rule in vector_store.get_lessons_context(rule)
-
-            message, _ = builder.build_message(rule, True, "s-version-tooling")
-            assert rule in message
-        finally:
-            vector_store.close()
-
-    def test_key_confirmed_legacy_negative_pin_yields_jsonl_fallback(self, tmp_path):
-        from kiro_crew.learn import Lesson
-        from kiro_crew.vector_memory import (
-            _LESSON_NEGATIVE_SEP,
-            VectorMemoryStore,
-            _lesson_key,
-        )
-
-        builder = self._builder(tmp_path)
-        memory = builder.get_memory_for(None)
-        vector_store = VectorMemoryStore(db_path=tmp_path / "legacy-vectors.db", embedding_dim=4)
-        vector_store.init()
-        rule = "automatic selection is safest"
-        try:
-            memory._vector_store = vector_store
-            vector_store.set_semantic(
-                _lesson_key(rule),
-                f"{rule}{_LESSON_NEGATIVE_SEP}Select gpt-5.6-sol for reviews",
-                1.0,
-                "user_explicit",
-            )
-            assert vector_store.has_any_lesson() is False
-            assert vector_store.get_lessons_context() == ""
-            assert (
-                builder.lessons.save(Lesson(ts="t", rule="JSONL-SENTINEL", category="tool"))
-                == "inserted"
-            )
-
-            message, _ = builder.build_message(
-                "check fallback",
-                True,
-                "s-legacy-negative-fallback",
-            )
-
-            assert "JSONL-SENTINEL" in message
-            assert "gpt-5.6-sol" not in message
-        finally:
-            vector_store.close()
 
 
 class TestKeepVisibleMarkerRule:

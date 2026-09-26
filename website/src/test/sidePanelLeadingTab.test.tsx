@@ -24,7 +24,7 @@
  * end.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { render, screen, fireEvent, act, cleanup } from '@testing-library/react'
+import { render, screen, fireEvent, act } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { createTestStore } from './helpers'
@@ -144,8 +144,8 @@ describe('SidePanel leading tab', () => {
   it('renders first, ahead of the pinned block, labelled, with the host icon and no close control', () => {
     renderPanel({ closable: false })
     const rendered = chips()
-    // Leading + the three pinned views, and nothing else on a fresh strip.
-    expect(rendered).toHaveLength(1 + PINNED_VIEWS.length)
+    // Leading + the enabled pinned views, and nothing else on a fresh strip.
+    expect(rendered).toHaveLength(1 + PINNED_VIEWS.filter(view => view !== 'artifacts').length)
     expect(rendered[0]).toBe(leadingChip())
     // Labelled even while inactive: the label is visible text, not an aria-label.
     expect(rendered[0]).toHaveTextContent('Notes')
@@ -215,8 +215,8 @@ describe('SidePanel leading tab', () => {
 
   it('hiddenViews withdraws a view from the pinned block and the + menu alike', () => {
     renderPanel({ closable: false, hidden: new Set<SidePanelWithholdable>(['changes', 'pins', 'issues']) })
-    // Pinned block: Changes is gone; Artifacts and Files remain, after the leading chip.
-    expect(chips().map(nameOf)).toEqual(['Notes', 'Artifacts', 'Files'])
+    // Pinned block: Changes is gone; Files remains after the leading chip.
+    expect(chips().map(nameOf)).toEqual(['Notes', 'Files'])
     fireEvent.pointerDown(
       screen.getByRole('button', { name: 'Open side panel tab' }),
       { button: 0, ctrlKey: false, pointerType: 'mouse' },
@@ -266,7 +266,7 @@ describe('SidePanel leading tab', () => {
     expect(shown).toBe(LEADING_ID)
   })
 
-  it('a document tab follows its parent view: withholding Files withdraws a persisted file editor, Artifacts an artifact preview', () => {
+  it('a document tab follows its parent view: withholding Files withdraws a persisted file editor', () => {
     // A file opened on the chat page (kind 'file', not a ViewKind) is left
     // focused; the Members page then withholds every slot-bound view because
     // the slot is unconfirmed. A document tab that ignored the withdrawal would
@@ -274,25 +274,17 @@ describe('SidePanel leading tab', () => {
     // endpoint may refuse, in place of the leading tab the contract promises.
     const first = renderPanel({ closable: false })
     act(() => {
-      ctl!.openArtifact({ slug: 'plan', kind: 'markdown' }, '# plan', 'member-radar')
       ctl!.openFile('/srv/notes.md', 'notes', 'member-radar')
     })
     expect(ctl?.activeId).toBe('file:/srv/notes.md')
     first.unmount()
-    renderPanel({ closable: false, hidden: new Set<SidePanelWithholdable>(['files', 'artifacts']) })
+    renderPanel({ closable: false, hidden: new Set<SidePanelWithholdable>(['files']) })
     expect(screen.queryByRole('tab', { name: /notes\.md/ })).toBeNull()
-    expect(screen.queryByRole('tab', { name: /plan/ })).toBeNull()
     expect(leadingChip()).toHaveAttribute('aria-selected', 'true')
     expect(leadingBody()).toBeInTheDocument()
     expect(shown).toBe(LEADING_ID)
     // Stored, not deleted — same contract as any withheld view.
     expect(ctl?.tabs.some(t => t.id === 'file:/srv/notes.md')).toBe(true)
-    // Withholding Files alone leaves the artifact preview in place: the mapping
-    // is per parent view, not a blanket "no documents".
-    cleanup()
-    renderPanel({ closable: false, hidden: new Set<SidePanelWithholdable>(['files']) })
-    expect(screen.queryByRole('tab', { name: /notes\.md/ })).toBeNull()
-    expect(screen.getByRole('tab', { name: /plan/ })).toBeInTheDocument()
   })
 
   it('a focus on the leading tab survives persistence: reload restores it, not the last stored tab', async () => {
@@ -329,7 +321,7 @@ describe('SidePanel leading tabs — three host tabs', () => {
   it('renders all three ahead of the pinned block, in order, every one labelled', () => {
     renderPanel({ closable: false, leading: THREE_LEADING })
     const rendered = chips()
-    expect(rendered).toHaveLength(3 + PINNED_VIEWS.length)
+    expect(rendered).toHaveLength(3 + PINNED_VIEWS.filter(view => view !== 'artifacts').length)
     expect(rendered.slice(0, 3)).toEqual(THREE_IDS.map(chipFor))
     // Labels are visible text on inactive chips too — never icon-only.
     expect(rendered.slice(0, 3).map(c => c.textContent)).toEqual([...THREE_TITLES])

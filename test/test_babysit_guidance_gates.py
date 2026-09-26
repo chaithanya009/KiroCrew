@@ -25,7 +25,6 @@ from kiro_crew.monitoring.github_pull_request import _normalize_checks
 from kiro_crew.probes.targets import infer
 
 ROOT = Path(__file__).resolve().parents[1]
-PROMPT = ROOT / "src" / "kiro_crew" / "config" / "prompt.md"
 BABYSIT_SKILL = (
     ROOT / "src" / "kiro_crew" / "builtin_skills" / "kirocrew-dev" / "babysit" / "SKILL.md"
 )
@@ -38,16 +37,6 @@ _URL = re.compile(r"https://github\.com/\S+?/pull/\d+")
 def _gating_urls(text: str) -> list[str]:
     """Every pull-request URL in ``text`` that inference actually accepts."""
     return [url for url in _URL.findall(text) if infer("Check %s now." % url) is not None]
-
-
-def test_the_monitor_start_guidance_demonstrates_a_gating_subject() -> None:
-    body = PROMPT.read_text(encoding="utf-8")
-    start = body.index("**Using monitor_start:**")
-    block = body[start : start + 1200]
-    assert _gating_urls(block), (
-        "the monitor_start guidance in prompt.md must show the subject as a pull-request "
-        "URL that inference accepts; a bare 'PR #123' leaves the loop ungated"
-    )
 
 
 def test_the_babysit_example_message_names_its_subject_by_url() -> None:

@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen, fireEvent, waitFor } from '@testing-library/react'
-import { MemoryRouter, useLocation } from 'react-router-dom'
+import { MemoryRouter } from 'react-router-dom'
 
 // jsdom polyfill: SegmentedControl uses ResizeObserver
 if (typeof globalThis.ResizeObserver === 'undefined') {
@@ -288,340 +288,7 @@ describe('ActivityViewer', () => {
 // library; these tests pin that those are gone, plus the de-dup and the
 // save-permanently routing. SessionArtifactsTab uses useNavigate, so it needs a
 // Router.
-describe('ActivityViewer — Artifacts tab', () => {
-  const artifactProps = {
-    subagents: {},
-    toolLog: [],
-    open: true,
-    onToggle: vi.fn(),
-    slot: 'test-slot',
-    view: 'artifacts' as const,
-  }
-
-  function routerWrapper({ children }: { children: React.ReactNode }) {
-    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-    const store = configureStore({
-      reducer: { chat: chatReducer, dashboard: dashboardReducer, notifications: notificationsReducer },
-    })
-    return (
-      <Provider store={store}>
-        <QueryClientProvider client={qc}>
-          <MemoryRouter>{children}</MemoryRouter>
-        </QueryClientProvider>
-      </Provider>
-    )
-  }
-
-  beforeEach(() => {
-    vi.mocked(api.artifacts).mockResolvedValue({ artifacts: [] })
-    vi.mocked(api.artifactSessionDocs).mockResolvedValue({ docs: [] })
-  })
-
-  it('scopes one artifact query to this session and fetches the library too', async () => {
-    render(<ActivityViewer {...artifactProps} />, { wrapper: routerWrapper })
-    await waitFor(() => {
-      // Session section uses the INVOLVEMENT scope (created + read + iterated),
-      // not the narrower origin-only `session` filter — that is what lets an
-      // artifact the agent merely consumed appear under "This session".
-      expect(api.artifacts).toHaveBeenCalledWith({ touchedBy: 'test-slot' })
-    })
-    // The library section is a second, unscoped query.
-    await waitFor(() => {
-      expect(api.artifacts).toHaveBeenCalledWith({})
-    })
-  })
-
-  it('lists an auto-registered widget artifact (no filesystem path)', async () => {
-    vi.mocked(api.artifacts).mockResolvedValue({
-      artifacts: [{ slug: 'abc123', name: 'Sales Chart', kind: 'widget', pinned: false, auto_registered: true }],
-    } as never)
-    render(<ActivityViewer {...artifactProps} />, { wrapper: routerWrapper })
-    expect(await screen.findByText('Sales Chart')).toBeInTheDocument()
-    // Auto-registered + unpinned is the sweepable state, so this row is the one
-    // that offers to save it permanently.
-    expect(screen.getByTestId('artifact-save-abc123')).toBeInTheDocument()
-  })
-
-  it('lists an auto-registered image artifact for this session', async () => {
-    vi.mocked(api.artifacts).mockResolvedValue({
-      artifacts: [{
-        slug: 'generated-image',
-        name: 'Generated image',
-        kind: 'image',
-        pinned: false,
-        auto_registered: true,
-        image: { mime: 'image/png', ext: 'png', alt: 'generated preview' },
-      }],
-    } as never)
-    render(<ActivityViewer {...artifactProps} />, { wrapper: routerWrapper })
-    expect(await screen.findByText('Generated image')).toBeInTheDocument()
-    expect(screen.getByText('image')).toBeInTheDocument()
-    expect(screen.getByTestId('artifact-save-generated-image')).toBeInTheDocument()
-  })
-
-  it('offers no save action once an auto-registered widget is pinned', async () => {
-    // Pinning is one-way in this panel: un-pinning only buys eligibility for
-    // the sweep, so a pinned row must NOT render a toggle back.
-    vi.mocked(api.artifacts).mockResolvedValue({
-      artifacts: [{ slug: 'abc123', name: 'Kept', kind: 'widget', pinned: true, auto_registered: true }],
-    } as never)
-    render(<ActivityViewer {...artifactProps} />, { wrapper: routerWrapper })
-    expect(await screen.findByText('Kept')).toBeInTheDocument()
-    expect(screen.queryByTestId('artifact-save-abc123')).not.toBeInTheDocument()
-  })
-
-  it('offers no save action on an explicitly created artifact', async () => {
-    // Nothing sweeps a non-auto-registered record, so the control would promise
-    // a safety it is not providing.
-    vi.mocked(api.artifacts).mockResolvedValue({
-      artifacts: [{ slug: 'plan-md', name: 'Launch plan', kind: 'markdown', pinned: false, auto_registered: false }],
-    } as never)
-    render(<ActivityViewer {...artifactProps} />, { wrapper: routerWrapper })
-    expect(await screen.findByText('Launch plan')).toBeInTheDocument()
-    expect(screen.queryByTestId('artifact-save-plan-md')).not.toBeInTheDocument()
-  })
-
-  it('lists only artifact records — a scratch file this session wrote is not one', async () => {
-    // The tab used to run a second query (GET /api/artifacts/session-docs) that
-    // admitted any path by extension (.md/.txt/.rst/…), so a scratch note the
-    // agent wrote appeared here as if it were an artifact. Files belong to the
-    // Files tab; getting into the library is an explicit act.
-    mockArtifactQueries([], [])
-    render(<ActivityViewer {...artifactProps} />, { wrapper: routerWrapper })
-    expect(await screen.findByText(/No artifacts in this chat yet/)).toBeInTheDocument()
-    expect(screen.queryByText('notes.md')).not.toBeInTheDocument()
-    expect(api.artifactSessionDocs).not.toHaveBeenCalled()
-  })
-
-  it('saving a sweepable widget pins it', async () => {
-    vi.mocked(api.artifacts).mockResolvedValue({
-      artifacts: [{ slug: 'w1', name: 'Widget One', kind: 'widget', pinned: false, auto_registered: true }],
-    } as never)
-    render(<ActivityViewer {...artifactProps} />, { wrapper: routerWrapper })
-    fireEvent.click(await screen.findByTestId('artifact-save-w1'))
-    await waitFor(() => {
-      // The REAL session key travels so a restricted slot is gated on the pin too.
-      expect(api.setArtifactPinned).toHaveBeenCalledWith('w1', true, 'dashboard:test-slot')
-    })
-    expect(api.materializeArtifact).not.toHaveBeenCalled()
-  })
-
-  it('shows the empty state when the session produced nothing and the library is empty', async () => {
-    render(<ActivityViewer {...artifactProps} />, { wrapper: routerWrapper })
-    expect(await screen.findByText(/No artifacts in this chat yet/)).toBeInTheDocument()
-  })
-
-  it('keeps a file-backed artifact this session only READ in the session section', async () => {
-    // A file-backed artifact the agent merely read is still a real artifact
-    // record and belongs under "This session" — the consumed-artifact case the
-    // touched_by scan exists to surface.
-    vi.mocked(api.artifacts).mockResolvedValue({
-      artifacts: [{ slug: 'spec-md', name: 'spec.md', kind: 'markdown', pinned: false, source_path: '/p/spec.md' }],
-    } as never)
-    render(<ActivityViewer {...artifactProps} />, { wrapper: routerWrapper })
-    // Renders once, under the session header — not duplicated into the library.
-    await waitFor(() => { expect(screen.getAllByText('spec.md')).toHaveLength(1) })
-    expect(screen.queryByText(/Artifact library/)).not.toBeInTheDocument()
-  })
-
-  /* ── Library section (section B) ──────────────────────────────────────────
-   * The tab is both a session view and a library browser. These lock in that
-   * the library renders, and that an artifact is never listed in both places.
-   */
-
-  /** Route the two queries independently: the session section asks with
-   *  `touchedBy`, the library section with `{}`. The default mock answers both
-   *  with the same value, which is what would mask a de-dup regression. */
-  function mockArtifactQueries(session: unknown[], library: unknown[]) {
-    vi.mocked(api.artifacts).mockImplementation((filters?: { touchedBy?: string }) =>
-      Promise.resolve({ artifacts: filters?.touchedBy ? session : library }) as never,
-    )
-  }
-
-  it('surfaces a library artifact by search, de-duped against the session', async () => {
-    mockArtifactQueries(
-      [{ slug: 'mine', name: 'Made Here', kind: 'widget', pinned: false }],
-      [
-        { slug: 'mine', name: 'Made Here', kind: 'widget', pinned: false },
-        { slug: 'older', name: 'From Last Week', kind: 'markdown', pinned: true },
-      ],
-    )
-    render(<ActivityViewer {...artifactProps} />, { wrapper: routerWrapper })
-    await findSection('This session', 1)
-    // The library is no longer mirrored inline — the "From your library" header
-    // carries no count and no rows until the user searches.
-    expect(screen.getByText('From your library')).toBeInTheDocument()
-    expect(screen.queryByText('From Last Week')).not.toBeInTheDocument()
-    // Typing a query surfaces the matching library artifact.
-    fireEvent.change(screen.getByPlaceholderText('Search your library…'), { target: { value: 'last week' } })
-    expect(await screen.findByText('From Last Week')).toBeInTheDocument()
-    // 'Made Here' stays once (session only) — the session item is excluded from
-    // library search results.
-    expect(screen.getAllByText('Made Here')).toHaveLength(1)
-  })
-
-  it('shows the empty hero and the library bridge when the session touched nothing', async () => {
-    mockArtifactQueries([], [{ slug: 'older', name: 'From Last Week', kind: 'markdown', pinned: true }])
-    render(<ActivityViewer {...artifactProps} />, { wrapper: routerWrapper })
-    // A fresh session shows the empty hero + "From your library", not an empty
-    // "This session" heading.
-    expect(await screen.findByText(/No artifacts in this chat yet/)).toBeInTheDocument()
-    expect(screen.getByText('From your library')).toBeInTheDocument()
-    expect(screen.queryByText(/^This session/)).not.toBeInTheDocument()
-  })
-
-  it('caps library search results and shows a no-matches state', async () => {
-    const many = Array.from({ length: 55 }, (_, i) => ({
-      slug: `a${i}`, name: `Artifact ${i}`, kind: 'widget', pinned: false,
-    }))
-    mockArtifactQueries([], many)
-    render(<ActivityViewer {...artifactProps} />, { wrapper: routerWrapper })
-    // Nothing is listed until the user searches.
-    expect(await screen.findByText('From your library')).toBeInTheDocument()
-    expect(screen.queryByText('Artifact 0')).not.toBeInTheDocument()
-    const box = screen.getByPlaceholderText('Search your library…')
-    // A broad query matches more than the cap; at most 20 rows render.
-    fireEvent.change(box, { target: { value: 'artifact' } })
-    await waitFor(() => {
-      expect(screen.getAllByText(/^Artifact \d+$/).length).toBe(20)
-    })
-    // A query matching nothing shows the no-matches state.
-    fireEvent.change(box, { target: { value: 'zzz-nope' } })
-    expect(await screen.findByText('No matches')).toBeInTheDocument()
-  })
-
-  it('links to the full artifacts library', async () => {
-    mockArtifactQueries([], [{ slug: 'older', name: 'From Last Week', kind: 'markdown', pinned: true }])
-    render(<ActivityViewer {...artifactProps} />, { wrapper: routerWrapper })
-    // The browse control carries the total library count and routes to /artifacts.
-    expect(await screen.findByText(/Browse all \(1\)/)).toBeInTheDocument()
-  })
-
-  /* ── Companion binding (requirement: the association must persist) ─────── */
-
-  /** Provider tree with a store the test keeps, so slots can be seeded. The
-   *  shared routerWrapper builds its store inline and hands back no handle. */
-  function renderWithSlots(slots: unknown[]) {
-    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-    const store = configureStore({
-      reducer: { chat: chatReducer, dashboard: dashboardReducer, notifications: notificationsReducer },
-    })
-    store.dispatch(sseSlots(slots as never))
-    return render(
-      <Provider store={store}>
-        <QueryClientProvider client={qc}>
-          <MemoryRouter><ActivityViewer {...artifactProps} /></MemoryRouter>
-        </QueryClientProvider>
-      </Provider>,
-    )
-  }
-
-  it('lists the bound companion artifact under This session, untouched', async () => {
-    // A session started from an artifact's detail page carries slot.artifact
-    // (persisted in the history meta line). The binding alone is the
-    // association, so the artifact belongs in the session section even though
-    // the agent never read or edited it — touched_by returns nothing here.
-    mockArtifactQueries([], [{ slug: 'cr-queue', name: 'CR Queue', kind: 'widget', pinned: true }])
-    renderWithSlots([{ key: 'test-slot', title: 'Artifact: CR Queue', messages: 2, running: false, artifact: 'cr-queue' }])
-    await findSection('This session', 1)
-    expect(screen.getAllByText('CR Queue')).toHaveLength(1)
-    // Pulled up into the session section, so the library section is now empty.
-    expect(screen.queryByText(/^Artifact library/)).not.toBeInTheDocument()
-  })
-
-  it('does not double-list a bound artifact the session also touched', async () => {
-    mockArtifactQueries(
-      [{ slug: 'cr-queue', name: 'CR Queue', kind: 'widget', pinned: true }],
-      [{ slug: 'cr-queue', name: 'CR Queue', kind: 'widget', pinned: true }],
-    )
-    renderWithSlots([{ key: 'test-slot', title: 'Artifact: CR Queue', messages: 2, running: false, artifact: 'cr-queue' }])
-    await findSection('This session', 1)
-    expect(screen.getAllByText('CR Queue')).toHaveLength(1)
-  })
-
-  it('ignores a binding whose artifact no longer exists', async () => {
-    // The slot keeps its binding after the artifact is deleted; there is no
-    // metadata to render, so the row is skipped rather than faked.
-    mockArtifactQueries([], [])
-    renderWithSlots([{ key: 'test-slot', title: 'Artifact: Gone', messages: 1, running: false, artifact: 'deleted-slug' }])
-    expect(await screen.findByText(/No artifacts in this chat yet/)).toBeInTheDocument()
-  })
-
-  // ── Row click routes into the side panel, not a full-page navigation ───────
-  //
-  // The whole point of the panel tab: clicking an artifact opens it inline in
-  // the side panel instead of hard-navigating to /artifacts/<slug>, which would
-  // tear down the chat to show a document the panel can render inline. Files
-  // never did that, so without this artifacts would be the only panel-capable
-  // content you could not flip between like a file.
-  it('opens an artifact row through onArtifactOpen instead of navigating', async () => {
-    const onArtifactOpen = vi.fn()
-    vi.mocked(api.artifacts).mockResolvedValue({
-      artifacts: [{ slug: 'cr-queue', name: 'CR Queue', kind: 'widget', pinned: false }],
-    } as never)
-    render(<ActivityViewer {...artifactProps} onArtifactOpen={onArtifactOpen} />, { wrapper: routerWrapper })
-    fireEvent.click(await screen.findByText('CR Queue'))
-    expect(onArtifactOpen).toHaveBeenCalledWith('cr-queue')
-  })
-
-  it('routes a library search-result row through onArtifactOpen too', async () => {
-    // A library artifact surfaced by search is the same artifact row, so it must
-    // route through onArtifactOpen (open in panel), not navigate().
-    const onArtifactOpen = vi.fn()
-    mockArtifactQueries([], [{ slug: 'old-doc', name: 'Old Doc', kind: 'markdown', pinned: false }])
-    render(<ActivityViewer {...artifactProps} onArtifactOpen={onArtifactOpen} />, { wrapper: routerWrapper })
-    fireEvent.change(await screen.findByPlaceholderText('Search your library…'), { target: { value: 'old doc' } })
-    fireEvent.click(await screen.findByText('Old Doc'))
-    expect(onArtifactOpen).toHaveBeenCalledWith('old-doc')
-  })
-
-  it('never routes an Artifacts-tab row to the file opener', async () => {
-    // The tab no longer holds anything path-addressable, so nothing here can
-    // reach onFileOpen — that is the Files tab's job.
-    const onArtifactOpen = vi.fn()
-    const onFileOpen = vi.fn()
-    vi.mocked(api.artifacts).mockResolvedValue({
-      artifacts: [{ slug: 'notes-md', name: 'notes.md', kind: 'markdown', pinned: true, source_path: '/p/notes.md' }],
-    } as never)
-    render(
-      <ActivityViewer {...artifactProps} onFileOpen={onFileOpen} onArtifactOpen={onArtifactOpen} />,
-      { wrapper: routerWrapper },
-    )
-    fireEvent.click(await screen.findByText('notes.md'))
-    expect(onArtifactOpen).toHaveBeenCalledWith('notes-md')
-    expect(onFileOpen).not.toHaveBeenCalled()
-  })
-
-  it('falls back to the detail page when no panel host is supplied', async () => {
-    // The tab can render outside a chat, where there is no panel to open into.
-    // Without a fallback the row would be a dead click. MemoryRouter never
-    // touches window.location, so the routed path is read from the router.
-    vi.mocked(api.artifacts).mockResolvedValue({
-      artifacts: [{ slug: 'cr-queue', name: 'CR Queue', kind: 'widget', pinned: false }],
-    } as never)
-    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-    const store = configureStore({
-      reducer: { chat: chatReducer, dashboard: dashboardReducer, notifications: notificationsReducer },
-    })
-    function LocationProbe() {
-      return <span data-testid="path">{useLocation().pathname}</span>
-    }
-    render(
-      <Provider store={store}>
-        <QueryClientProvider client={qc}>
-          <MemoryRouter>
-            <ActivityViewer {...artifactProps} />
-            <LocationProbe />
-          </MemoryRouter>
-        </QueryClientProvider>
-      </Provider>,
-    )
-    fireEvent.click(await screen.findByText('CR Queue'))
-    await waitFor(() => {
-      expect(screen.getByTestId('path')).toHaveTextContent('/artifacts/cr-queue')
-    })
-  })
-
+describe('ActivityViewer — subagent card layout', () => {
   // Layout: in the narrow activity rail, if every header item were shrinkable
   // "Subagent Running Tool", the elapsed clock and the Cancel button would all
   // wrap onto two lines and blow the card's header height up. The status label
@@ -687,13 +354,13 @@ describe('ActivityViewer — queued subagents', () => {
   const SLOT = 'test-slot'
   const baseProps = { subagents: {}, toolLog: [], open: true, onToggle: vi.fn(), slot: SLOT }
 
-  function queuedWrapper(queued: number) {
+  function queuedWrapper(queued: number, reason?: { reason: string; available_gb?: number; required_gb?: number }) {
     return function Wrapper({ children }: { children: React.ReactNode }) {
       const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
       const store = configureStore({
         reducer: { chat: chatReducer, dashboard: dashboardReducer, notifications: notificationsReducer },
       })
-      if (queued > 0) store.dispatch(sseSubagentQueued({ slot: SLOT, queued }))
+      if (queued > 0) store.dispatch(sseSubagentQueued({ slot: SLOT, queued, ...reason }))
       return (
         <Provider store={store}>
           <QueryClientProvider client={qc}>{children}</QueryClientProvider>
@@ -706,6 +373,68 @@ describe('ActivityViewer — queued subagents', () => {
     render(<ActivityViewer {...baseProps} view="subagents" />, { wrapper: queuedWrapper(3) })
     expect(screen.getByTestId('subagent-queued-banner').textContent).toContain('3 waiting to start')
     expect(screen.queryByText('No subagents running')).not.toBeInTheDocument()
+  })
+
+  it('keeps the concurrency text for a count with no reason (older gateway)', () => {
+    render(<ActivityViewer {...baseProps} view="subagents" />, { wrapper: queuedWrapper(3) })
+    expect(screen.getByTestId('subagent-queued-banner').textContent)
+      .toBe('3 waiting to start — queued behind the concurrency limit')
+  })
+
+  it('says a memory-deferred wave waits for memory, with both figures', () => {
+    // The F20 report: cap 4, one queued, "queued behind the concurrency limit"
+    // forever -- the memory guard had parked it and the panel never said so.
+    render(<ActivityViewer {...baseProps} view="subagents" />, {
+      wrapper: queuedWrapper(1, { reason: 'low_memory', available_gb: 3.2, required_gb: 4.5 }),
+    })
+    const text = screen.getByTestId('subagent-queued-banner').textContent ?? ''
+    expect(text).toContain('1 waiting to start')
+    expect(text).toMatch(/4\.5\s?GB/)
+    expect(text).toMatch(/3\.2\s?GB/)
+    expect(text).not.toContain('concurrency limit')
+  })
+
+  it('says a paused cap is about memory or load, in user words, not the concurrency limit', () => {
+    render(<ActivityViewer {...baseProps} view="subagents" />, {
+      wrapper: queuedWrapper(2, { reason: 'adaptive_cap_zero' }),
+    })
+    const text = screen.getByTestId('subagent-queued-banner').textContent ?? ''
+    expect(text).toContain('low on memory or overloaded')
+    expect(text).not.toContain('controller')
+    expect(text).not.toContain('concurrency limit')
+  })
+
+  it('tells the user what to do about a memory wait', () => {
+    render(<ActivityViewer {...baseProps} view="subagents" />, {
+      wrapper: queuedWrapper(1, { reason: 'low_memory', available_gb: 3.2, required_gb: 4.5 }),
+    })
+    expect(screen.getByTestId('subagent-queued-banner').textContent).toContain('free up memory to continue')
+  })
+
+  it('drops to the figure-less sentence when a memory event carries no numbers', () => {
+    render(<ActivityViewer {...baseProps} view="subagents" />, {
+      wrapper: queuedWrapper(1, { reason: 'low_memory' }),
+    })
+    const text = screen.getByTestId('subagent-queued-banner').textContent ?? ''
+    expect(text).toBe('1 waiting to start — not enough free memory; free up memory to continue')
+    expect(text).not.toMatch(/needs .* of free memory/)
+  })
+
+  it('drops to the figure-less critical sentence when the posture event carries no number', () => {
+    render(<ActivityViewer {...baseProps} view="subagents" />, {
+      wrapper: queuedWrapper(1, { reason: 'posture_critical' }),
+    })
+    const text = screen.getByTestId('subagent-queued-banner').textContent ?? ''
+    expect(text).toContain('critically low; free up memory')
+    expect(text).not.toContain('(')
+  })
+
+  it('keeps the concurrency text for the concurrency kind itself', () => {
+    render(<ActivityViewer {...baseProps} view="subagents" />, {
+      wrapper: queuedWrapper(2, { reason: 'concurrency_limit' }),
+    })
+    expect(screen.getByTestId('subagent-queued-banner').textContent)
+      .toBe('2 waiting to start — queued behind the concurrency limit')
   })
 
   it('keeps the honest empty state when nothing is queued or running', () => {
@@ -757,19 +486,5 @@ describe('ActivityViewer — panel section headers', () => {
     expect(sectionHeaders()).toEqual([['Resources', '1']])
   })
 
-  it('renders the Artifacts tab groups through the shared header, count outside the label', async () => {
-    vi.mocked(api.artifacts).mockImplementation((params?: { touchedBy?: string }) =>
-      Promise.resolve({
-        artifacts: params?.touchedBy
-          ? [{ slug: 'w1', name: 'Widget One', kind: 'widget', pinned: false }]
-          : [{ slug: 'w1', name: 'Widget One', kind: 'widget', pinned: false },
-             { slug: 'lib1', name: 'Kept Doc', kind: 'markdown', pinned: true }],
-      }) as never)
-    render(<ActivityViewer {...headerProps} view="artifacts" />, { wrapper: panelWrapper })
-    await findSection('This session', 1)
-    // "This session" carries its count as a sibling node; "From your library" is
-    // a countless header (the hairline rule sits where a count would).
-    expect(sectionHeaders()).toEqual([['This session', '1'], ['From your library', null]])
-    expect(screen.queryByText(/\(1\)/)).not.toBeInTheDocument()
-  })
+
 })

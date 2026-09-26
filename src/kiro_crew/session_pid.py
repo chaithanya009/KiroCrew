@@ -3458,14 +3458,12 @@ def _read_env_has_kirocrew_marker(pid: int, proc_root: Path | None = None) -> bo
     tables on every host and always takes the ``/proc`` path, so a fixture's
     verdict never depends on the host it runs on.
 
-    Two production arms, one per platform that HAS a same-uid environ oracle:
+    Two production arms, with macOS availability dependent on the host kernel:
 
     * Linux reads ``/proc/<pid>/environ``.
-    * macOS reads the same exec-time environment out of ``sysctl
-      KERN_PROCARGS2`` (:func:`platform_compat.darwin_process_environ`) -- the
-      kernel record ``ps -E`` reads, answered for a same-uid process with no
-      entitlement and no elevated privilege, and already relied on in this
-      codebase for argv.
+    * macOS attempts to read the exec-time environment from ``sysctl
+      KERN_PROCARGS2`` (:func:`platform_compat.darwin_process_environ`). Some
+      hosts omit the environment; that is an unreadable answer, not proof.
 
     Both are in-process kernel reads of a copy fixed at exec, which is what
     makes the marker ownership evidence rather than a claim: a same-uid process
@@ -3533,8 +3531,8 @@ def _is_sweepable_orphan_mcp(pid: int, cmdline: bytes) -> bool:
     2. cmdline is a fingerprint-less MCP launcher shape AND the process
        environ carries the ``KIROCREW_SPAWNED`` marker (catches escaped
        ``npx @playwright/mcp`` and ``<launcher> mcp start-server`` trees).
-       Needs a same-uid environ oracle, which Linux and macOS have and Windows
-       does not, so this arm is fail-closed there.
+       Needs a readable same-uid environ oracle. Linux has one; macOS may omit
+       the environment and Windows has none, so this arm fails closed there.
     """
     if _is_orphan_mcp(cmdline):
         return True

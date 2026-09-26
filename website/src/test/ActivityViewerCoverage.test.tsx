@@ -15,7 +15,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, within, act } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { Provider } from 'react-redux'
-import { MemoryRouter, useLocation } from 'react-router-dom'
+import { MemoryRouter } from 'react-router-dom'
 import type { ReactNode } from 'react'
 
 vi.mock('../api/client', () => ({
@@ -53,8 +53,9 @@ import { api } from '../api/client'
 import { createTestStore } from './helpers'
 import { openActivityToTab, selectSubagent } from '../store/chatSlice'
 import { __resetPanelTabs } from '../hooks/usePanelTabs'
-import type { SubagentActivity, ToolActivity, Artifact } from '../types'
+import type { SubagentActivity, ToolActivity } from '../types'
 import type { ExtractedLink } from '../utils/extractChatLinks'
+import { i18nT } from '../i18n/t'
 
 const SLOT = 'test-slot'
 
@@ -95,19 +96,6 @@ const mkAgent = (id: string, over: Partial<SubagentActivity> = {}): SubagentActi
   ...over,
 })
 
-
-const mkArtifact = (slug: string, over: Partial<Artifact> = {}): Artifact => ({
-  slug,
-  name: slug.replace(/-/g, ' '),
-  kind: 'markdown',
-  source: 'chat',
-  description: '',
-  tags: [],
-  version: 1,
-  created_at: '2026-08-01T00:00:00+00:00',
-  updated_at: '2026-08-01T00:00:00+00:00',
-  ...over,
-})
 
 const mkLink = (url: string, label: string, type: ExtractedLink['type'] = 'other'): ExtractedLink =>
   ({ url, label, type, msgIdx: 0 })
@@ -306,6 +294,51 @@ describe('ActivityViewer — subagent card controls', () => {
     await waitFor(() => expect(store.getState().chat.subagents.p1?.approving).toBe(false))
   })
 
+  it('withdraws the buttons and names a terminal refusal (#11180)', async () => {
+    // Duck-typed 404 (api/apiError.ts): the mocked client is not ApiError.
+    vi.mocked(api.resolveApproval).mockRejectedValue(Object.assign(new Error('not found or expired'), { status: 404 }))
+    const pending = mkAgent('p1', { status: 'pending', approval_id: 'ap-1' })
+    renderPanel(
+      <ActivityViewer {...baseProps} view="subagents" subagents={{ p1: pending }} />,
+      storeTracking(pending),
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Approve' }))
+
+    await waitFor(() => {
+      expect(screen.queryByRole('button', { name: 'Approve' })).not.toBeInTheDocument()
+    })
+    expect(screen.queryByRole('button', { name: 'Reject' })).not.toBeInTheDocument()
+    expect(screen.getByRole('alert')).toHaveTextContent(
+      i18nT('components.approvalCard.approval_no_longer_pending'),
+    )
+  })
+
+  it('re-offers the buttons when the pane gets a NEW approval id (#11180)', async () => {
+    // Duck-typed 404 (api/apiError.ts): the mocked client is not ApiError.
+    vi.mocked(api.resolveApproval).mockRejectedValue(Object.assign(new Error('not found or expired'), { status: 404 }))
+    const pending = mkAgent('p1', { status: 'pending', approval_id: 'ap-1' })
+    const { rerender } = renderPanel(
+      <ActivityViewer {...baseProps} view="subagents" subagents={{ p1: pending }} />,
+      storeTracking(pending),
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Approve' }))
+    await waitFor(() => {
+      expect(screen.queryByRole('button', { name: 'Approve' })).not.toBeInTheDocument()
+    })
+
+    // Same sub-agent id, so the pane stays mounted and keeps its state; the
+    // backend has issued it a fresh approval, which IS decidable.
+    rerender(
+      <ActivityViewer
+        {...baseProps}
+        view="subagents"
+        subagents={{ p1: { ...pending, approval_id: 'ap-2' } }}
+      />,
+    )
+    expect(screen.getByRole('button', { name: 'Approve' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Reject' })).toBeInTheDocument()
+  })
+
   it('does nothing for a pending agent with no approval id', () => {
     renderPanel(
       <ActivityViewer
@@ -481,6 +514,21 @@ describe('ActivityViewer — spawn approval entries', () => {
 
     await waitFor(() => expect(screen.getByText('Approval Needed')).toBeInTheDocument())
     expect(screen.getByRole('button', { name: /Reject/ })).toBeInTheDocument()
+  })
+
+  it('withdraws the buttons and names a terminal refusal (#11180)', async () => {
+    // Duck-typed 404 (api/apiError.ts): the mocked client is not ApiError.
+    vi.mocked(api.resolveApproval).mockRejectedValue(Object.assign(new Error('not found or expired'), { status: 404 }))
+    renderPanel(<ActivityViewer {...baseProps} view="subagents" toolLog={[pending]} />)
+    fireEvent.click(screen.getByRole('button', { name: /Approve/ }))
+
+    await waitFor(() => {
+      expect(screen.queryByRole('button', { name: /Approve/ })).not.toBeInTheDocument()
+    })
+    expect(screen.queryByRole('button', { name: /Reject/ })).not.toBeInTheDocument()
+    expect(screen.getByRole('alert')).toHaveTextContent(
+      i18nT('components.approvalCard.approval_no_longer_pending'),
+    )
   })
 
   it('offers only Approve / Reject and never reports a trust grant (#5400)', async () => {
@@ -735,9 +783,9 @@ describe('ActivityViewer — panel behaviour', () => {
     renderPanel(<ActivityViewer {...baseProps} />, store)
     // jsdom reports a zero-width parent, so the control collapses to a dropdown.
     fireEvent.click(screen.getByRole('button', { name: /Links/ }))
-    fireEvent.click(screen.getByRole('button', { name: /Artifacts/ }))
+    fireEvent.click(screen.getByRole('button', { name: /Logs/ }))
 
-    await waitFor(() => expect(store.getState().chat.activityTab).toBe('artifacts'))
+    await waitFor(() => expect(store.getState().chat.activityTab).toBe('logs'))
   })
 
   it('auto-switches to the subagents tab when a spawn approval arrives', async () => {
@@ -764,27 +812,7 @@ describe('ActivityViewer — panel behaviour', () => {
     expect(screen.getByText('Complete')).toBeInTheDocument()
   })
 
-  it('opens the full library from the Artifacts tab', async () => {
-    vi.mocked(api.artifacts).mockResolvedValue({ artifacts: [mkArtifact('design-doc')] })
-    function LocationProbe() {
-      return <span data-testid="path">{useLocation().pathname}</span>
-    }
-    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-    const store = createTestStore()
-    render(
-      <Provider store={store}>
-        <QueryClientProvider client={qc}>
-          <MemoryRouter>
-            <ActivityViewer {...baseProps} view="artifacts" />
-            <LocationProbe />
-          </MemoryRouter>
-        </QueryClientProvider>
-      </Provider>,
-    )
-    fireEvent.click(await screen.findByRole('button', { name: /Browse all/ }))
 
-    await waitFor(() => expect(screen.getByTestId('path')).toHaveTextContent('/artifacts'))
-  })
 })
 
 // ---------------------------------------------------------------------------

@@ -335,11 +335,18 @@ OFF_CARD_SETS: Mapping[str, str] = {
         "diverge, that divergence is what earns a line"
     ),
     "ACP_BACKENDS_HOOKS_LIST": (
-        "which backend's agent may ask its client for the hooks matching a trigger. "
-        "Nothing a reader choosing a harness can act on: Crew does not announce the "
-        "capability that makes an agent use the channel, so a member asks nothing and a "
-        "non-member loses nothing. A wrong membership would answer a backend that never "
-        "defined the channel, which is a defect rather than a shortfall"
+        "which backend's agent may ask its client for the hooks matching a trigger, and "
+        "have the client run one. Nothing a reader choosing a harness can act on: Crew "
+        "does not announce the capability that makes an agent use the channel, so a "
+        "member asks nothing and a non-member loses nothing. A wrong membership would "
+        "answer a backend that never defined the channel, which is a defect rather "
+        "than a shortfall"
+    ),
+    "ACP_BACKENDS_CREW_FIRES_SPEC_HOOKS": (
+        "who runs the agent spec's own hooks: the harness, or Crew's turn loop for a "
+        "harness that never receives them. The hooks run either way, so a reader "
+        "choosing a harness loses nothing; a wrong membership runs every hook twice "
+        "or not at all, which is a defect"
     ),
     "ACP_BACKENDS_HARNESS_OWNED_SESSIONS": (
         "whose disk the transcript sits on. Crew holds a non-member's transcript under "
