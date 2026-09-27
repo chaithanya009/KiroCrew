@@ -1,5 +1,5 @@
 import { memo, type ReactNode } from 'react'
-import { ExternalLink, KeyRound, Loader2, RotateCw, Settings, SlidersHorizontal } from 'lucide-react'
+import { ExternalLink, KeyRound, Loader2, RotateCw, Settings, ShieldCheck, SlidersHorizontal } from 'lucide-react'
 
 import { i18nT } from '../../i18n/t'
 import { useLanguageGeneration } from '../../i18n/useLanguageGeneration'
@@ -7,7 +7,17 @@ import { chatErrorDisplayText } from '../../lib/chatErrorRecovery'
 import { isStopEvent } from '../../lib/stopEvent'
 import { isSystemNoticeKind } from '../../lib/systemNotice'
 import type { ChatMessage } from '../../types'
+import { withOriginLink } from '../../components/withOriginLink'
 import { injectOpensTurn } from './RecoveryCard'
+
+/** Error code the backend stamps (`meta.code`) when a crew member's private
+ *  agent file no longer matches what was last reviewed in Capabilities
+ *  (`agent_capabilities.prepare_member_capabilities`). A retry re-runs the same
+ *  check, so the row links to the member's Capabilities pane instead. */
+const MATERIALIZATION_CHANGED = 'materialization_changed'
+
+export const isCapabilitiesChanged = (m: Pick<ChatMessage, 'meta'>): boolean =>
+  (m.meta as { code?: string } | undefined)?.code === MATERIALIZATION_CHANGED
 
 /** Row kind the backend stamps on a terminal model-entitlement rejection
  *  (`chat_utils.MODEL_UNENTITLED_KIND`). Both carriers are load-bearing for the
@@ -201,10 +211,24 @@ export interface ErrorCardProps {
    * an ordinary chat has no form to offer and keeps today's card.
    */
   featureRequestFormUrl?: string
+  /**
+   * The fix affordance for a `materialization_changed` row: open this crew
+   * member's Capabilities pane, where the changed agent file is reviewed and
+   * saved. Offered INSTEAD of Continue: a retry repeats the same check.
+   * Omitted on a surface with no crew editor route (embed, popout).
+   */
+  onOpenCapabilities?: () => void
 }
 
+// No `shrink-0` and no `truncate`: every action sits in a flex row, and a
+// label longer than the card (the feature-request form's, which names its
+// destination and its cost, runs 44 chars in English and 62 in German) must
+// break into lines inside the card rather than run past its edge. The control
+// shrinks to its longest word and `text-balance` splits the label into two
+// even lines instead of a long line and a stray word. The icon beside the
+// label keeps its own `shrink-0`, so only the text gives.
 const ACTION_BTN =
-  'shrink-0 inline-flex items-center gap-2 text-[12px] leading-5 font-medium px-3 py-1 rounded-md border-none cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed transition-colors'
+  'inline-flex items-center gap-2 text-[12px] leading-5 font-medium text-balance px-3 py-1 rounded-md border-none cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed transition-colors'
 
 /** The restart hint with its command as a `<code>` chip. The command is
  *  interpolated verbatim (never translated) inside the `i18nT` call, and the
@@ -259,6 +283,7 @@ export const ErrorCard = memo(function ErrorCard({
   unentitledElsewhere,
   featureRequestFormUrl,
   sessionStartRepeat,
+  onOpenCapabilities,
 }: ErrorCardProps) {
   useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   // Swap the gateway's "please retry" wording ONLY on a row that renders the
@@ -301,6 +326,30 @@ export const ErrorCard = memo(function ErrorCard({
       </div>
     )
   }
+  if (onOpenCapabilities) {
+    return (
+      <div
+        className="bg-danger-subtle ring-1 ring-inset forced-colors:border ring-danger/20 rounded-md self-center w-full max-w-full min-w-0 px-3 py-2 flex flex-col gap-2 animate-scale-in"
+        data-testid="error-card"
+        data-capabilities-changed="true"
+      >
+        <div className="text-danger text-[13px] leading-5 min-w-0" style={{ overflowWrap: 'anywhere' }}>
+          {i18nT('pages.chat.errorCard.capabilities_changed')}
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            onClick={onOpenCapabilities}
+            className={`${ACTION_BTN} bg-accent text-accent-fg hover:bg-accent-hover`}
+            data-testid="error-card-open-capabilities"
+          >
+            <ShieldCheck size={12} className="lucide-inline shrink-0" aria-hidden="true" />
+            {i18nT('pages.chat.errorCard.open_capabilities')}
+          </button>
+        </div>
+      </div>
+    )
+  }
   if (onOpenSignIn) {
     // A signed-out agent process: the one action that ends it is signing in
     // again from Settings. The prose (the backend's own wording, which may
@@ -313,7 +362,7 @@ export const ErrorCard = memo(function ErrorCard({
         data-auth-required="true"
       >
         <div className="text-danger text-[13px] leading-5 min-w-0" style={{ overflowWrap: 'anywhere' }}>
-          {content}
+          {withOriginLink(content)}
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <button
@@ -350,7 +399,7 @@ export const ErrorCard = memo(function ErrorCard({
         data-testid="error-card"
       >
         <div className="text-danger text-[13px] leading-5 min-w-0" style={{ overflowWrap: 'anywhere' }}>
-          {displayText}
+          {withOriginLink(displayText)}
         </div>
         {onPickModel && onOpenDefaultModel && (
           // Both actions are needed, and a primary/secondary pair reads as
@@ -405,7 +454,7 @@ export const ErrorCard = memo(function ErrorCard({
         data-testid="error-card"
         style={{ overflowWrap: 'anywhere' }}
       >
-        {displayText}
+        {withOriginLink(displayText)}
         {elsewhere && (
           <div className="text-[12px] leading-5 text-muted mt-1" data-testid="error-card-elsewhere-hint">
             {i18nT(elsewhereKey!)}
@@ -432,7 +481,7 @@ export const ErrorCard = memo(function ErrorCard({
       data-continuable="true"
     >
       <div className="text-danger text-[13px] leading-5 flex-1 min-w-0" style={{ overflowWrap: 'anywhere' }}>
-        {displayText}
+        {withOriginLink(displayText)}
       </div>
       <button
         type="button"

@@ -33,7 +33,7 @@ import type { KiroCrewAgent } from '../components/AgentSelector'
 import type { MemoryRecord, MemoryRecordRef, MemoryRecordQuery, MemoryRecordSelection, MemoryEditOperation, MemoryEditPreview, MemoryRecordRevision } from '../types/memoryEditing'
 import type { AutoNudgeListResponse } from '../components/autoNudgeLoop'
 import type { TaskDetailResponse, TasksListResponse, TasksSummary } from './tasks'
-import { ApiError, friendlyErrText } from './apiError'
+import { ApiError, friendlyErrText, toApiError } from './apiError'
 import { SESSION_CONTROL_STATUS_PATH_RE } from '../lib/sessionControlStatusPath'
 import { refreshOnce, __resetRefreshOnceForTests } from './refreshOnce'
 import {
@@ -41,6 +41,7 @@ import {
   installStaleOwnerHandler,
   noteStaleOwnerResponse,
 } from './staleOwnerSignal'
+import { edgeChallengeMessage, noteEdgeAuthChallenge } from './edgeAuthChallenge'
 import { beginArtifactWrite, endArtifactWrite } from '../lib/artifactWrites'
 import { withDeadline } from '../lib/withDeadline'
 import { createVoiceRequestId } from '../lib/voicePlayback'
@@ -2026,7 +2027,7 @@ export { STALE_OWNER_SESSION_CODE }
  * every existing consumer, and every test that mocks `../api/client`, is
  * unchanged by the move.
  */
-export { ApiError, friendlyErrText }
+export { ApiError, friendlyErrText, toApiError }
 
 /**
  * Whether *e* is a failure the user can only clear by signing back in.
@@ -2036,9 +2037,15 @@ export { ApiError, friendlyErrText }
  * useless to a user: it neither says the session is what broke nor points at
  * the re-auth banner. Call sites use this to swap a futile retry for the one
  * action that recovers.
+ *
+ * An interposed proxy's challenge is deliberately NOT one of these, though it
+ * also sets `authRequired`: the gateway never saw that request, so its sign-in
+ * banner and token flow cannot clear it, and offering them names the wrong
+ * system. Those failures carry their own remedy in the message instead. Call
+ * sites that only want the retry withdrawal read `authRequired` directly.
  */
 export const isAuthExpiredError = (e: unknown): boolean =>
-  e instanceof ApiError && e.authRequired
+  e instanceof ApiError && e.authRequired && !e.edgeChallenge
 
 /**
  * Build the ApiError AND journal it.
@@ -2062,11 +2069,23 @@ const apiFailure = (r: Response, errText: string): ApiError => {
   // the BODY, which checkSessionExpired (a pre-body Response hook) cannot read;
   // the prompt itself is idempotent, so the factory raising it cannot spam.
   const staleOwnerSession = noteStaleOwnerResponse(r.status, errText)
+  // A third denial neither of the above can see: a proxy in front of the gateway
+  // answered with its own sign-in page, so the signals are status + type + body.
+  // Skipped when the gateway's own header is present: that header proves the request
+  // reached the gateway, so nothing interposed answered it.
+  const edgeOutcome = authRequired || staleOwnerSession
+    ? null
+    : noteEdgeAuthChallenge(r.status, r.headers.get('content-type'), errText)
+  // Every one of these needs a person: the gateway never saw the request, so a silent
+  // retry a second later reproduces it whether a session lapsed or a firewall refused.
+  const edgeAuthExpired = edgeOutcome !== null
   const message = staleOwnerSession
     ? i18nT('api.client.stale_owner_session_sign_in_again')
     : authRequired
       ? i18nT('api.client.session_expired_sign_in_again')
-      : friendlyErrText(r.status, errText) || `HTTP ${r.status}`
+      : edgeChallengeMessage(edgeOutcome)
+        || friendlyErrText(r.status, errText)
+        || `HTTP ${r.status}`
   recordError({
     source: 'api',
     message,
@@ -2077,7 +2096,11 @@ const apiFailure = (r: Response, errText: string): ApiError => {
   })
   // A stale-owner denial is authRequired in the sense call sites care about:
   // no retry can succeed until the user signs in again.
-  return new ApiError(r.status, message, errText, authRequired || staleOwnerSession)
+  return new ApiError(
+    r.status, message, errText,
+    authRequired || staleOwnerSession || edgeAuthExpired,
+    edgeAuthExpired,
+  )
 }
 
 /**
@@ -2470,6 +2493,12 @@ export interface KiroPrerequisiteStatus {
    */
   login_command: string
   sso_login_command: string
+  /**
+   * True when the resolved CLI is the copy built into the desktop app. The gate
+   * then explains why `login_command` is an absolute path into the app's own
+   * resources rather than the bare name the user's shell would resolve.
+   */
+  bundled_cli: boolean
   setup_allowed: boolean
   /**
    * True when the CLI binary is present and executable but could not be
@@ -2903,6 +2932,15 @@ export interface MemberActivityEntry {
   project?: string
 }
 
+/** One team of crewmates (GET /api/teams). `members` are exact crew NAMES in
+ *  the user's order; a crewmate is on at most one team, which the store
+ *  enforces on every write. */
+export interface CrewTeam {
+  id: string
+  name: string
+  members: string[]
+}
+
 /** Free-form fields a crew publishes into its webview. The crew owns the shape,
  *  so every value is unknown until the renderer narrows it. */
 export type CrewPanelData = Record<string, unknown>
@@ -3284,8 +3322,7 @@ export const api = {
   wakatimeExportDownload: async (start: string, end: string, format: 'csv' | 'json') => {
     const r = await get(api.wakatimeExportUrl(start, end, format))
     if (!r.ok) {
-      const t = await r.text()
-      throw new ApiError(r.status, t || `HTTP ${r.status}`)
+      throw await toApiError(r)
     }
     const blob = await r.blob()
     const cd = r.headers.get('Content-Disposition') || ''
@@ -3449,6 +3486,15 @@ export const api = {
     patch('/api/security/denied-commands/user/' + encodeURIComponent(id), { enabled }).then(j) as Promise<DeniedCommandsData>,
   deleteUserDeniedCommand: (id: string) =>
     del('/api/security/denied-commands/user/' + encodeURIComponent(id)).then(j) as Promise<DeniedCommandsData>,
+  // Redaction cards: the per-workspace allowed-host list (Settings → Security →
+  // Redaction). Every route is owner-only.
+  redactionAllowedHosts: () =>
+    get('/api/redaction/allowed-hosts').then(j) as Promise<{ workspaces: Record<string, string[]> }>,
+  redactionAllowHost: (slot: string, host: string) =>
+    post('/api/redaction/allowed-hosts', { slot, host }).then(j) as Promise<{ ok: boolean; workspace: string }>,
+  redactionRevokeHost: (workspace: string, host: string) =>
+    del(`/api/redaction/allowed-hosts?workspace=${encodeURIComponent(workspace)}&host=${encodeURIComponent(host)}`)
+      .then(j) as Promise<{ ok: boolean; removed: boolean }>,
   // Third-party app trust (Settings → Security). Like denied-commands, every
   // endpoint returns the full refreshed snapshot so callers can seed the query
   // cache from the mutation response instead of re-fetching.
@@ -3516,15 +3562,7 @@ export const api = {
   exportSession: async (slot: string) => {
     const r = await get('/api/chat/slots/' + encodeURIComponent(slot) + '/export')
     if (!r.ok) {
-      let message = `HTTP ${r.status}`
-      try {
-        const body = await r.json()
-        if (body?.error) message = body.error
-      } catch {
-        // A non-JSON error body is not worth a second failure mode; the status
-        // line above is still a usable message.
-      }
-      throw new ApiError(r.status, message)
+      throw await toApiError(r)
     }
     const blob = await r.blob()
     const filename = filenameFromDisposition(
@@ -3916,6 +3954,18 @@ export const api = {
        *  notes. */
       truncated: boolean
     }>,
+  // Crewmate teams: a name plus an ordered member list, stored by the gateway
+  // in the data home's crew-teams directory. Dashboard-only like the members routes; the three
+  // writes are owner actions. `remove` rather than `delete`: a reserved word
+  // reads badly as a method name at every call site.
+  teams: {
+    list: () => fetch('/api/teams').then(j) as Promise<{ teams: CrewTeam[] }>,
+    create: (body: { name: string; members: string[] }) =>
+      post('/api/teams', body).then(j) as Promise<{ team: CrewTeam }>,
+    update: (id: string, body: { name?: string; add?: string[]; remove?: string[] }) =>
+      put('/api/teams/' + encodeURIComponent(id), body).then(j) as Promise<{ team: CrewTeam }>,
+    remove: (id: string) => del('/api/teams/' + encodeURIComponent(id)).then(j) as Promise<{ ok: boolean }>,
+  },
   updateKirocrewAgent: (name: string, body: object) =>
     put('/api/agents/' + encodeURIComponent(name), body).then(j),
   deleteKirocrewAgent: (name: string) =>
@@ -3974,6 +4024,14 @@ export const api = {
     }).then(j) as Promise<{ ok?: boolean; staged?: boolean; token?: string; error?: string }>
   },
   models: () => fetch('/api/models').then(j),
+  chatSlotSelectionCapabilities: (slot: string) =>
+    fetch('/api/chat/slots/' + encodeURIComponent(slot) + '/selection-capabilities').then(j) as Promise<{
+      known: boolean
+      backend?: string
+      effort_supported?: boolean
+      effort_levels?: string[]
+      model_effort_pair_ids?: boolean
+    }>,
   effortLevels: (slot?: string) =>
     fetch('/api/effort-levels' + (slot ? '?slot=' + encodeURIComponent(slot) : '')).then(j) as Promise<string[]>,
   // Bounded HERE, not per initiator: react-query dedupes on the key, so the
@@ -4001,7 +4059,7 @@ export const api = {
   chatSlotsModel: (model: string, skip_running: boolean) =>
     post('/api/chat/slots/model', { model, skip_running }).then(j) as Promise<{ ok: boolean; model: string; switched: string[]; skipped_running: string[]; unchanged: string[]; failed: string[] }>,
   chatSlotReasoningEffort: (slot: string, reasoning_effort: string) =>
-    post('/api/chat/slots/' + encodeURIComponent(slot) + '/reasoning-effort', { reasoning_effort }).then(j) as Promise<{ ok?: boolean; reasoning_effort?: string; deferred?: boolean }>,
+    post('/api/chat/slots/' + encodeURIComponent(slot) + '/reasoning-effort', { reasoning_effort }).then(j) as Promise<{ ok?: boolean; reasoning_effort?: string; model?: string; deferred?: boolean }>,
   chatSlotWorkspace: (slot: string, workspace: string) =>
     post('/api/chat/slots/' + encodeURIComponent(slot) + '/workspace', { workspace }).then(j),
   // Relaunch the slot's agent process in place (fresh agent spec, env, and MCP
@@ -4029,7 +4087,7 @@ export const api = {
   projectGit: (path: string) => fetch('/api/project/git?path=' + encodeURIComponent(path)).then(j) as Promise<{ path: string; repo: boolean; repoRoot?: string; branch?: string; detached?: boolean; head?: string }>,
   projectGitStatus: (path: string) => fetch('/api/project/git/status?path=' + encodeURIComponent(path)).then(j) as Promise<{ repo: boolean; repoRoot?: string; branch?: string; ahead?: number; behind?: number; truncated?: boolean; files: { path: string; status: string; staged: boolean; additions?: number; deletions?: number }[] }>,
   projectGitLog: (path: string, limit = 20) => fetch('/api/project/git/log?path=' + encodeURIComponent(path) + '&limit=' + limit).then(j) as Promise<{ repo: boolean; commits: { sha: string; message: string; author: string; date: string; isHead: boolean }[] }>,
-  projectTree: (path: string) => fetch('/api/project/tree?path=' + encodeURIComponent(path)).then(j) as Promise<{ root: string; paths: string[]; directories?: string[]; repo: boolean; truncated?: boolean; truncatedDirectories?: string[] }>,
+  projectTree: (path: string) => fetch('/api/project/tree?path=' + encodeURIComponent(path)).then(j) as Promise<{ root: string; paths: string[]; directories?: string[]; repo: boolean; truncated?: boolean; truncatedDirectories?: string[]; hiddenOnlyDirectories?: string[]; unreadableDirectories?: string[]; linkedDirectories?: string[] }>,
   workspaces: () => fetch('/api/workspaces').then(j),
   createWorkspace: (body: object) => post('/api/workspaces', body).then(j),
   updateWorkspace: (name: string, body: object) =>
@@ -4806,8 +4864,10 @@ export const api = {
   resolveApproval: (id: string, action: 'approve' | 'reject' | 'reject_once') => post('/api/approvals/' + encodeURIComponent(id) + '/' + action, {}).then(j),
   /** Question cards still awaiting an answer, for rehydration after a reload or
    *  websocket reconnect (`question_card` is a one-shot broadcast). A blocking
-   *  ask carries `ask_id`; a stateless card carries `card_id` instead. */
-  pendingQuestions: (): Promise<{ ask_id?: string; card_id?: string; slot: string; questions: { question: string; header?: string; multiSelect?: boolean; options: { label: string; description?: string }[] }[]; ts?: number }[]> =>
+   *  ask carries `ask_id`; a stateless card carries `card_id` instead, and
+   *  `native` when it is kiro-cli's mid-turn `AskUserQuestion` card (whose
+   *  answer steers into the live turn). */
+  pendingQuestions: (): Promise<{ ask_id?: string; card_id?: string; native?: boolean; slot: string; questions: { question: string; header?: string; multiSelect?: boolean; options: { label: string; description?: string }[] }[]; ts?: number }[]> =>
     fetch('/api/ask-question/pending').then(j),
   /** Resolve a pending agent question that carries an `ask_id` — a server-side
    *  wait opened by `POST /api/ask-question`, not the MCP ask_question tool,
@@ -4917,8 +4977,7 @@ export const api = {
   exportPlanYaml: async (taskId: string) => {
     const r = await get('/api/taskrunner/' + encodeURIComponent(taskId) + '/plan.yaml')
     if (!r.ok) {
-      const t = await r.text()
-      throw new ApiError(r.status, t || `HTTP ${r.status}`)
+      throw await toApiError(r)
     }
     const blob = await r.blob()
     const cd = r.headers.get('Content-Disposition') || ''
@@ -5681,8 +5740,7 @@ export const api = {
     const r = await post(item.endpoint, { item_id: item.id, ...ctx }, sessionKey, undefined, 'error')
     checkSessionExpired(r)
     if (r.ok) { removeAuthBanner(); return r.json() }
-    const errText = await r.text()
-    throw new ApiError(r.status, errText || `HTTP ${r.status}`)
+    throw await toApiError(r)
   },
 
   artifactTeardown: (slug: string) => post(`/api/deploy/teardown/${slug}`, { confirm: true }).then(j),
@@ -5725,8 +5783,7 @@ export const api = {
     if (r.ok) { removeAuthBanner(); return r.json() }
     // 409 = scan blocked — parse body so PublishHub can render findings panel
     if (r.status === 409) { return r.json() }
-    const errText = await r.text()
-    throw new ApiError(r.status, errText || `HTTP ${r.status}`)
+    throw await toApiError(r)
   },
 
   // Tips

@@ -700,7 +700,8 @@ def _doctor_mcp_tools(
        into ``tools`` nor probed (see :func:`_spec_gate_closed`). Missing
        ``tools`` entries — and ``allowedTools`` entries for every server
        outside :data:`_NO_BLANKET_ALLOW_MCPS` — are auto-appended and the file
-       is rewritten atomically. A missing ``mcpServers`` entry cannot be
+       is rewritten atomically; an instance that must not own the shared agent
+       home writes nothing and reports the repairs as issues. A missing ``mcpServers`` entry cannot be
        auto-added because the command path is install-specific.
     2. Live handshake probe via :func:`mcp_discovery.probe_server`. Reports
        per-server status with tool count on success, and on failure shows
@@ -728,6 +729,8 @@ def _doctor_mcp_tools(
     allowed = agent_data.get("allowedTools", [])
     mcps = agent_data.get("mcpServers", {})
     config_changed = False
+    # Read-only probe (no SEL write): a declined instance never writes the shared spec.
+    declined = _agent._decline_shared_agent_home(audit=False) is not None
 
     probe_targets = []
     if gated_off is None:
@@ -818,7 +821,12 @@ def _doctor_mcp_tools(
         # `allowedTools` auto-approves, which is the one path that never reaches
         # the PreToolUse gate — so what the ceiling says about this server decides
         # both whether doctor may mint a grant and whether an existing one stands.
-        if not may_skip_gate_now(ref):
+        if not may_skip_gate_now(ref) and ref in allowed and declined:
+            config_changed = True
+            issues.append(
+                f"{ref} auto-approve forbidden by ceiling (repair from the owning install)"
+            )
+        elif not may_skip_gate_now(ref):
             # REVOKE, not merely "do not add". A grant can predate the ceiling —
             # the policy arrives on a host whose config was written while it was
             # ungoverned — and leaving it in place means the ceiling applies only
@@ -879,6 +887,20 @@ def _doctor_mcp_tools(
         )
 
     if config_changed:
+        try:  # both verdicts on the shared spec are audited; the audit must not break doctor
+            sel().log_api_access(
+                caller="system",
+                operation="agent_home_write",
+                outcome="denied" if declined else "allowed",
+                source="cli_doctor",
+                resources=str(agent_path),
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("SEL audit unavailable for doctor spec write", exc_info=True)
+    if config_changed and declined:
+        print("  → Auto-fix skipped: shared home")
+        issues.append("agent config (auto-fix skipped: shared home)")
+    elif config_changed:
         agent_data["tools"] = tools
         agent_data["allowedTools"] = allowed
         agent_data["mcpServers"] = mcps
@@ -1937,11 +1959,14 @@ def _kiro_cli_signed_in() -> bool | None:
     kiro-cli row above already reports the install, and "not signed in" would send
     someone to ``kiro-cli login`` before there is a ``kiro-cli`` to run it.
     """
-    if not shutil.which(KIRO_CLI_BIN):
+    binary = resolve_kiro_cli()
+    if not binary:
         return None
+    # The same binary the gateway spawns: the desktop app's bundled copy ranks
+    # above PATH, so ``shutil.which`` could name a copy no session runs.
     try:
         result = subprocess.run(  # noqa: S603 - argv list, no shell, local binary
-            [KIRO_CLI_BIN, "whoami"],
+            [binary, "whoami"],
             capture_output=True,
             timeout=10,
             **UTF8_TEXT,
@@ -4197,6 +4222,64 @@ def _doctor_agents_janitor(issues: list[str], sweep_backups: bool) -> None:
     else:
         print("  janitor:     ✅ no stale temp/backup files to reclaim")
     _doctor_skill_view_census(agents_dir)
+    _doctor_run_dirs()
+
+
+# Unmarked run directories above which the doctor warns. Each is one directory
+# holding one small file; the count matters as a listing cost on the workspace
+# root, which every derived-cwd spawn's ``mkdir`` re-enumerates.
+_RUN_DIR_BACKLOG_WARN = 1000
+
+
+def _doctor_run_dirs() -> None:
+    """Report, in one line, the run directories the gateway's sweep cannot reclaim.
+
+    Advisory and read-only. A subagent or stateless cron run gets a directory
+    under the workspace root that the provider marks at first start and reclaims
+    at shutdown; the gateway sweeps what a dead predecessor of its own data home
+    left. Two figures from one bounded walk, judged by the sweep's own rule:
+    directories from builds that wrote no marker (a name is not provenance, so
+    the sweep deletes nothing it cannot prove Crew made), and marked directories
+    this data home cannot act on -- another data home's, an unreadable marker,
+    or a gateway the pid ledger still retains entries for. Named, never done:
+    the doctor deletes nothing.
+    """
+    from kiro_crew.config.loader import workspace_root
+    from kiro_crew.session_pid import retained_gateway_pids
+    from kiro_crew.session_work_dir import DERIVED_NAME_RE, RUN_DIR_MARKER, count_run_dirs
+
+    try:
+        # Resolve only: the default resolver creates the tree, and a read-only
+        # report must not leave a workspace behind where no gateway ever ran.
+        root = workspace_root(create=False)
+    except OSError:
+        return
+    if not root.is_dir():
+        print("  run dirs:    ✅ no workspace root yet, so no run directories")
+        return
+    try:
+        retained = retained_gateway_pids()
+    except OSError:
+        print("  run dirs:    ⚠️  the session pid ledger cannot be read; census skipped")
+        return
+    census = count_run_dirs(root, retained_gateway_pids=retained)
+    if not census.unmarked and not census.refused:
+        print("  run dirs:    ✅ no run directories left behind that the sweep cannot reclaim")
+        return
+    suffix = "+" if census.floor else ""
+    warn = census.unmarked > _RUN_DIR_BACKLOG_WARN or census.refused > 0
+    print(
+        f"  run dirs:    {'⚠️ ' if warn else '✅'} under {root}: {census.unmarked}{suffix} run"
+        f" director(ies) carry no {RUN_DIR_MARKER} marker (left by a build that wrote none);"
+        f" {census.refused}{suffix} marked director(ies) this data home cannot reclaim (another"
+        f" data home's, an unreadable marker, or a gateway the pid ledger still retains)"
+    )
+    if census.unmarked > _RUN_DIR_BACKLOG_WARN:
+        print(
+            f"{_INDENT}The gateway reclaims only marked run directories. With the gateway"
+            f" stopped, move directories matching {DERIVED_NAME_RE.pattern} that hold only"
+            f" .kiro/settings/cli.json out of {root}; a live run recreates its own."
+        )
 
 
 def _doctor_skill_view_census(agents_dir: Path) -> None:
@@ -4719,7 +4802,11 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
     # reported as a real optional backend -- present or absent -- rather than only
     # when it happens to be installed. The verdict comes from the same owner the
     # dashboard asks, so doctor and the panel cannot disagree.
-    kiro = shutil.which(KIRO_CLI_BIN)
+    # Resolved the way the gateway resolves it -- KIROCREW_KIRO_BIN, then the
+    # desktop app's bundled copy, then the known install dirs, then PATH -- so
+    # this row names the binary a session actually spawns. ``shutil.which`` would
+    # name the user's own install on a bundled app, which is not the one running.
+    kiro = resolve_kiro_cli()
     if kiro:
         print(f"  kiro-cli:    ✅ {kiro}")
         _doctor_headless_auth(issues)
@@ -5439,7 +5526,7 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
     print("\nConnectivity")
     if kiro:
         kiro_result = subprocess.run(
-            [KIRO_CLI_BIN, "--version"],
+            [kiro, "--version"],
             capture_output=True,
             text=True,
             encoding="utf-8",

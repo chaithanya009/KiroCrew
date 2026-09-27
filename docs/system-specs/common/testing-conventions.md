@@ -130,6 +130,49 @@ the owner of a coalesced embed) is expired by the test through `work.cancelled.s
 once the native call is provably in flight -- `expired()` honours it -- never by
 sleeping past a shortened deadline that also has to outlast a thread start.
 
+Both of those are one rule: **an assertion about an interleaving must not be an assertion
+about a window.** "Long enough for the other side to get there" is a claim about how much
+progress a loaded runner makes in that many milliseconds, so when it makes less the test
+reports the property as violated when the truth is that the setup was never reached.
+Enlarging the constant is the same defect in a longer sleeve.
+`test_config_purged_on_phase1_cancellation` is the worked example: it cancelled a
+two-phase MCP apply 50 ms after starting it, but the prologue before the
+guaranteed-cleanup `try` -- a bounded body read plus a read-only preflight on a worker
+thread -- can outlast that window, and a cancellation landing there owes no sweep, which
+the assertion reads as a missing purge. Priced at 300 ms, it fails every run. The fake
+confirmed uninstall now sets an `asyncio.Event` as it returns and the test awaits that,
+so the ordering is a fact and the constant is gone.
+
+Three forms satisfy the rule, and the tree has a worked example of each.
+
+- **Hold the state until it is observed, then release it.**
+  `test/test_runloop_integration.py::test_throttle_parks_two_runs_on_one_scope_and_wakes_by_capacity`
+  parks on `_HELD_PARK_SECS` (600 s, longer than every barrier below it) and releases
+  through `coordinator.recovered`, so the parked state is one the test reads rather than
+  one it must catch.
+- **Observe at the seam, so the state cannot become visible unobserved.**
+  `ops_mission_control/tests/test_policy_store.py::TestConcurrentWritesCannotRestoreAStaleCeiling::test_the_two_halves_of_the_ceiling_commit_together`
+  wraps the publish primitive and asserts every state `set_ceiling` publishes is
+  coherent. Because `atomic_write` publishes by rename, a published state is the only
+  thing an unsynchronised reader can ever see, so this proves the property for every
+  schedule instead of sampling schedules -- and needs no concurrency at all.
+- **Wait for a handshake the production path raises, then act.** The two cancellation
+  cases above.
+
+Two rules travel with all three. **Make the precondition a separate, deterministic
+assertion from the property**: bound the handshake wait as a hang guard and fail it in
+the precondition's own words ("the interleaving under test did not occur"), so an unmet
+setup is never read as a broken invariant. **An assertion must be unable to fail for the
+wrong reason**: scope it to the subject under test -- this logger, this file, this object
+-- so an unrelated event in the same process cannot red it.
+
+Do not factor these into a shared helper. The seam differs in kind every time (a SQLite
+write lock, an asyncio task reaching an attributable state, a multi-phase uninstall's
+phase 1, a dependency coordinator's park, a policy-file publish), anything spanning them
+is a thin wrapper over `threading.Event` / `asyncio.Event` plus `try`/`finally` behind an
+indirection every reader must learn, and the seam form holds nothing at all, so a hold
+helper would not even cover it.
+
 A mock subprocess handed to a real kill path must not carry a pid a live process
 can own. The kill helpers' only handle on their target is the integer `pid`:
 they resolve it against the runner's real process table and signal whatever owns
@@ -142,8 +185,9 @@ assertion and no traceback. Running the file alone hides it -- with a sparse
 process table the lookup raises and the suppressed exception swallows the whole
 path, so the crash needs the full shard. The surface is every kill helper on
 `platform_compat`, not only the tree kill: `kill_pid`, `kill_pid_pinned`,
-`kill_pid_async`, `kill_process_tree`, `kill_process_tree_pinned`,
-`kill_process_tree_async` and `kill_and_reap`. Pick one of the two spellings
+`kill_pid_async`, `kill_process_group`, `kill_process_tree`,
+`kill_process_tree_pinned`, `kill_process_tree_async` and `kill_and_reap`. Pick
+one of the two spellings
 already in the tree rather than inventing a third: give the mock a pid above
 every supported platform's `pid_max`
 (`test/test_update_provider.py::_UNALLOCATABLE_PID`), or neutralise the killer
@@ -532,6 +576,163 @@ Resource consumption belongs on that list for the same reason damage does: a gua
 that only covers `test/` is invisibly absent from the built-in-app testpath, and the
 failure it was written to prevent — a swapped, unresponsive machine — does not care
 which testpath asked for the workers.
+
+## The integration layer (`test/integration/`)
+
+Three layers, told apart by how much of the product is real:
+
+| Layer | Where | What is real | What is fake | Runs |
+|---|---|---|---|---|
+| Unit | `test/`, `src/kiro_crew/apps/builtins/*/tests/` | one function or one handler on a bare `web.Application()` | everything else | every shard, every platform |
+| Integration | `test/integration/` | the whole gateway, booted by `GatewayOrchestrator.run()` in the pytest process, on a `tmp_path` home; real config, stores, policy files, routes | the model (`kiro_crew.testing.fake_acp_backend`) | the `integration` job, Linux, behind `KIROCREW_INTEGRATION=1` |
+| E2E | `test/test_e2e_smoke.py`, `test/e2e/`, `test/test_playwright_e2e.py` | a `kirocrew gateway` subprocess, and for the browser suite a real Chromium | the model | the `e2e*` jobs, behind `KIROCREW_E2E=1` |
+
+The middle layer exists because the other two cannot see the seams between
+boot steps. A handler test mocks the store the handler reads; the E2E harness
+sees only what crosses the process boundary. Neither catches: a memory
+binding that `doctor` accepts but workflow creation refuses; a chat that is on
+disk before a restart and gone after it; a policy file the boot itself wrote
+that the next request cannot parse; a second session starved because the
+first holds the event loop. Those all live in one process, between modules,
+and that is exactly what a test in `test/integration/` can hold in one hand.
+
+### The fixtures
+
+`integration_home` is a fresh `KIROCREW_HOME` under `tmp_path` with the same
+environment the E2E harness sets (`KIRO_HOME` moved under it so the boot's
+agent-spec rewrite cannot touch the operator's `~/.kiro/agents`;
+`KIROCREW_KIRO_BIN` pointing at the fake backend). `gateway_boot` binds the
+boot helper to that home; the boot itself is an `async with` block inside the
+test -- this repo's convention for anything whose teardown must AWAIT on the
+test's own loop (see "Async tests" above), not an `@pytest_asyncio.fixture`:
+
+```python
+@pytest.mark.asyncio
+async def test_sessions_survive_a_restart(gateway_boot):
+    async with gateway_boot() as gw:
+        created = await gw.post_json("/api/sessions", {...})
+        await gw.restart()                        # second boot, SAME home
+        listed = await gw.get_json("/api/sessions")
+        assert created["key"] in {s["key"] for s in listed}
+```
+
+`get`/`post`/`put`/`patch`/`delete` return the aiohttp response;
+`get_json`/`post_json` assert the status and decode. `auth=True` (the default)
+sends the dashboard session cookie the boot minted from its token -- not
+`?token=`, which is a one-use link nonce the `mixed_internal` routes refuse
+once any ordinary route has minted the cookie. `auth=False` proves the denied
+side of a contract. For the internal routes a managed MCP server calls
+(`/api/session-tool-policy`, the memory routes), `gw.mcp_headers(session_key)`
+does the launcher's half of the session-token handshake in-process and returns
+the `X-Internal-Secret` / `X-Session-Key` / `X-Session-Token` headers; send them
+with `auth=False`. `gw.state` is the live `DashboardState`, `gw.app` the real
+`web.Application`, `gw.home` the data home -- use them to assert on what a
+request left behind, not to bypass the request.
+
+`integration_home` also releases the rootdir conftest's agent-spec pin: that
+pin sends the boot's spec WRITES to a per-test directory while request-time
+READS follow `KIRO_HOME`, so under it the boot would write `kirocrew.json`
+where no request reads it. Both sides resolve to `<home>/kiro/agents` here,
+which is the private target the shared-home write guard exempts. A test that
+edits the agents directory waits for the managed `kirocrew.json` first (the
+spec rebuild runs after the dashboard is serving).
+
+The directory is a package (`test/integration/__init__.py`) so its conftest
+imports as `integration.conftest`. The unit files import `test/conftest.py` by
+the bare name `conftest`; a second top-level `conftest` shadows it and 160
+files fail to import.
+
+### What the boot helper does that a test must not undo
+
+`run()` ends in `_shutdown_and_exit` -> `os._exit`. `booted_gateway` starts
+`run()` as a task, waits until the dashboard answers `/api/health` on the port
+it bound, and on exit sets `shutdown_event` -- exactly what SIGTERM does -- so
+`run()` walks its OWN exit path: the run-marker settle and clear,
+`_shutdown()`, the orphaned-session cleanup, the crew-log and event-log
+drains, the log-queue drain. The helper intercepts only `os._exit`
+(`conftest.intercepted_os_exit`, held for the WHOLE boot -- a `run()` that
+exits on its own mid-test must raise, not end pytest), which raises
+`HarnessExit` with the exit code instead of ending the interpreter.
+Nothing about shutdown is re-implemented in the harness, so a step added to
+`_shutdown_and_exit` runs here the day it lands.
+`test_boot_smoke.py::test_shutdown_and_exit_ends_in_os_exit` pins the shape
+that makes the interception sufficient: `os._exit` is the last statement of
+`_shutdown_and_exit` and the only hard exit `run()` reaches. A `run()` that
+does not reach its exit within `SHUTDOWN_PATH_SECS` of the event is cancelled
+and `_shutdown()` awaited directly, and the teardown reports it. The serve/stop
+seam on `GatewayOrchestrator` (issue #13627) would let an in-process caller
+skip the interception altogether; until it lands, a change to the exit path
+that trips the pin is a change that needs the harness updated in the same PR.
+Do not set `shutdown_event` from a test, do not call `run()` yourself, and do
+not `await` the helper's task.
+
+A production gateway is one process for one home and never expects its
+process-wide state to be undone; this layer boots many homes in one process,
+so the helper undoes it, by four mechanisms the conftest docstring lists in
+full: a **reset list** for module globals a boot derives from its home
+(signing key, revoked-nonce store, crash-log path, `SafetyOverride`, live
+config, autonudge, platform context, embedder and model-download manager); a
+**snapshot** of the process settings a boot changes in place (signal handlers,
+`os.environ`, the loop exception handler, `RLIMIT_NOFILE`) restored on every
+exit; a **wait** for the memory-preparation worker thread to drop its
+process-wide fence (`MemoryStartup`), because cancelling its awaiter does not
+stop the thread and a second boot on the same home would otherwise be refused
+with "Another gateway is still preparing memory" (a fence still held at the
+deadline fails the test by name); and a **reap** of every
+asyncio task the boot added that `_shutdown()` left running (production leaves
+those to `os._exit`), failing the test by name if one ignores cancellation.
+The lists are kept honest by
+`test_boot_smoke.py::test_a_second_boot_touches_only_known_module_globals`:
+it diffs every loaded `kiro_crew` module's globals across a second boot, and a
+changed name that is neither restored by the harness nor listed with a reason
+in `_KNOWN_SECOND_BOOT_CHANGES` fails there. When startup grows a home-derived
+global, that test names it; put it on the reset list, or on the known list
+with its reason, in the same PR.
+
+The only fake is the model, but not every production step runs: the boot is
+`GatewayOrchestrator.run()`, not `kirocrew gateway`, with `test_mode=True` and
+`no_crons=True`. Skipped, and so left to the E2E layer: everything
+`run_gateway()` does before constructing the orchestrator (platform boot,
+slice limits, the agents-dir janitor, the agent scratch sweep, the kiro-cli
+log cap, the telemetry beacon); under `test_mode`, the kiro-cli readiness
+probe and the outbound policy-distribution refresher; under `no_crons`, cron
+arming and reconciliation. The flags are fixed: a test that needs one of
+those steps is an E2E test today, and the helper grows the flag when the
+first such in-tree test does.
+
+Every boot is a fresh boot (one per `async with`). That is deliberate: the
+bugs this layer chases are state bugs, and a shared boot would let one test's
+residue explain another's failure. Budget accordingly -- a boot is about two
+seconds here, and a file should hold a few tests, not fifty.
+
+### The metric is routes, not lines
+
+Each request through the handle is attributed to the aiohttp route it
+resolved to (`/api/sessions/abc` counts toward `GET /api/sessions/{key}`).
+With `KIROCREW_INTEGRATION_HITS_DIR` set the conftest writes the hit set and
+the registered-route list per process; `scripts/check_integration_route_coverage.py`
+unions them and prints the share of registered routes the suite requested,
+`--missing` grouped by path prefix so the next file to write is obvious. A
+route served end to end proves the wiring; a line reached through a mock
+proves the line exists. Line coverage of the layer is still worth reading
+(`--cov=kiro_crew` works as usual), it is just not what the layer is gated on.
+`--min` in the `integration` job is a ratchet: a little under what `main`
+measures, never above.
+
+### Writing one
+
+- One file per route group or per bug family. Name the contract in the test
+  name: `test_bad_spec_does_not_disable_memory_tools_for_other_agents`, not
+  `test_policy`.
+- Assert three things per route where they apply: the denied side without a
+  token, the happy path's status and JSON shape, one validation `4xx`.
+- A test that documents a bug we have not fixed is welcome -- mark it
+  `xfail(strict=True, reason="GH #<n>")` so the fix flips it and the marker
+  has to come off in the same PR.
+- Seed the home through the product (a request, or the same store the
+  product uses), not by hand-writing JSON the product never wrote.
+- Run locally with `KIROCREW_INTEGRATION=1 python -m pytest test/integration/test_x.py -n0`.
+  A multi-file run keeps `-n 2 --dist loadgroup --max-worker-restart=2`.
 
 ## Rules
 
@@ -2797,11 +2998,11 @@ The knobs, tightest-wins:
 If the suite is slow on your machine, the answer is usually not a bigger `-n`: run
 the slice you are working on. A full-suite checkpoint is what CI is for.
 
-**Narrow by FILE, not by `--splits`.** `--splits/--group` — pytest-split, retained
-for macOS — deselects *after* the session has collected everything, so a 1-of-4
+**Narrow by FILE, not by `--splits`.** `--splits/--group` — pytest-split — deselects
+*after* the session has collected everything, so a 1-of-4
 item shard still pays the whole floor in every worker while running a quarter of
 the tests. Measured: 14,237 of 56,946 items selected, 744 MiB peak, which is the
-unsharded floor. Linux and Windows CI instead use `scripts.ci_file_shards` to
+unsharded floor. CI uses `scripts.ci_file_shards` on every platform to
 assign whole files before import; each worker collects only its shard's files.
 For local work, pass the specific files relevant to the change.
 
@@ -3254,7 +3455,7 @@ test fails. Raw assignment does not.
 
 **Sharding does not just scatter this class, it hides it — so a full-suite run is the wrong
 place to be finding it.** `ci.yml` assigns whole files to Linux/Windows shards
-before import (macOS retains `pytest-split` groups), and a leaker only damages tests
+before import (every platform assigns whole files), and a leaker only damages tests
 that land in the *same process*, so a leak whose
 victim sits in another shard is not observable in PR CI at all. The release job runs the
 suite whole and is therefore the first place it appears — as failures in files that have
@@ -3578,10 +3779,14 @@ using `scripts.ci_file_shards`. Ownership is SHA-256 of the root-relative POSIX
 path, not a duration or test-count balance. Other shards skip the file before
 import, while discovery patterns and platform ignores remain pytest's own.
 
-macOS retains three `pytest-split` groups. That plugin uses recorded runtime only
-when `.test_durations` is available, otherwise it falls back to test count.
-`test-durations.yml` remains the optional duration-recording workflow; its output
-does not affect Linux/Windows file ownership. Linux-recorded durations must not be
+macOS assigns whole files like the other platforms, in four shards. The shard
+count is the knob to reach for there rather than the 40-minute cap, because that
+cap is a spend guard as much as a hang guard on a lane billed at ten times Linux:
+a higher cap bounds a runaway more loosely, while a higher count is what divides
+the work. `test-durations.yml` still
+invokes pytest-split to RECORD `.test_durations`, and three tests load its plugin
+directly, but no sharding lane reads that file any more, so the recording balances
+nothing. Linux-recorded durations must not be
 assumed to balance macOS.
 
 **Measure a shard by running it, not by summing durations.** Per-test times from

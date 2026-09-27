@@ -80,6 +80,8 @@ vi.mock('../api/client', () => ({
     dashboardConfig: dashboardConfigMock,
     updateDashboardConfig: updateDashboardConfigMock,
     kirocrewConfig: kirocrewConfigMock,
+    kirocrewAgents: () => Promise.resolve({ agents: [], default_agent: 'default' }),
+    agentResolvedModel: () => Promise.resolve({ model: '', pinned: false }),
     patchConfig: patchConfigMock,
     models: modelsMock,
     voiceConfig: () => Promise.resolve({ enabled: false, voice: 'Ruth', engine: 'neural', rate: '100%', autoSpeak: false, aws_profile: '', region: '' }),
@@ -368,6 +370,7 @@ describe('ChatPanel — Messages', () => {
 
   it.each([
     ['Show Timestamps', 'showTimestamps', false],
+    ['Double-click to edit your messages', 'doubleClickToEdit', true],
     ['Pin the latest turn', 'pinLastPrompt', false],
     ['Simplified Tool Call Names', 'simplifiedToolNames', false],
     ['Show Context Percentage', 'showContextPct', true],

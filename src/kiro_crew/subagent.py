@@ -53,6 +53,7 @@ from kiro_crew.agent_sdk.provider_identity import PROVIDER_CLAUDE_CODE
 from kiro_crew.config import live
 from kiro_crew.config.loader import DEFAULT_MODEL, KiroCrewConfig
 from kiro_crew.config.paths import data_home
+from kiro_crew.config.sections import SESSION_START_TIMEOUT_MIN, AgentConfig
 from kiro_crew.constants import (
     DEFAULT_SUBAGENT_MAX_TURNS,
     SUBAGENT_COMPLETION_PREFIX,
@@ -575,7 +576,12 @@ _BOUNDARY_CANCELLATION_SCOPE_CAP_REASON = "pending_scope_cap"
 # cannot hold cancel_all()'s untimed gather — bounded shutdown plus recoverable
 # state beats unbounded shutdown.
 _STATE_DRAIN_TIMEOUT = 5.0
-_STARTUP_TIMEOUT_SECS = 120  # max seconds a subagent may sit pre-first-turn with no runtime before the startup watchdog reaps it
+# The startup watchdog's window (``SubagentManager._startup_deadline``) covers one
+# start clock: the ``session/new`` budget, then the late-start collector's wait
+# (timeout plus ``_await_late_start``'s grace), plus a launch margin; floor 120.
+_STARTUP_TIMEOUT_SECS = 120
+_STARTUP_COLLECT_GRACE_SECS = 5
+_STARTUP_LAUNCH_MARGIN_SECS = 30
 # Derived in-startup bound, in rounds of the session-start gate: one round
 # holding permits plus one round already admitted and waiting behind them. See
 # ``SubagentManager._startup_cap`` for why the bound is tied to the gate's
@@ -583,8 +589,8 @@ _STARTUP_TIMEOUT_SECS = 120  # max seconds a subagent may sit pre-first-turn wit
 _STARTUP_CAP_GATE_ROUNDS = 2
 # How often a start released from the spawn-approval prompt re-pumps while it
 # waits for the in-startup bound (``_admit_released_start``). A backstop behind
-# the edges that pump anyway (PID, first stream, terminal, stagger boundary),
-# so it is slow.
+# the edges that pump anyway (PID, first answer, terminal, stagger boundary), so
+# it is slow.
 _RELEASE_REPUMP_SECS = 1.0
 _ON_DONE_TIMEOUT = 1200.0  # outer cap: max total seconds for semaphore wait + injection
 
@@ -1868,7 +1874,21 @@ class SubagentInfo:
     # startup watchdog measures from THIS timestamp so it never reaps an agent
     # that is merely waiting for approval. None until execution starts.
     _exec_started: float | None = None
+    # Wall-clock moment this execution's own session first answered its prompt
+    # (``SubagentManager._leave_startup``): the first frame addressed to this
+    # session, or a dependency verdict on the prompt. None until then, and reset
+    # by ``_run_inner`` for every execution. The startup watchdog and the
+    # in-startup bound read it only while ``_pid`` is None, because a runtime
+    # PID ends startup on its own; an AcpRuntime-backed start records the PID
+    # its runtime reports before the stream opens, and a runtime reports one
+    # from spawn until its process is reset. The adaptive controller reads it
+    # as the floor of this run's progress.
     _first_stream_started: float | None = None
+    # ``runtime_global`` frames this execution received while still in
+    # startup; named in the startup reap's error. Reset with the marker.
+    _startup_cotenant_frames: int = 0
+    # (start clock, deadline) the startup watchdog fixed for this start.
+    _startup_deadline_stamp: tuple[float, int] | None = None
     # Wall-clock moment this run began waiting for a ``SessionStartGate``
     # permit (``_gate_wait_mark``); None outside that wait. While set, the
     # startup watchdog reads the start clock as frozen at this moment: time
@@ -1958,7 +1978,7 @@ class SubagentInfo:
     # Queue wait behind the session-start gate, ms; 0 when the gate was free.
     _start_queue_wait_ms: float = 0.0
     # True once the durable row was written ``running`` -- at the FIRST stream
-    # event of the run's own turn, not at execution start, so a row is never
+    # event addressed to the run's own session, not at execution start, so a row is never
     # ``running`` while the session is still being created (RFC §4.4).
     _taskq_running_marked: bool = False
     # Provider built by a StartCollector's late adoption, handed to the run
@@ -2041,7 +2061,17 @@ def _injection_notice_outcome(info: "SubagentInfo") -> str:
     their record without it) with no wording contract between ``error``
     strings and this notice. The "no result to deliver" phrasings are guarded
     on the absence of any output so they can never contradict the result-path
-    recovery hint. Pure function of the record, unit-tested per branch.
+    recovery hint.
+
+    The completed branch names no delivery MECHANISM. Only two of the six
+    ``notify_injection_failed`` call sites pass a timeout; the rest pass
+    "provider dead after prompt-busy retries", "ACP process died", a raw
+    ``str(exception)`` and the last injection-failure reason. Since the notice
+    prints ``reason`` on the line directly above this one, asserting a timeout
+    here would contradict it — and the reader is an LLM deciding whether to
+    retry. The cause belongs to ``reason``; this line states only the outcome.
+
+    Pure function of the record, unit-tested per branch.
     """
     never_ran = info._exec_started is None and not info.result and not info.result_path
     outcome = info.outcome
@@ -2053,7 +2083,7 @@ def _injection_notice_outcome(info: "SubagentInfo") -> str:
         if never_ran:
             return "The run failed before it started, so there is no result to deliver."
         return "The agent failed before a result could be delivered."
-    return "The agent finished but result delivery timed out."
+    return "The agent finished, but its result could not be delivered."
 
 
 # Event callback: (event_type, info, extra_data) -> None
@@ -2517,7 +2547,7 @@ class SubagentManager:
         max_concurrent: int = _MAX_CONCURRENT,
         default_turn_limit: int = _TURN_LIMIT,
         default_timeout: int = _TIMEOUT_SECS,
-        startup_timeout: int = _STARTUP_TIMEOUT_SECS,
+        startup_timeout: int = 0,
         stall_idle_secs: int = _STALL_IDLE_SECS,
         on_tool_approval: ToolApprovalCallback | None = None,
         on_tool_approval_factory: (
@@ -2572,7 +2602,8 @@ class SubagentManager:
         self._cap_raise_listener: Callable[[], object] | None = None
         self._default_turn_limit = default_turn_limit
         self._default_timeout = default_timeout if default_timeout > 0 else _TIMEOUT_SECS
-        self._startup_deadline = startup_timeout if startup_timeout > 0 else _STARTUP_TIMEOUT_SECS
+        # A positive value pins the window; 0 derives it from the budget.
+        self._startup_timeout_override = startup_timeout if startup_timeout > 0 else None
         self._stall_idle_secs = stall_idle_secs if stall_idle_secs > 0 else _STALL_IDLE_SECS
         self._on_tool_approval = on_tool_approval  # fallback for non-auto sessions
         self._on_tool_approval_factory = on_tool_approval_factory
@@ -2807,7 +2838,8 @@ class SubagentManager:
         # callers open inline. Pending or failed opens refuse typed; only
         # agent.task_queue_enabled=false selects the in-memory queue.
         # ``admitted -> starting`` is written at claim; ``running`` at the
-        # run's first stream event; waits and wakes through admission.
+        # run's first stream event addressed to its session; waits and wakes
+        # through admission.
         self._taskq: Any = None
         self._taskq_admit_wait_secs: float = 30.0
         #: Set when ``agent.task_queue_enabled`` is on but the store could not
@@ -3203,6 +3235,18 @@ class SubagentManager:
 
     async def _reaper_loop(self) -> None:
         return await self._monitor._reaper_loop_impl()
+
+    @property
+    def _startup_deadline(self) -> int:
+        """Seconds a new start may run with no runtime, from the live config."""
+        if self._startup_timeout_override is not None:
+            return self._startup_timeout_override
+        snap = live.snapshot()
+        agent = snap.agent if snap is not None else AgentConfig()
+        budget = max(SESSION_START_TIMEOUT_MIN, agent.session_start_timeout_secs)
+        collect = agent.start_collect_timeout_secs + _STARTUP_COLLECT_GRACE_SECS
+        derived = int(budget + collect + _STARTUP_LAUNCH_MARGIN_SECS)
+        return max(_STARTUP_TIMEOUT_SECS, derived)
 
     def _is_startup_stalled(self, info: SubagentInfo, now: float) -> bool:
         return self._monitor._is_startup_stalled_impl(info, now)
@@ -3824,8 +3868,9 @@ class SubagentManager:
 
         The same shape the startup watchdog reaps on (:meth:`_is_startup_stalled`),
         minus the clock: past ``_run_inner``'s first statement (``_exec_started``
-        set), no runtime PID, no first provider stream, no turn, and not already
-        ending. A queued spawn is not in it (not registered until admitted), and
+        set), no runtime PID, no answer on its own session yet
+        (:meth:`_leave_startup`), no turn, and not already ending. A queued
+        spawn is not in it (not registered until admitted), and
         neither is an agent PARKED at the spawn-approval prompt
         (``_awaiting_approval``, ``_exec_started`` still ``None``): it is
         starting nothing, so it must not consume the startup bound -- counting
@@ -3913,10 +3958,11 @@ class SubagentManager:
     def _note_startup_progress(self, info: SubagentInfo) -> None:
         """Wake the spawn queue when *info* leaves startup without ending.
 
-        A runtime PID or a first provider stream takes *info* out of the
-        in-startup population, which may open a slot under :meth:`_startup_cap`
-        that no other edge announces: the slot-release drain fires only on a
-        terminal, and the pump does not poll. Called from ``_run_inner`` at
+        A runtime PID (``_run_inner``'s PID record, ``_bind_shared_handle``) or
+        the first answer on its own session (:meth:`_leave_startup`) takes
+        *info* out of the in-startup population, which may open a slot under
+        :meth:`_startup_cap` that no other edge announces: the slot-release
+        drain fires only on a terminal, and the pump does not poll. Called at
         those two transitions -- at most twice per start -- and the pump
         returns at once when nothing waits and re-checks every gate itself, so
         a call that opens nothing is cheap. A pump failure is logged, never
@@ -3927,6 +3973,26 @@ class SubagentManager:
             self._drain_queue()
         except Exception:
             logger.debug("startup-progress queue pump failed for %s", info.id, exc_info=True)
+
+    def _leave_startup(self, info: SubagentInfo) -> None:
+        """Take *info* out of startup: its own session has answered its prompt.
+
+        Two moments prove that, and each calls this: the first frame out of the
+        provider stream that is addressed to THIS session (the stream loop in
+        ``_run_inner``), and a dependency verdict on the prompt
+        (``_yield_for_dependency``), which
+        the durable row records as ``starting -> running`` in the same step.
+        An opened stream proves neither, and neither does a ``runtime_global``
+        frame -- a co-tenant's traffic that a shared runtime fanned out to
+        every session on it. Stamps ``info._first_stream_started`` once per
+        execution and, on a first turn, wakes a spawn the in-startup bound is
+        holding (:meth:`_note_startup_progress`).
+        """
+        if info._first_stream_started is not None:
+            return
+        info._first_stream_started = time.time()
+        if info.turns == 0:
+            self._note_startup_progress(info)
 
     def set_cap_raise_listener(self, listener: Callable[[], object] | None) -> None:
         """Register the ONE hook a cap raise rings, or ``None`` to drop it.
@@ -4523,7 +4589,7 @@ class SubagentManager:
     def _drain_queue(self) -> None:
         return self._admission._drain_queue_impl()
 
-    async def _admit_released_start(self, info: SubagentInfo) -> bool:
+    async def _admit_released_start(self, info: SubagentInfo) -> str:
         return await self._admission._admit_released_start_impl(info)
 
     def _release_admitted_start(self) -> str:
@@ -4701,7 +4767,16 @@ class SubagentManager:
 
     @staticmethod
     def _write_tombstone(info: SubagentInfo, cause: str) -> None:
-        """Best-effort tombstone write for abnormal exits."""
+        """Best-effort tombstone write for abnormal exits.
+
+        A run that is not persistent gets no tombstone. ``write_tombstone``
+        refuses one whose live-run state or recorded mode says so, but a run
+        that ended before its folder was seeded -- a declined spawn prompt, a
+        stop or a reap while it waited for admission into startup -- has
+        neither, so the run's own mode decides here.
+        """
+        if info.memory_mode != "persistent":
+            return
         try:
 
             write_tombstone(

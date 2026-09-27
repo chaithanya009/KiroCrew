@@ -136,11 +136,15 @@
     "parentChange_changed": "Parent changed this",
     "discardDraftTitle": "Discard the Capabilities draft?",
     "discardDraftBody": "Discarding the capability edits for {{name}} keeps the editor open. Saved values and hidden credentials are unchanged. No other member is affected.",
-    "discardDraftConfirm": "Discard draft"
+    "discardDraftConfirm": "Discard draft",
+    "driftHint": "{{member}}'s agent file was edited outside this page. Press Review changes to see that outside edit together with any draft of your own. After reviewing, Save writes the fix or tells you why it cannot.",
+    "unreviewableDrift": "{{member}}'s agent file {{file}} was edited outside this page in a setting this page cannot show, so this page cannot write the fix and Review changes stays turned off. Undo that outside edit in ~/.kiro/agents/{{file}}, then press Reload from server."
   },
   "api": {
     "client": {
       "paste_token_url_or_raw_token": "Paste sign-in URL…",
+      "proxy_challenge_reload": "Reload this browser tab — if a sign-in page appears, your access proxy’s session expired. If not, a proxy or firewall in front of this dashboard refused the request; check the proxy’s logs, or retry later.",
+      "proxy_challenge_framed": "Open {{origin}} in a new tab — if a sign-in page appears, your access proxy’s session expired. Signing in inside this panel won’t work. Sign in there, then reload this page.",
       "rate_limited_by_the_tunnel_edge_http_429_too_man": "Rate limited by the tunnel edge (HTTP 429) — too many requests in a burst. The dashboard retries automatically; if this persists, wait a few seconds and reload.",
       "reauth_command": "kirocrew token",
       "run_kirocrew_token_then_paste_sign_in_url": "Run kirocrew token in a terminal, then paste the sign-in URL below and press Enter.",
@@ -1710,7 +1714,10 @@
     "approvalCard": {
       "approval_no_longer_pending": "This approval has expired or was already decided — the agent is no longer waiting on it.",
       "decision_failed": "This decision may not have been recorded — the request failed.",
-      "decision_not_recorded_error": "This decision wasn't recorded: {{error}}"
+      "decision_not_recorded_error": "This decision wasn't recorded: {{error}}",
+      "trusted_channel_all": "Trusted — all tools in this channel are auto-approved, persists across restarts",
+      "trusted_channel_base": "Trusted — {{base}} commands are auto-approved for @{{role}} until {{productName}} restarts",
+      "trusted_channel_command": "Trusted — “{{cmd}}” is auto-approved for @{{role}} until {{productName}} restarts"
     },
     "approvalModePicker": {
       "approval_mode_aria": "Approval mode: {{mode}}",
@@ -2061,9 +2068,18 @@
       "copy_2": "Copy {{label}}"
     },
     "diffBlock": {
+      "added": "added",
+      "binary": "binary",
       "copied": "Copied!",
       "copy_patch": "Copy patch",
+      "deleted": "deleted",
+      "file_count_one": "{{count}} file",
+      "file_count_other": "{{count}} files",
+      "mode_changed": "mode changed",
+      "no_longer_executable": "no longer executable",
+      "now_executable": "now executable",
       "open_in_side_panel": "Open {{path}} in side panel",
+      "plain_view": "No highlighting — plain view",
       "split_view": "Split view",
       "switch_to_split_view": "Switch to split view",
       "switch_to_unified_view": "Switch to unified view",
@@ -2091,7 +2107,7 @@
       "insider": "Insider",
       "report_problem": "Report problem",
       "report_problem_on_build": "Report a problem on this {{channel}} build",
-      "request_feature_starts_agent": "Starts a chat that drafts your request and files it on GitHub once you approve. Uses your plan's monthly usage."
+      "request_feature_starts_agent": "Starts a chat that drafts your request and files it on GitHub once you approve. Uses your plan's monthly usage, like any chat turn."
     },
     "fileCard": {
       "audio": "Audio: {{name}}",
@@ -2228,6 +2244,10 @@
     "issuePanel": {
       "add_to_chat": "Add to chat",
       "assigned_to": "Assigned to {{name}}",
+      "change_state_closed": "Closed",
+      "change_state_draft": "Draft",
+      "change_state_merged": "Merged",
+      "change_state_open": "Open",
       "cli_login_required": "{{provider}} CLI login required",
       "comments": "Comments",
       "could_not_load_this_issue": "Could not load this issue",
@@ -2365,6 +2385,7 @@
       "another_sandbox_already_confines_kiro_crew_so_it": "Another sandbox already confines {{productName}}, so its own sandbox cannot nest inside it. This host's sandbox is not broken.",
       "copied": "Copied",
       "copy_command": "Copy command",
+      "copy_failed": "Copy failed. Select the command text and copy it manually.",
       "get_kiro_cli": "Get Kiro CLI",
       "how_to_fix": "How to fix",
       "if_this_keeps_happening": "If this keeps happening",
@@ -2400,6 +2421,7 @@
       "run_kirocrew_doctor_on_the_gateway_host_for_a_ful": "Run this on the gateway host for a full prerequisite report, including which sandbox step failed.",
       "sandbox_unavailable": "Sandbox unavailable",
       "sign_in_again_to_continue": "Sign in again to continue.",
+      "sign_in_bundled_hint": "The long path is the desktop app's own copy of Kiro CLI. Run one of these commands exactly as shown.",
       "sign_in_method_note": "Both open a browser to finish signing in. Pick the one that matches your plan — the sign-in page offers a personal Builder ID alongside organization SSO, and a Builder ID carries a smaller set of models.",
       "sign_in_personal_label": "Personal account — Builder ID, Google, or GitHub",
       "sign_in_required": "Sign in required",
@@ -2512,7 +2534,11 @@
       "copy_chip_name": "Copy {{text}}",
       "open_path_chip_name": "Open {{path}}",
       "browse_path_chip_name": "Browse {{path}}",
-      "switch_to_session_chip_name": "Switch to session {{label}}"
+      "switch_to_session_chip_name": "Switch to session {{label}}",
+      "couldnt_copy_select_the_text_to_copy_it_manually": "Couldn’t copy — select the text to copy it manually",
+      "the_copy_failed_ctrl_cmd_click_copies_the_full_session_id_for_label": "The copy failed. Ctrl/Cmd+click copies the full session ID for {{label}}.",
+      "couldnt_copy_the_image_path": "Couldn’t copy the image path",
+      "the_copy_failed_ctrl_cmd_click_copies_the_path_label": "The copy failed. Ctrl/Cmd+click copies the path {{label}}."
     },
     "mcpAppFrame": {
       "collapse": "Collapse",
@@ -2928,7 +2954,12 @@
     },
     "voiceStatusBar": {
       "default_microphone": "Default microphone",
-      "dictation_kept_for_model": "Your dictation is kept and will be transcribed."
+      "dictation_kept_for_model": "Your dictation is kept and will be transcribed.",
+      "dictation_kept_or_discard": "Your dictation is kept and will be transcribed, or discard it to stop waiting.",
+      "download_continues_after_discard": "The download continues even if you discard, so nothing is fetched twice.",
+      "discard_dictation_consequence": "Discarding cannot be undone, but anything you typed yourself stays, and you can dictate again.",
+      "waiting_for_speech_model": "Getting ready to transcribe your dictation.",
+      "discard_dictation": "Discard dictation"
     },
     "webAppArtifactCard": {
       "api_app": "API app",
@@ -3025,7 +3056,13 @@
       "edit_agent_config_to_change_mapping": "{{path}} — edit the agent config file to change this mapping",
       "remove": "Remove {{name}}",
       "remove_skill": "Remove skill {{name}}",
-      "skills_this_agent_template_loads_written_as_skil": "Skills this agent template loads. Written as skill:// resources in the agent config, so kiro-cli loads them natively when the agent starts. An agent with no skills mapped falls back to the default behavior: the kirocrew agent sees the whole catalog, other agents see none."
+      "could_not_load_the_skill_catalog": "Could not load the skill catalog.",
+      "skills_this_agent_template_loads_written_as_skil": "Skills this agent template loads. Written as skill:// resources in the agent config, so kiro-cli loads them natively when the agent starts. An agent with no skills mapped falls back to the default behavior: the kirocrew agent sees the whole catalog, other agents see none.",
+      "copy_identifier_hint": "Identifies which installed copy of this skill is mapped",
+      "mapping_unresolved": "This no longer matches an installed copy",
+      "mapping_unresolved_count_one": "{{count}} mapped skill no longer matches an installed copy — remove it, then pick a replacement from the list if one is installed.",
+      "mapping_unresolved_count_other": "{{count}} mapped skills no longer match an installed copy — remove them, then pick replacements from the list if any are installed.",
+      "copy_identifier_label": "Located in {{where}}"
     },
     "artifactFolderDeleteDialog": {
       "artifact_one": "{{count}} artifact",
@@ -3108,6 +3145,9 @@
       "open_a_chat_with_this_error_s_context_attached": "Open a chat with this error's full context attached",
       "prompt_lead": "This error just came up in the {{productName}} dashboard. Diagnose the root cause and fix it."
     },
+    "errorBoundary": {
+      "lazy_page_load_failed": "This page couldn't load. Check the connection to the gateway, then try again."
+    },
     "errorNotice": {
       "dismiss": "Dismiss"
     },
@@ -3131,8 +3171,10 @@
     },
     "trustDropdown": {
       "trust_all_base": "Trust all <mono>{{base}}</mono> commands",
+      "trust_all_base_channel": "Trust all <mono>{{base}}</mono> commands for @{{role}} — until {{productName}} restarts",
       "trust_all_tools_channel": "Trust all tools in this channel — persists across restarts",
-      "trust_this_command": "Trust “<mono>{{cmd}}</mono>”"
+      "trust_this_command": "Trust “<mono>{{cmd}}</mono>”",
+      "trust_this_command_channel": "Trust “<mono>{{cmd}}</mono>” for @{{role}} — until {{productName}} restarts"
     },
     "multiSelect": {
       "deselect_all": "Deselect all",
@@ -3215,7 +3257,20 @@
       "ask_agent_history": "Ask the agent about the history"
     },
     "workspaceTree": {
-      "status_failed": "Couldn’t read the repository status."
+      "status_failed": "Couldn’t read the repository status.",
+      "row_empty": "Empty folder",
+      "row_hidden_only": "Contains only hidden items (dotfiles, caches)",
+      "row_linked": "Link to another folder: contents not listed",
+      "row_truncated": "Files not shown: file limit of 10,000 reached",
+      "row_unreadable_marker": "Not readable — see the notice above",
+      "row_unreadable_marker_dismissed": "Not readable — notice dismissed",
+      "root_unreadable": "No permission to read the workspace folder",
+      "root_hidden_only": "This workspace contains only hidden items (dotfiles, caches)",
+      "unreadable_folders": "Folders not readable: {{paths}}",
+      "dismiss_unreadable": "Dismiss: hide this notice until the unreadable folders change",
+      "unreadable_dismissed_one": "Notice hidden — {{count}} folder still unreadable (shown again when it changes)",
+      "unreadable_dismissed_other": "Notice hidden — {{count}} folders still unreadable (shown again when they change)",
+      "undo_dismiss_unreadable": "Undo"
     },
     "logEntry": {
       "trace_load_failed": "Couldn’t load this run’s trace."
@@ -3425,6 +3480,11 @@
       "unexpected_response": "Unexpected response",
       "deploy_failed": "Deploy failed",
       "stale_preview_retry": "The app changed since it was checked — try again."
+    },
+    "mcpApp": {
+      "from_app": "Sent by the {{app}} app",
+      "delivery_failed": "Couldn't deliver your message — try again.",
+      "from_app_tooltip": "This app posted a message into the chat — Kiro treats it as the app's words, not yours"
     }
   },
   "hooks": {
@@ -3920,8 +3980,8 @@
         "model_effective": "Running on {{model}} (backend selects the model)",
         "workflows": "Workflows",
         "workspace_empty": "No files in this workspace yet",
-        "workspace_truncated": "Large workspace: showing up to 10,000 files; all folders remain available",
-        "workspace_directory_truncated": "files hidden",
+        "workspace_truncated": "Large workspace: file limit of 10,000 reached, some files not shown; all folders remain available",
+        "workspace_directory_truncated": "files not shown",
         "output_load_failed": "Couldn't load the output",
         "retry": "Retry",
         "cancel_failed": "Couldn't cancel the subagent",
@@ -4291,11 +4351,13 @@
         "copy_failed": "Copy failed"
       },
       "errorCard": {
-        "feature_request_form": "Open the feature request form",
+        "feature_request_form": "Open the GitHub form (uses no monthly usage)",
         "feature_request_form_hint": "Your monthly usage is used up — file your request on GitHub with this form instead. This form skips the agent: it opens the GitHub issue form for you to fill in yourself and uses none of your monthly usage.",
         "sign_in": "Sign in to Kiro",
         "sign_in_hint": "Open Settings → Overview → Kiro sign-in and sign in again, then send your message again.",
-        "session_start_repeat_hint": "The agent session has failed to start more than once in a row, so resuming would only run the same start again. Restart the gateway from a terminal with {{command}}, then send your message again."
+        "session_start_repeat_hint": "The agent session has failed to start more than once in a row, so resuming would only run the same start again. Restart the gateway from a terminal with {{command}}, then send your message again.",
+        "capabilities_changed": "This crew member's agent file changed outside the Capabilities page, so new chats cannot start. Open Capabilities, review the change and save it, then start a new chat.",
+        "open_capabilities": "Open Capabilities"
       },
       "crewLog": {
         "section_status": "Status",
@@ -4656,6 +4718,18 @@
       "sort_created_oldest": "Created (Oldest)",
       "sort_name_asc": "A → Z",
       "sort_name_desc": "Z → A",
+      "folder_order": "Folder order",
+      "folder_order_custom": "Custom",
+      "folder_order_name": "By name",
+      "folder_order_created": "By date created (newest first)",
+      "folder_order_unavailable": "Folder order could not be read",
+      "folder_order_unavailable_detail": "All folders are shown, in your Custom order; retries automatically",
+      "folder_order_unavailable_detail_picker_ask": "All folders are shown, in your Custom order; retries automatically. Open the chat sidebar to ask the agent about it.",
+      "folder_order_reorder_hint": "Switch to Custom to reorder folders",
+      "folder_order_reorder_note": "Folders can be dragged into place in Custom order only",
+      "folder_order_switch_custom": "Switch to Custom",
+      "folder_order_unstamped_note": "Folders made before dates were recorded have no date; they come last, in your Custom order",
+      "sort_sessions_by": "Sort sessions by",
       "clear_named_filter": "Clear {{filter}} filter",
       "collapse_source_links": "Show fewer",
       "source_links_expand_failed": "Could not load the rest. Click to retry.",
@@ -4681,7 +4755,13 @@
       "open_crew_members": "Crew Members",
       "open_crew_members_desc": "Opens the Crew Members page — each member is a standing agent with its own thread.",
       "open_crew_members_gated_desc": "Opens Settings first, to turn this preview on — the page is not available until you do.",
-      "model_list_failed": "Couldn't load the model list. What's shown may be incomplete or out of date."
+      "model_list_failed": "Couldn't load the model list. What's shown may be incomplete or out of date.",
+      "hidden_folder_count_one": "{{count}} hidden folder",
+      "hidden_folder_count_other": "{{count}} hidden folders",
+      "sort_filter_sessions_hidden_one": "Sort & filter sessions — {{count}} hidden folder not shown",
+      "sort_filter_sessions_hidden_other": "Sort & filter sessions — {{count}} hidden folders not shown",
+      "show_hidden_folders_from_board_one": "{{count}} hidden folder is not shown — open sort & filter to bring it back.",
+      "show_hidden_folders_from_board_other": "{{count}} hidden folders are not shown — open sort & filter to bring them back."
     },
     "connectionsPage": {
       "action_failed": "Action failed: {{error}}",
@@ -5515,6 +5595,7 @@
       },
       "displayTab": {
         "change_the_dashboard_font_family_persists_across": "Change the dashboard font family. Persists across sessions.",
+        "custom_font_configure_in_settings": "Custom font — choose the installed font in Settings → Display.",
         "choose_a_color_palette_each_theme_supports_dark": "Choose a color palette. Each theme supports dark and light modes. Custom themes are stored in ~/.kiro/crew/themes/.",
         "mono": "Mono",
         "native_window_zoom_tip": "Native window zoom, the same setting as {{mod}}+ / {{mod}}−. Click the percentage to reset to 100%.",
@@ -6141,6 +6222,8 @@
         "comfortable": "Comfortable",
         "compact": "Compact",
         "default_auto": "Default (auto)",
+        "double_click_to_edit": "Double-click to edit your messages",
+        "double_click_to_edit_desc": "When off, a double-click on your message selects a word as in any text.",
         "failed_to_save_selectable_models": "Failed to save selectable models",
         "model_picker_all_models": "All models ({{count}})",
         "model_picker_selected_models": "Selected {{selected}} / {{total}}",
@@ -6248,6 +6331,19 @@
         "install": "Install",
         "install_failed": "Install failed",
         "native_window_zoom_tip": "Native window zoom, the same setting as {{mod}}+ / {{mod}}− (50%–300%). Remembered across launches.",
+        "custom_font_family": "Custom font",
+        "custom_font_family_desc": "The font the whole dashboard uses, including chat, the composer, and sidebar session and folder names. Pick one installed on the machine you view the dashboard from, or type any font name — a Nerd Font renders its glyphs and a programming font shows its ligatures.",
+        "custom_font_choose": "Choose a font…",
+        "custom_font_search": "Search fonts…",
+        "custom_font_use_typed": "Use “{{value}}”",
+        "custom_font_not_detected": "Not detected on this machine",
+        "custom_font_detect": "List all installed fonts…",
+        "custom_font_detect_checking": "Checking…",
+        "custom_font_detect_added": "Installed fonts added to the list.",
+        "custom_font_detect_none": "No fonts beyond the ones already listed.",
+        "custom_font_detect_denied": "Font access was not granted — the list keeps the fonts already detected, and you can still type any font name.",
+        "custom_font_ligatures": "Enable ligatures",
+        "custom_font_ligatures_desc": "Render programming ligatures (=>, !=, ->) when the custom font has them. Code and diffs in messages are unaffected.",
         "terminal": "Terminal",
         "terminal_font_family": "Font",
         "terminal_font_family_desc": "Font for the built-in terminal. Pick one installed on the machine you view the dashboard from, or type any font name — a Nerd Font renders Powerline and prompt-theme glyphs.",

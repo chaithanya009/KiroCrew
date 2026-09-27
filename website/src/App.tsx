@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useState, useCallback, useRef, useMemo, useSyncExternalStore, createContext, lazy, Suspense, type HTMLAttributes, type ReactNode } from 'react'
+import { useEffect, useLayoutEffect, useState, useCallback, useRef, useMemo, useSyncExternalStore, createContext, lazy, Suspense, type ComponentType, type HTMLAttributes, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
 import { Routes, Route, Navigate, useLocation, useNavigate, useParams } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
@@ -10,7 +10,7 @@ import { performAgentSlotSwitch } from './lib/agentSwitch'
 // before `getBuiltinSurfaces()` is invoked below to compute `NAV_ITEMS`.
 import './surfaces/builtins'
 import { getBuiltinSurfaces, getBuiltinSurface, selectSurfaceBadgeCount, selectSurfaceActivityCount, selectAllSurfacesAttention, surfaceLabel, surfacePreviewEnabled } from './surfaces/registry'
-import { createSlot, appendSlotMessage, setAgentSwitchNotice, setSlotRunning, switchSlot, selectActiveSlotProject } from './store/chatSlice'
+import { createSlot, appendSlotMessage, setAgentSwitchNotice, startLocalTurn, endLocalTurn, switchSlot, selectActiveSlotProject } from './store/chatSlice'
 import { mintSendId } from './utils/sendDelivery'
 import { queryComposerOrExpand } from './pages/chat/composerFocus'
 import { setNavIntentHandler as setArtifactNavIntentHandler } from './utils/artifactPopout'
@@ -52,7 +52,7 @@ import { gcOrphanedStorage } from './utils/storageGc'
 import { isMetricNumber, metricNumber } from './utils/metrics'
 import { Rocket, Bell, Code, RefreshCw, Package, Loader2, Download, Hammer, XCircle, Check, AlertTriangle, CheckCircle, X, AudioWaveform, ChevronUp, MoreHorizontal, Coins, ArrowLeftToLine, Compass, LayoutGrid, Fullscreen, Menu, PanelLeft, SquareTerminal, Bot, Smartphone, Search as SearchIcon } from 'lucide-react'
 import { GithubIcon, DiscordIcon } from './components/BrandIcon'
-import { Toggle } from './components/ui'
+import { Btn, Toggle } from './components/ui'
 import OnboardingFlow from './components/OnboardingFlow'
 import MeetCrewmatesFlow, { MeetCrewmatesEligibilityNotice } from './components/MeetCrewmatesFlow'
 import { useMeetCrewmatesGate } from './hooks/useMeetCrewmatesGate'
@@ -96,30 +96,22 @@ import AskAgentButton from './components/AskAgentButton'
 import AppIcon from './components/AppIcon'
 import Clickable from './components/Clickable'
 import MarkdownRenderer, { Lightbox } from './components/MarkdownRenderer'
-import NotificationsPage from './pages/NotificationsPage'
 const SessionsPage = lazy(() => import('./pages/SessionsPage'))
 import NotificationDetailPanel from './components/notifications/NotificationDetailPanel'
 import NotificationFeed from './components/notifications/NotificationFeed'
 import NotificationBanner from './components/notifications/NotificationBanner'
 import LogsPage from './pages/LogsPage'
-import HooksPage from './pages/HooksPage'
-import WebhooksPage from './pages/WebhooksPage'
-import CapabilitiesPage from './pages/CapabilitiesPage'
 // Lazy: /members is a standalone surface not needed at startup, and the main
 // chunk sits at its size budget — the import() boundary keeps the page (and
 // its drawer/roster tree) out of the initial bundle.
 const MembersPage = lazy(() => import('./pages/members/MembersPage'))
-import SettingsPage from './pages/SettingsPage'
 import { InAppUpdateFlow } from './pages/settings/AboutPanel'
-import EmbedSettingsPage from './pages/EmbedSettingsPage'
 import KiroCrewNavBridge from './components/KiroCrewNavBridge'
 import InstanceTabBar from './components/InstanceTabBar'
 import InstancesViewport from './components/InstancesViewport'
 import EmbeddedHostBridge from './components/EmbeddedHostBridge'
 import EmbeddedDragRegionReporter from './components/EmbeddedDragRegionReporter'
 import EmbedTabStrip from './components/EmbedTabStrip'
-import DeveloperPage from './pages/DeveloperPage'
-import SchedulePage from './pages/SchedulePage'
 import { useUpdateSubscription, type UpdateState } from './hooks/useUpdateSubscription'
 import UpdateModal from './components/UpdateModal'
 
@@ -131,9 +123,6 @@ import { withDeadline } from './lib/withDeadline'
 import { toggleTerminalByChord } from './lib/terminalChordFocus'
 import { useTerminalPoppedOut, focusPopout as focusTerminalPopout } from './utils/terminalPopout'
 import { setTerminalEnabledFlag } from './utils/terminalRegistry'
-import AppPage from './pages/AppPage'
-import AppDetailPage from './pages/AppDetailPage'
-import MigrationPage from './pages/MigrationPage'
 import MigrationCheck from './components/MigrationCheck'
 import CrashReportNotice from './components/CrashReportNotice'
 import BuiltinAppRoute from './apps/BuiltinAppRoute'
@@ -202,6 +191,76 @@ const UpdatePill = lazy(() => import('./components/UpdatePill'))
 // chunk -- each rides its own on-demand chunk fetched on first navigation.
 const DiscoverPage = lazy(() => import('./pages/apps/DiscoverPage'))
 const LibraryPage = lazy(() => import('./pages/apps/LibraryPage'))
+/**
+ * A route page loaded on first navigation, rendering nothing until its chunk
+ * arrives. The Suspense boundary lives inside the returned component, so the
+ * `<Route>` entries that mount these pages read the same as for an eager page.
+ *
+ * The chunk fetch can reject (gateway unreachable, stale chunk after a rebuild
+ * once main.tsx's `vite:preloadError` reload guard has bailed). React surfaces
+ * a rejected lazy import as a render throw, and an eager page could never
+ * fail that way -- so the page carries its own route-scoped ErrorBoundary:
+ * the route area shows the recoverable error card while the shell (rail,
+ * top bar, other routes) stays mounted instead of the throw reaching the
+ * root `app-shell` boundary in main.tsx and replacing the whole dashboard.
+ */
+function lazyPage(load: () => Promise<{ default: ComponentType }>): ComponentType {
+  // Shared by every mount, so a page whose chunk already loaded renders on the
+  // next visit without suspending again. Replaced only by a retry.
+  let shared = lazy(load)
+  function LazyPage() {
+    const [{ Page, attempt }, setLoadState] = useState(() => ({ Page: shared, attempt: 0 }))
+    // React.lazy caches a rejected loader. A new wrapper per attempt makes the
+    // retry perform another import instead of rendering the cached rejection.
+    return (
+      <ErrorBoundary
+        key={attempt}
+        scope="lazy-route"
+        fallback={(error) => (
+          <div className="flex h-full items-center justify-center p-8">
+            <ErrorNotice
+              title={i18nT('components.errorBoundary.lazy_page_load_failed')}
+              message={error.message}
+              askAgent
+              footer={(
+                <div className="flex items-center gap-2">
+                  <Btn onClick={() => {
+                    shared = lazy(load)
+                    setLoadState(current => ({ Page: shared, attempt: current.attempt + 1 }))
+                  }}>
+                    {i18nT('components.errorBoundary.try_again')}
+                  </Btn>
+                  <Btn onClick={() => window.location.reload()}>
+                    {i18nT('components.errorBoundary.reload_page')}
+                  </Btn>
+                </div>
+              )}
+            />
+          </div>
+        )}
+      >
+        <Suspense fallback={null}><Page /></Suspense>
+      </ErrorBoundary>
+    )
+  }
+  return LazyPage
+}
+
+// Every page below is reached only through its own route, so each rides an
+// on-demand chunk instead of the app-core chunk the chat route has to parse on
+// first load. Pages another eager module imports statically stay eager above
+// (LogsPage via the chat ActivityViewer): a lazy boundary there would not move their code.
+const NotificationsPage = lazyPage(() => import('./pages/NotificationsPage'))
+const WebhooksPage = lazyPage(() => import('./pages/WebhooksPage'))
+const CapabilitiesPage = lazyPage(() => import('./pages/CapabilitiesPage'))
+const SettingsPage = lazyPage(() => import('./pages/SettingsPage'))
+const EmbedSettingsPage = lazyPage(() => import('./pages/EmbedSettingsPage'))
+const DeveloperPage = lazyPage(() => import('./pages/DeveloperPage'))
+const SchedulePage = lazyPage(() => import('./pages/SchedulePage'))
+const AppPage = lazyPage(() => import('./pages/AppPage'))
+const AppDetailPage = lazyPage(() => import('./pages/AppDetailPage'))
+const MigrationPage = lazyPage(() => import('./pages/MigrationPage'))
+const HooksPage = lazyPage(() => import('./pages/HooksPage'))
 
 type LogSubscribeFn = (cb: ((data: { level: string; msg: string }) => void) | null) => void
 
@@ -3350,9 +3409,19 @@ export default function App() {
     // new slot is registered but never activated — an active-slot append would
     // put the bubble in an unrelated session's transcript, and an
     // unconditional running flag would mark that session busy for a turn it
-    // never started (review finding on #4198).
+    // never started (review finding on #4198). The running flag goes through
+    // `startLocalTurn`, the same mark a composer send leaves: it flips the
+    // visible footer and records the send as UNCONFIRMED, so a switch away
+    // while the POST is in flight parks the slot idle rather than busy -- a
+    // refused receipt after that switch has no active mirror left to clear.
+    // The mark is dispatched only while the created slot is still ACTIVE:
+    // `pendingTurnSlot` is one field for the whole store, so marking a slot
+    // the user already left would overwrite the guard of whatever slot they
+    // are sending from now, and a stale idle snapshot could unlock that
+    // composer mid-send. A slot the user left before the create settled
+    // simply gets no optimistic running flag, exactly as before.
     dispatch(appendSlotMessage({ slot, message: { role: 'user', content: visibleMessage, cls: '', ts: new Date().toISOString(), meta } }))
-    if (appStore.getState().chat.activeSlot === slot) dispatch(setSlotRunning(true))
+    if (appStore.getState().chat.activeSlot === slot) dispatch(startLocalTurn(slot))
     // A send the server never accepted has to say so where the request landed
     // (#4198): an HTTP 4xx/5xx RESOLVES rather than rejecting, so the catch
     // alone never saw the errors that matter — a refused send left the
@@ -3365,7 +3434,10 @@ export default function App() {
     // indicator (a stale flag on this slot self-heals from the server snapshot
     // on the next switch-back). The payload is a canned constant, so unlike
     // the chat composers there is no typed text to hand back — the retry
-    // affordance is the feedback pill itself.
+    // affordance is the feedback pill itself. `endLocalTurn` is the inverse of
+    // the mark above: slot-keyed, it drops the unconfirmed mark only if it is
+    // still THIS slot's and touches the footer only while this slot is on
+    // screen, so it is safe to dispatch whether or not the mark was set.
     const reportFailedSend = (reason?: string) => {
       // FRAMED, not bare: a raw backend reason ("slot agent mismatch") reads
       // as the agent erroring mid-work, not as "your request never went out".
@@ -3379,7 +3451,7 @@ export default function App() {
           cls: '',
         },
       }))
-      if (appStore.getState().chat.activeSlot === slot) dispatch(setSlotRunning(false))
+      dispatch(endLocalTurn(slot))
     }
     try {
       // maxAge bounds the seed's lifetime: if the visible send below fails,

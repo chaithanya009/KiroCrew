@@ -280,7 +280,7 @@ class FakeClient:
     ) -> bool:
         self.edits.append((message_id, text, reply_markup))
         self.edit_chats.append(chat_id)
-        return True
+        return getattr(self, "edit_ok", True)
 
     async def edit_message_reply_markup(
         self, chat_id: int, message_id: int, reply_markup: Any = None
@@ -4879,6 +4879,23 @@ class TestForumQueueDrain:
     """Fix B: a message queued mid-turn in a forum Topic drains under the FORUM
     session key, not the DM key."""
 
+    def test_the_surface_reports_whether_the_edit_landed(self) -> None:
+        """A rate-limited chat answers a refusal rather than raising, and the registry
+        can only keep that transition retryable if the wrapper reports it."""
+        d, cli, _sess = _dispatcher({7})
+        surface = d._receipt_surface(7, None)
+
+        async def go() -> tuple[bool, bool]:
+            cli.edit_ok = True
+            ok = await surface.edit_receipt(11, "body")
+            cli.edit_ok = False
+            refused = await surface.edit_receipt(11, "body")
+            return ok, refused
+
+        ok, refused = asyncio.run(go())
+        assert ok is True
+        assert refused is False
+
     def test_queued_forum_message_drains_under_forum_key(self) -> None:
         d, cli, sess = _dispatcher({7})
         forum_key = "telegram:kirocrew:forum:-1001234567890:5"
@@ -5363,6 +5380,62 @@ class TestForumCallbackGate:
 
         assert asyncio.run(_go()) is False
         assert cli.answered == []
+
+
+class TestLinkPreviewSuppression:
+    def test_send_message_disables_previews_on_initial_send_and_plain_retry(
+        self, monkeypatch
+    ) -> None:
+        client = TelegramClient(token="12345:testtoken")
+        calls: list[tuple[str, dict[str, Any]]] = []
+
+        async def _api(method, params, timeout=30, *, record=True, err_out=None):
+            calls.append((method, dict(params)))
+            return None if len(calls) == 1 else {"message_id": 7}
+
+        monkeypatch.setattr(client, "_api", _api)
+        result = asyncio.run(client.send_message(1, "<b>hello</b>", parse_mode="HTML"))
+
+        assert result == 7
+        assert [method for method, _params in calls] == ["sendMessage", "sendMessage"]
+        for _method, params in calls:
+            assert params["link_preview_options"] == {"is_disabled": True}
+
+    def test_streaming_edit_disables_previews_on_both_attempts(self, monkeypatch) -> None:
+        """A URL appearing mid-stream must not gain a preview on the edit
+        path that the send path already denies (round-8 gpt finding)."""
+        client = TelegramClient(token="12345:testtoken")
+        calls: list[tuple[str, dict[str, Any]]] = []
+
+        async def _api(method, params, timeout=30, *, record=True, err_out=None):
+            calls.append((method, dict(params)))
+            return None if len(calls) == 1 else {"message_id": 7}
+
+        monkeypatch.setattr(client, "_api", _api)
+        ok = asyncio.run(
+            client.edit_message(1, 7, "<b>https://evil.example</b>", parse_mode="HTML")
+        )
+
+        assert ok is True
+        assert [m for m, _p in calls] == ["editMessageText", "editMessageText"]
+        for _method, params in calls:
+            assert params["link_preview_options"] == {"is_disabled": True}
+
+    def test_draft_and_rich_paths_disable_previews(self, monkeypatch) -> None:
+        client = TelegramClient(token="12345:testtoken")
+        calls: list[tuple[str, dict[str, Any]]] = []
+
+        async def _api(method, params, timeout=30, *, record=True, err_out=None):
+            calls.append((method, dict(params)))
+            return {"message_id": 7}
+
+        monkeypatch.setattr(client, "_api", _api)
+        asyncio.run(client.send_message_draft(1, "d1", "streaming…"))
+        asyncio.run(client.send_rich_message(1, "# heading"))
+
+        assert [m for m, _p in calls] == ["sendMessageDraft", "sendRichMessage"]
+        for _method, params in calls:
+            assert params["link_preview_options"] == {"is_disabled": True}
 
 
 class TestRichMessageAvailabilityLatch:

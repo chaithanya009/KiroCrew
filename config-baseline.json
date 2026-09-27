@@ -2955,7 +2955,7 @@
       "sensitive": false,
       "tags": [],
       "label": "Assistant Excerpt Size",
-      "help": "Characters kept from each end of an assistant message when building the summarization input (>=80). User messages are always included in full -- they carry intent and are small -- while assistant output is excerpted because it holds the progress detail but dominates the transcript.",
+      "help": "Characters kept from each end of an assistant message when building the summarization input (>=80). User messages are included in full unless the whole input exceeds the fixed 40,000-character summary input limit -- they carry intent and are small -- while assistant output is excerpted because it holds the progress detail but dominates the transcript. Past that limit, middle turns are dropped and any turn is cut to about 5,000 characters per end, so larger values stop helping.",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": 400
@@ -6992,6 +6992,7 @@
         "theme_color": "",
         "language": "",
         "recent_tint_count": 0,
+        "folder_sort": "custom",
         "update_nudge": {},
         "onboarded": false,
         "import_onboarded": false,
@@ -7794,6 +7795,24 @@
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": 0
+    },
+    {
+      "path": "dashboard.folder_sort",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Sidebar Folder Order",
+      "help": "How the chat sidebar orders session folders: 'custom' keeps the stored positions (set by dragging a folder or by chat_folder_move), 'name' is an ASCII-case-insensitive natural order (01. < 02. < 10.; A-Z fold to a-z, other letters compare as written), 'created' is newest first. A view preference only -- choosing a mode never rewrites the stored positions, so switching back to 'custom' restores them exactly. Read by the sidebar and by chat_folder_tree, which lists folders in the order the sidebar draws them.",
+      "hasChildren": false,
+      "enumValues": [
+        "custom",
+        "name",
+        "created"
+      ],
+      "defaultValue": "custom"
     },
     {
       "path": "dashboard.update_nudge",

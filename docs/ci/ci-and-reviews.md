@@ -132,8 +132,8 @@ Out-of-band lanes that never gate a PR:
   call, and `test-durations.yml` already pays for a full suite on `main`.
   Contributor-facing half: [CONTRIBUTING.md](../../CONTRIBUTING.md).
 - **Maintenance:** `ship-report.yml` (a scheduled Slack summary),
-  `test-durations.yml` (re-measures `.test_durations` so pytest-split's shards stay
-  balanced by recorded runtime, and opens a PR with the update), `issue-triage.yml`
+  `test-durations.yml` (re-measures `.test_durations`, which no sharding lane reads
+  any more, and opens a PR with the update), `issue-triage.yml`
   (a model picks `type:` / `area:` / `platform:` labels from the repository's own
   live label set, because keyword rules mislabel often enough to be worse than no
   label), `issue-summary.yml` (a second, deliberately separate lane posts ONE
@@ -375,7 +375,7 @@ Every job here is blocking. Every job that costs real runner time also `needs:`
 | `pod-boot-windows` | Boots a real worktree Pod under Windows Task Scheduler and pins three canary tests. A PR carrying `ci:pod-scenarios` before its next push also runs the 55-test Pod scenario suite against a built SPA |
 | `backend-test-windows-fail-closed` | Same actor-gated Windows routing, single `-n0` run of `test/test_windows_fail_closed_optin.py` BY NODE ID with the pass count grepped, so a silent skip cannot go green. It boots a real gateway and drives one ACP prompt turn on Windows against real filesystem state |
 | `backend-test-sandbox` | The one job that clears the AppArmor userns restriction, so the tests guarded by `skipif(not userns_available())` EXECUTE instead of skipping. Runs all eleven sandbox-dependent suites. The shards collect the same files — nothing is deselected — but there the sandbox-guarded tests skip, so this is the only lane where those assertions (the `~/.kiro/crew` keystone among them) actually execute |
-| `backend-test-crew-container` | "Backend Tests (crew container)". The only lane that runs the crew container image's suite (`aws_control/crew/runtime/container_tests/`, 327 tests). It is separate from the shards because it installs the image's own runtime pins (`container/requirements.txt`: fastapi, uvicorn, httpx, boto3), which that file's header forbids becoming dependencies of the application, and the shards' environment IS the application's, so there the suite's conftest collects nothing. Sets `CREW_CONTAINER_TESTS_REQUIRED=1`, which turns every reason that conftest would decline to collect into a hard error and checks the collection against the tree |
+| `backend-test-crew-container` | "Backend Tests (crew container)". The only lane that runs the crew container image's suite (`aws_control/crew/runtime/container_tests/`). It is separate from the shards because it installs the image's own runtime pins (`container/requirements.txt`: fastapi, uvicorn, httpx, boto3), which that file's header forbids becoming dependencies of the application, and the shards' environment IS the application's, so there the suite's conftest collects nothing. Sets `CREW_CONTAINER_TESTS_REQUIRED=1`, which turns every reason that conftest would decline to collect into a hard error and checks the collection against the tree: every module and every named test the source declares must yield an item, and the total must be at or above `_MIN_COLLECTED` and no more than `_FLOOR_MARGIN` above it. A declared module or test name that stops yielding an item reds on its own name, with no number involved; the count is what catches a test whose parametrize cases drain while its name is still collected. `_MIN_COLLECTED`'s own comment states what that does and does not catch, and is the only place that bound is spelled out |
 | `real-adapter-contract` | "Real Adapter Contract Tests". The one lane that INSTALLS the adapters the codex and opencode projections were measured against — `@agentclientprotocol/codex-acp` and `opencode-ai`, `npm ci` from the locked manifest in `test/real_adapters/` (its own manifest, not the product's; Dependabot bumps it weekly so drift shows up in the bump PR) — so the four contract tests that drive a real adapter execute instead of skipping. Everywhere else they skip, which left the element shape, the child environment, the refused transports and the eviction verb resting on one local run. Selects them by the `real_adapter` marker, so one added later is included rather than left out of a list. Sets `KIROCREW_E2E_REQUIRE=1` — the repository's existing "this job declared its preconditions must hold" switch, shared with the E2E suites — which turns an absent adapter into a failure, and then asserts on the junit report that at least the known contracts ran and none was skipped, so a broken install cannot report a green lane that measured nothing |
 | `coverage-combine` then `coverage-gate` | Combines the 3.12 shard data, then enforces the project line-rate floors, plus a per-file floor with a shrink-only baseline (all floors live in the job's `env:` block). **CodeBuild-hosted runner** (pilot, below) except for forks |
 | `frontend-lint` | `tsc -p tsconfig.app.json`, `eslint` under a hard-zero warning ceiling, `jscpd`, and `npm run i18n:check` |
@@ -389,6 +389,7 @@ Every job here is blocking. Every job that costs real runner time also `needs:`
 | `bundle-size` | "Bundle Size Gate". Builds the frontend with `--mode analyze` (which is the only build that emits `dist/bundle-report.json`) and then runs TWO checks over that one build: per-chunk ceilings from `website/scripts/check-bundle-size.mjs`, with a 500 KB default for any chunk not named there, and an acyclic-graph check from `website/scripts/check-chunk-cycles.mjs`. The job name is narrower than its scope on purpose — it is a required check, so renaming it would silently stop satisfying branch protection. **An acyclic chunk graph is a deliberate invariant and the cycle check has no allowlist**, unlike the size ceilings: a chunk cycle has no valid initialization order, so a body can run against a binding that is still uninitialized and blank the page before React mounts, and whether a given cycle does that is not decidable from the chunk graph. Fix the chunking rather than waiving it. Skipped on a backend-only diff, which cannot change the bundle |
 | `e2e` | Runs `python scripts/ci_e2e_parallel.py`, which awaits `python setup.py test_e2e`, the dedicated Memory UI pytest command, and `npm --prefix website run i18n:render` in parallel. **CodeBuild-hosted large runner where eligible**, behind the same `run-as-runner` boundary as the backend shards. The suite's disposable gateway takes `agent.sandbox_allow_unsandboxed_exec` (seeded in `test/test_playwright_e2e.py`) because the fleet container refuses `CLONE_NEWUSER` at the runtime policy level and the agent binary is a stdlib echo stub; a sandboxed spawn doing real work stays proven by `e2e-private-namespace` and `e2e-boot-matrix`. Details: [e2e-gate.md](e2e-gate.md) |
 | `e2e-private-namespace` | "E2E (private member namespace, hosted)". The one E2E step the fleet cannot host: `test/e2e/test_private_workflow_memory.py` runs a Crew Member's private workflow MCP inside the member sandbox, which needs `unshare --map-root-user`. Hosted `ubuntu-latest`, clears the AppArmor userns restriction first, no SPA or browser |
+| `integration` | "Integration (in-process gateway)". The middle layer: `test/integration/` boots the real `GatewayOrchestrator.run()` inside the pytest process on a scratch `KIROCREW_HOME` with the packaged fake ACP backend and talks HTTP to the port it bound, so one test can assert across a restart, across two concurrent requests on one event loop, or on a file the boot itself wrote. Opt-in by `KIROCREW_INTEGRATION=1`, so the unit shards collect and skip it; Linux only. Gated on ROUTE coverage -- `scripts/check_integration_route_coverage.py` reports the share of registered dashboard routes the suite requested (`--min` is a ratchet kept a little under what `main` measures) and the report is uploaded as the `integration-route-coverage` artifact. Details: `docs/system-specs/common/testing-conventions.md`, "The integration layer" |
 | `e2e-boot-matrix` | Boots a real fake-backed gateway and pins seven tests on Linux and Windows for PRs; push-to-main runs add `macos-15`. Every leg is fail-closed on missing prerequisites or a collapsed pass count |
 
 `backend-lint` also runs `scripts/check_python_audit.py` (report-only findings,
@@ -399,8 +400,8 @@ fourth shrink-only, diff-scoped baseline gate referenced in the table above.
 
 ### Backend file sharding
 
-The Linux and Windows matrices assign whole files before pytest imports their
-items. `scripts/ci_file_shards.py` is an opt-in pytest plugin, loaded only by
+The Linux, Windows and macOS matrices assign whole files before pytest imports
+their items. `scripts/ci_file_shards.py` is an opt-in pytest plugin, loaded only by
 those matrix commands. It uses SHA-256 of the root-relative POSIX path to choose
 one of `SHARD_COUNT` owners. Each xdist worker reaches the same assignment.
 Adding a file does not move existing files between shards.
@@ -410,8 +411,8 @@ platform-specific conftest ignores, and creates its normal file collectors.
 The plugin returns an empty collection report for files owned by another shard,
 before their collector imports them. It does not rewrite discovery into explicit
 file arguments, which would bypass `collect_ignore`. Within its owner, the
-ordinary shard excludes only `ipv6_required`; the dedicated hosted lane runs those
-items. Explicit reduced-scope targets keep their
+ordinary Linux shard excludes only `ipv6_required` and the dedicated hosted lane runs
+those items; the macOS command passes no marker filter at all. Explicit reduced-scope targets keep their
 existing discovery semantics and are partitioned at the same file boundary.
 Leaf-test repeat runs do not load the file-sharding plugin and remain unsharded.
 
@@ -436,14 +437,19 @@ suite, with no duplicates within each OS. Invalid shard options fail as usage
 errors. A shard collecting no tests retains
 pytest's nonzero exit; it never falls back to the whole suite or reports success.
 `loadgroup` still serializes marked tests within a job. Like the former item
-split, this is not a cross-runner serialization mechanism. Namespace jobs and
-macOS keep their existing collection; `pytest-split` remains installed for macOS
-and the optional duration-recording workflow.
+split, this is not a cross-runner serialization mechanism. Namespace jobs keep their
+own collection, and macOS now file-shards like the two backend jobs, so no job
+splits items any more. `pytest-split` stays
+installed for `test-durations.yml`'s `--store-durations` recording run and for three
+tests that load its plugin directly (`test_ci_pytest_progress.py`,
+`test_ci_file_shards.py`, `test_xdist_escaped_failure_guard.py`); what has no consumer
+is the `.test_durations` those runs record.
 
 This reduces repeated test-module imports and item collection. It does not avoid
 shared conftest/package imports or imports made by another test. Hashing does not
-balance duration, and one large test file is indivisible. The eight shards per OS
-trade more runner slots and repeated setup for less work per shard. Keep runner
+balance duration, and one large test file is indivisible. The eight Linux/Windows
+shards, and macOS's four, trade more runner slots and repeated setup for less work per
+shard. Keep runner
 routing, timeout values and coverage gates fixed when comparing CI runs; report
 the shard count alongside queue, collection and execution timings.
 Use actual phase timing rather than buffered log timestamps to measure collection.
@@ -472,7 +478,7 @@ recorded line ran in the unmodified variant. Whole-suite coverage and baseline
 graduations still require the resulting CI artifact.
 
 Rollback: replace the plugin and `--file-shards` / `--file-shard` flags in the
-three matrix invocations with the previous `--splits` / `--group` flags. No
+four matrix invocations with the previous `--splits` / `--group` flags. No
 infrastructure, worker-count or privilege change is needed.
 
 ### Required native IPv6 tests
@@ -674,8 +680,8 @@ Where the coverage went:
 
 | Lane | Where | Blocking? |
 |---|---|---|
-| `backend-test-macos` (full suite, 3 shards) | `platform-tests.yml`: called by `nightly.yml` at 06:00 UTC, plus `workflow_dispatch` against any branch | Holds the nightly **publish** jobs, never the builds — the artifacts are the evidence a fixer works from. Maintains one tracking issue (`platform-tests-macos` label) carrying the failing node ids and the pull requests merged in the last 24h |
-| The same suite, on demand | `macos-on-demand.yml`, `pull_request`, calls `platform-tests.yml` against the PR head; a Linux `decide` job runs it when the diff touches a darwin-sensitive path, **or** the PR carries the `ci:macos` label, **or** the head SHA falls in a 1-in-20 sample (`16#${HEAD_SHA:0:8} % 20`, deterministic per commit) (acts immediately -- the workflow listens for `labeled`). Over those three sits a CEILING: the path and sample switches are refused while this lane already holds `LANE_MAX_LIVE_RUNS` (6) live runs of the hosted macOS pool, because on 2026-09-24 it held 53 of the 56 in-progress macOS jobs and one shard waited 14 hours for a runner while `build.yml` and `release.yml` queued behind it. A capped run is skipped, not queued, so the ceiling bounds demand and settles the lane at about nine verdicts an hour -- a timely verdict for a few pull requests instead of a 14-hour one for all of them, with the nightly still covering every merge. The `ci:macos` label is never refused, and neither is a re-run, so a retry cannot turn a red lane into a skip | Advisory. It is a separate workflow ON PURPOSE: a macOS job inside `ci.yml` holds that workflow's completion even with `continue-on-error`, so it would still hold readiness. Readiness evaluates neither this workflow nor its check |
+| `backend-test-macos` (full suite, 4 shards) | `platform-tests.yml`: called by `nightly.yml` at 06:00 UTC, plus `workflow_dispatch` against any branch | Holds the nightly **publish** jobs, never the builds — the artifacts are the evidence a fixer works from. Maintains one tracking issue (`platform-tests-macos` label) carrying the failing node ids and the pull requests merged in the last 24h |
+| The same suite, on demand | `macos-on-demand.yml`, `pull_request`, calls `platform-tests.yml` against the PR head; a Linux `decide` job runs it when the diff touches a darwin-sensitive path, **or** the PR carries the `ci:macos` label, **or** the head SHA falls in a 1-in-20 sample (`16#${HEAD_SHA:0:8} % 20`, deterministic per commit) (acts immediately -- the workflow listens for `labeled`). Over those three sits a CEILING: the path and sample switches are refused while this lane already holds `LANE_MAX_LIVE_RUNS` (4) live runs of the hosted macOS pool (a run holds one job per shard, so the ceiling is expressed in runs but felt in jobs, and it moves with the shard count), because on 2026-09-24 it held 53 of the 56 in-progress macOS jobs and one shard waited 14 hours for a runner while `build.yml` and `release.yml` queued behind it. A capped run is skipped, not queued, so the ceiling bounds demand and settles the lane at about six verdicts an hour -- a timely verdict for a few pull requests instead of a 14-hour one for all of them, with the nightly still covering every merge. The `ci:macos` label is never refused, and neither is a re-run, so a retry cannot turn a red lane into a skip | Advisory. It is a separate workflow ON PURPOSE: a macOS job inside `ci.yml` holds that workflow's completion even with `continue-on-error`, so it would still hold readiness. Readiness evaluates neither this workflow nor its check |
 | Real gateway boot on macOS | `ci.yml`'s `e2e-boot-matrix`, push-to-main leg; `nightly.yml`'s `pod-scenarios` | Blocking on main / holds nothing in the nightly |
 
 `test/test_macos_platform_tests_gate.py` pins all of it, including the property that
@@ -822,14 +828,20 @@ Details worth knowing:
     pages each — the API's reachable window, since a status-filtered runs listing
     stops at 1000 results — and each live classification sweep reads jobs for at
     most 50
-    runs: 40 to the classify slice and 10 reserved
-    for the newest, whose prompt CodeBuild starts are the dispatch evidence a
-    saturation hold is judged by. Spending the whole bound oldest first would
+    runs: up to 10 reserved for the newest runs that are themselves at least one
+    saturation wait old (a younger run cannot hold a served start that waited that
+    long and so could only ever report the fleet dispatching), falling back to the
+    newest runs when none qualifies, since an empty reserve reads as an outage; the
+    rest go to the classify slice, ranked actionable-shaped first (a `push` run of a
+    heal-safe workflow past the orphan threshold) then oldest. The split is dynamic —
+    a short reserve hands its unused reads to the classify slice instead of leaving
+    them unspent. Spending the whole bound oldest first would
     leave a backlogged sweep unable to tell a dead fleet from a busy one, so it
-    would heal nothing exactly when the watchdog is needed. The classify slice is
-    drawn heal-eligible first — a `push` run of a heal-safe workflow, the only
-    shape a heal can act on — and oldest first within each class, because age
-    alone hands those slots to runs no heal will ever touch: 220 watched live runs
+    would heal nothing exactly when the watchdog is needed. Ranking inside the classify
+    slice puts the heal-eligible shape first — a `push` run of a heal-safe workflow,
+    the only shape a heal can act on, AND past the orphan threshold — then oldest
+    within each class, because age alone hands those slots to runs no heal will ever
+    touch: 220 watched live runs
     sat past the orphan threshold on 2026-09-24 and 18 past a day, the oldest 36
     days, every one of them a pull-request run that stays listed and re-reads the
     same slot on every tick. The log names the
@@ -928,19 +940,40 @@ Details worth knowing:
     watchdog reads what the *other* routed jobs are doing, counting only starts
     after the orphaned job queued (a fleet that was fine before the orphan
     queued says nothing about the fleet it is waiting on) — if a CodeBuild job
-    that did get a runner started in that window after waiting five
-    minutes or more, CodeBuild is queueing, and the tick reports the runs as
+    that did get a runner started in that window after waiting a third of the
+    orphan threshold or more, CodeBuild is queueing, and the tick
+    reports the runs as
     `skipped-saturated` and heals nothing; if *nothing* has started on
     CodeBuild in that window (live runs, then the newest completed runs), the
     evidence is inconclusive — a fleet outage looks exactly like an orphan from
     the queued side — and the tick reports `skipped-no-dispatch-evidence`,
-    heals nothing, and points at the rollback above. If the listing exceeded the
-    per-tick job-read bound, the sweep reports `skipped-partial-dispatch-evidence`
-    instead of acting, because the band the bound drops is the middle of the sweep
-    and a slow start living there would have held: a "nothing slow was seen"
-    verdict is not established from a partial read. Guard rails: runs younger than
-    15 minutes are never actionable (their jobs are still read, since a slow
-    start inside one is saturation evidence); the verdict is re-derived from a fresh read
+    heals nothing, and points at the rollback above. If a run old enough to hold a
+    served start past the threshold went unread against the per-tick job-read bound,
+    the sweep reports `skipped-partial-dispatch-evidence` instead of acting, because
+    the completed-run sample cannot close that gap: it reads the newest completions,
+    and a fleet serving some jobs promptly while queueing others past the threshold
+    puts a prompt start there. The premise is the unread saturation-capable runs
+    rather than the bound being reached, so a sweep whose unread band is all too
+    young to have carried such a start may still act. The unread runs are retained
+    with their creation times and re-judged on age at each cancel, not counted once:
+    the cancel phase re-reads the listing once and then judges several cancels
+    against it, so a run just under the line at the read is over it minutes later.
+    The bound's reserved reads go
+    to the newest runs at least one saturation wait old, since a younger run cannot
+    contain a wait that long and so could only ever report the fleet dispatching. The
+    line is deliberately low because this evidence is label-blind: a start served
+    quickly on another label says nothing about the queue the orphaned job is in, so
+    raising it would widen the window in which a queued-but-alive job is cancelled.
+    A tick that observed any served CodeBuild start logs the slowest of them against
+    the line, which is the drift a raise has to be calibrated from (#13644); a tick
+    that saw none has nothing to measure and logs nothing. Guard rails: runs younger than
+    the orphan threshold are never actionable, and the two age bands differ -- a run at
+    least a third of that threshold old is what the evidence reserve is spent on, while
+    a younger one is not reserved a read while any run qualifies and is read only if a
+    classify slot remains after the actionable-shaped and older runs (a prompt start
+    inside one is dispatch evidence) -- the exception being the reserve's fallback,
+    where NO run can carry a slow start and the newest are reserved anyway because an
+    empty reserve reads as an outage; the verdict is re-derived from a fresh read
     immediately before the cancel and the cancel is sent only if the same
     attempt is still orphaned (a human who re-ran it by hand has moved it to a
     new attempt, which is left alone); fork runs are reported, never touched, and so
@@ -1144,14 +1177,22 @@ Details worth knowing:
 - **`backend-test-crew-container` cannot go green by skipping.** Installing the
   image's runtime dependencies in a dedicated lane fixes one instance of the
   problem; the mechanism that caused it, a conftest that answers a missing
-  dependency with `collect_ignore_glob`, so 226 tests read as present while
+  dependency with `collect_ignore_glob`, so the whole suite reads as present while
   executing zero times, survives any dependency rename or extras split. So the lane
   that installs them also sets `CREW_CONTAINER_TESTS_REQUIRED=1`, and under that
   variable the suite refuses to skip: a missing dependency or a non-POSIX host is a
   collection error, every `test_*.py` that defines a test function must contribute at
-  least one collected item, and the total must clear a floor read off a real
-  collection. The variable can only ever turn a skip into a failure, never the
-  reverse, so setting it can hide nothing. This is the same shape as
+  least one collected item, every `test*` name the source declares must yield an item
+  of its own, and the total must sit at or above `_MIN_COLLECTED` while running no
+  more than `_FLOOR_MARGIN` above it. That last bound is what keeps the floor honest:
+  a hand-written floor left behind by a growing suite stops measuring anything, so
+  the collection outrunning it is an error rather than a cushion, and the message
+  names the value to write. Its accepted cost is a merge race: two branches may each
+  add up to `_FLOOR_MARGIN` tests, clear the bound separately, and compose past it
+  without either one editing the constant, so the lane can red on `main` for a commit
+  that did not grow the suite. That is a one-integer follow-up rather than a
+  regression, and the error message says so. The variable can only ever turn a skip
+  into a failure, never the reverse, so setting it can hide nothing. This is the same shape as
   `backend-test-sandbox`'s `unshare` probe, moved inside the instrument.
 - **`coverage-gate` is fail-closed, and the split made that load-bearing.** It runs
   `if: always()` and its first step converts any non-success upstream result into an
@@ -2320,11 +2361,30 @@ Two subtleties:
   whose lane is failing at that moment. `requested` is the type that carries nothing: it
   fires at run CREATION, when no lane can have a verdict yet and readiness has already
   published `checking` from the `pull_request_target` path. Since every type fires once per
-  monitored workflow per revision, listing all three dispatched up to 57 readiness runs per
+  monitored workflow per revision, listing all three dispatched up to 36 readiness runs per
   head update and made readiness ~67% of every workflow run this repository created; two
-  types put the ceiling at 38. The `pr+sha` concurrency group collapses the burst for
+  types put the ceiling at 24. The `pr+sha` concurrency group collapses the burst for
   execution, but a collapsed run has already consumed its dispatch slot, so the group does
   not bound that cost.
+- **A lane that is itself `workflow_run`-triggered cannot be monitored.** GitHub runs such
+  a workflow from the default branch, so the `workflow_run` payload its completion hands
+  readiness names the default branch as `head_branch` and the default branch's tip as
+  `head_sha` — never the pull request's head. `Resolve current pull request revision` then
+  asks which open pull request has `<this repo>:<default branch>` as its head, an answer
+  that is empty by construction, and the run exits `SKIP` having published nothing and
+  spent one request from the shared hourly REST pool. The seven stage-2 fork reviewers
+  (`Fork * Review`, `Fork Internal Content Scan`) all key on Fast Gate this way and were
+  listed for years on the stated intent that their completion refreshed a fork verdict; it
+  never could. Measured 2026-09-26: 700/700 runs across those seven lanes carried the
+  default branch, and because their dispatches all keyed on ONE concurrency group (the
+  default branch's tip) rather than per head update, they accumulated across every open
+  pull request at once — 158 no-op readiness runs on a single default-branch SHA, 96% of
+  readiness's run creation, ~5,100 wasted requests an hour against a 15,000/hour
+  installation pool. A fork verdict is refreshed instead by the lanes that do run on the
+  PR head (Fast Gate, CI, Build, Code Review) plus the 15-minute
+  `pr-readiness-sweep.yml` backstop, which re-fires by PR number. Two fences hold the rule
+  — the trigger allowlist and the job gate's event check — and
+  `test_ai_review_workflows.py` pins both.
 - **A `pull_request_target` run gets its own isolated concurrency group.** Those are
   the only readiness runs that surface as a CheckRun in the PR's rollup, and GitHub
   marks any superseded run "cancelled" whichever way `cancel-in-progress` is set, so
@@ -2428,13 +2488,15 @@ directly without Fast Gate re-running, so the trigger-bound id stays identical
 between the stale failed attempt and the fresh rerun -- readiness resolves that by
 collapsing every check-run sharing an id to the newest by check-run id (distinct per
 POST, monotonically increasing), so the fresh rerun always wins. `pr-readiness.yml`
-also triggers on that same rerun's own `workflow_run: in_progress` event, which
-fires the instant the rerun starts and can race the rerun's own "Open check-run"
-step -- reading check-runs at that exact moment would still see only the OLD
-completed verdict. Readiness recognizes when its own evaluation was triggered by
-that lane's `in_progress` event (by name and status on the triggering
-`workflow_run`) and reads pending directly, without querying check-runs at all;
-the rerun's own completion re-triggers a real evaluation. CodeQL is
+does NOT see that rerun's own `workflow_run: in_progress` event: a `Fork <lane>` run
+is `workflow_run`-triggered, so it is barred from the trigger allowlist and its
+payload could not resolve a pull request anyway. The evaluation therefore reads
+check-runs at whatever state the triggering lane's event found them in, and a rerun
+whose fresh "Open check-run" row lands after that read still shows its OLD completed
+verdict until the next event. `pr-readiness-sweep.yml` mode 2 closes that within 15
+minutes on the check evidence. The `WR_NAME = "Fork $cname"` branch in the evaluate
+step was written for this race and has never been reachable; its comment records that.
+CodeQL is
 the single ineligible lane, reported as a non-blocking "Not eligible" note rather
 than a blocker. Readiness therefore says the same thing on a fork as anywhere else: the
 eligible automated validation passed for this revision. Human approval and branch

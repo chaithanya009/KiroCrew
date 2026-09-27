@@ -89,7 +89,11 @@ from kiro_crew.messaging.dispatch import (
 )
 from kiro_crew.messaging.display_safety import redact_for_display
 from kiro_crew.messaging.driver import APPROVAL_INTERACTIVE, TurnDriver
-from kiro_crew.messaging.identity import channel_inbound_permitted, publish_turn_identity
+from kiro_crew.messaging.identity import (
+    channel_inbound_permitted,
+    channel_outbound_permitted,
+    publish_turn_identity,
+)
 from kiro_crew.messaging.inbound_spool import InboundRoute, spool_refused_turn
 from kiro_crew.messaging.link import (
     CHAT_TYPE_DIRECT,
@@ -156,6 +160,7 @@ from kiro_crew.messaging.queue_receipt import STEER_ACK_EMOJI as _STEER_ACK_EMOJ
 from kiro_crew.messaging.queue_receipt import (
     ReceiptQueue,
     ReceiptSurface,
+    receipt_address_key,
 )
 
 logger = logging.getLogger(__name__)
@@ -1761,12 +1766,15 @@ class DiscordDispatcher:
 
         class _Surface:
             label = "discord"
+            # The channel is the whole address: ``edit_message`` takes it plus the
+            # message id, and a Discord message id is only that channel's.
+            address_key = receipt_address_key("discord", channel_id)
 
             async def send_receipt(self, body: str) -> Any | None:
                 return await client.send_message(channel_id, body)
 
-            async def edit_receipt(self, msg_id: Any, body: str) -> None:
-                await client.edit_message(channel_id, msg_id, body)
+            async def edit_receipt(self, msg_id: Any, body: str) -> bool:
+                return await client.edit_message(channel_id, msg_id, body)
 
         return _Surface()
 
@@ -2002,7 +2010,14 @@ class DiscordDispatcher:
             # suspension is exactly the defect this change exists to close, and on an
             # ungoverned install the read permits without writing a row, so the second
             # reading costs a row only where an operator asked for the audit trail.
-            if not await channel_inbound_permitted("discord"):
+            #
+            # The OUTBOUND authority decides it, because what is gated here is a write
+            # this process is about to make. It reads the same `channels` allowlist the
+            # inbound gate above reads, so the verdict is the same; the difference is
+            # the name the refusal is filed under, and an egress refusal recorded as an
+            # ingress one is unreadable to whoever later asks why a message did not go
+            # out.
+            if not await channel_outbound_permitted("discord"):
                 logger.info(
                     "discord approval confirmation withheld: denied by channels "
                     "governance policy"

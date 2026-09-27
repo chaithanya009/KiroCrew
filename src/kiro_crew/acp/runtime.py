@@ -35,6 +35,7 @@ from kiro_crew.acp._dispatch import (
     attach_kas_custom_agents,
     build_session_new_params,
     parse_session_modes,
+    redact_backend_text,
     redact_text,
 )
 from kiro_crew.acp._dispatch import reject_option_id as _reject_option_id
@@ -43,6 +44,8 @@ from kiro_crew.acp._dispatch import (
 )
 from kiro_crew.acp._frame_record import record_frame
 from kiro_crew.acp.client import (
+    _RESPONSE_WRITE_BOUND_SECS,
+    _RESPONSE_WRITE_MIN_PROGRESS_BYTES,
     ChildRecord,
     OversizeLineUnrecoverable,
     _apply_pod_home_remap,
@@ -50,10 +53,14 @@ from kiro_crew.acp.client import (
     _drain_oversize_line,
     _get_child_pids,
     _KiroExecutableTrustError,
+    _loggable_request_id,
     apply_pod_bundle_spawn,
     finish_suspended_spawn,
     is_auth_failure_output,
     is_sandbox_init_failure_output,
+    response_write_window_secs,
+    write_notification_best_effort,
+    write_response_frame_bounded,
 )
 from kiro_crew.acp.harness import (
     HarnessAdapter,
@@ -995,8 +1002,8 @@ _DROP_SUMMARY_INTERVAL_SECS = 60.0
 # halves of the key are backend-controlled, so an unbounded map would be a
 # memory sink; reaching the cap forces an early flush instead of growing.
 _DROP_SUMMARY_MAX_KEYS = 64
-# Backend-controlled key text is truncated before it is stored, so a
-# pathological sessionId/method (a stdout line may be up to
+# Backend-controlled key text is redacted whole and then capped before it is
+# stored, so a pathological sessionId/method (a stdout line may be up to
 # _STDOUT_BUFFER_LIMIT) cannot be retained at full length by the map either.
 _DROP_SUMMARY_KEY_MAX_CHARS = 80
 # Stands in for the sessionId half of the key on the no-sessionId broadcast
@@ -1020,6 +1027,17 @@ _ROSTER_OVERFLOW_REJECT_REASON = "roster_overflow_auto_reject"
 # roster it remembers was truncated either, so the backend genuinely never
 # announced this child to us.
 _UNREGISTERED_REJECT_REASON = "unregistered_session_auto_reject"
+
+
+class AcpRuntimeStdinStalled(AcpRuntimeDead):
+    """The shared stdin made no progress for the response-write bound.
+
+    A subclass so the off-loop auto-answer can keep its ``send_stalled`` audit
+    reason (the bound fires inside ``send_response``, ahead of that path's own
+    outer timeout) while every ``except AcpRuntimeDead`` handler keeps working.
+    """
+
+
 # Minimum seconds between throttled DEBUG summaries of repeated roster
 # truncation. A `subagent/list_update` is a backend-controlled notification
 # re-broadcast on every child status change, so above the cap the WARNING it
@@ -1077,7 +1095,10 @@ def _drop_key_part(value: object) -> str:
     """
     if not isinstance(value, str):
         return _DROP_KEY_PLACEHOLDER
-    return value[:_DROP_SUMMARY_KEY_MAX_CHARS]
+    # Redact BEFORE the retention cap: the key text is backend-authored and
+    # the flush logs it, so a slice taken first could sever a credential at
+    # the cut into a fragment that matches none of the redactor's patterns.
+    return redact_backend_text(value)[:_DROP_SUMMARY_KEY_MAX_CHARS]
 
 
 def _get_rss_mb(pid: int) -> float | None:
@@ -1760,9 +1781,20 @@ class AcpRuntime:
         # newer pass's descendants are dropped from both the record and the file.
         # Sessions start concurrently on a shared runtime, so this is reachable.
         self._descendant_scan_lock = asyncio.Lock()
-        self._entitlement_probe_at = 0.0
+        # Two independent clocks so a failure never extends the life of an old
+        # success: ``_result_at`` is stamped ONLY when a non-empty result is
+        # stored (that result may be replayed until it expires), while
+        # ``_attempt_at`` is stamped on EVERY completed attempt incl.
+        # failure/empty (it suppresses re-opening a session within the TTL but
+        # never replays a stale result).
+        self._entitlement_probe_result_at = 0.0
+        self._entitlement_probe_attempt_at = 0.0
         self._entitlement_probe_result: list[dict[str, str]] = []
         self._dead = False
+        # Set only after kill confirms the root exited and no tracked
+        # descendant survived. Consumers use it to decide whether a work
+        # directory is safe to reclaim.
+        self._process_tree_confirmed_dead = False
         self._death_summary: str | None = None
         # The composed summary's parts, so the post-reap amendment rebuilds the
         # line instead of editing its text -- a tail carrying this format's own
@@ -1890,6 +1922,23 @@ class AcpRuntime:
         return self._pid
 
     @property
+    def spawn_monotonic(self) -> float | None:
+        """Monotonic time this process was spawned, or ``None`` before spawn."""
+        return self._spawn_monotonic
+
+    @property
+    def entitlement_probe_result_at(self) -> float:
+        """Monotonic time the stored probe answer arrived (0.0 before any).
+
+        :meth:`probe_advertised_models` serves either a fresh answer or a replay
+        of this stored one; in both cases the answer is dated by this clock, so a
+        caller that stores what it was served dates its snapshot from here rather
+        than from its own call time, which for a replay would be LATER than the
+        data and would raise its own freshness floor above it.
+        """
+        return self._entitlement_probe_result_at
+
+    @property
     def work_scratch_dir(self) -> Path | None:
         """The session tree's work directory this process exposes as ``$KIROCREW_SCRATCH``.
 
@@ -1981,6 +2030,11 @@ class AcpRuntime:
     def is_alive(self) -> bool:
         """True if the underlying process exists and has not exited."""
         return self._process is not None and self._process.returncode is None and not self._dead
+
+    @property
+    def process_tree_confirmed_dead(self) -> bool:
+        """Whether teardown confirmed the root and every tracked child exited."""
+        return self._process_tree_confirmed_dead is True
 
     def death_summary(self) -> str | None:
         """One-line death attribution, or None while alive.
@@ -2337,6 +2391,7 @@ class AcpRuntime:
         """Start the ACP runtime behind the gateway-wide cold-start admission gate."""
         if self._process is not None:
             raise AcpRuntimeError("Runtime already spawned")
+        self._process_tree_confirmed_dead = False
 
         admission = _cold_start_admission()
         wait_ms = await admission.acquire()
@@ -2452,7 +2507,19 @@ class AcpRuntime:
                 if self._native_skill_projection is not None:
                     argv = list(argv)
                     agent_position = argv.index("--agent") + 1
-                    argv[agent_position] = self._native_skill_projection.agent(self._agent)
+                    try:
+                        argv[agent_position] = self._native_skill_projection.agent(self._agent)
+                    except ValueError as exc:
+                        # The projection refused this agent's view -- a
+                        # ``kirocrew-core`` restriction authored in its spec, a
+                        # disabled ``skill_search`` -- and says so in a sentence
+                        # that names the spec and the remedy. That sentence is
+                        # the user's, so it travels as the error the startup
+                        # paths translate (``providers/acp.py`` handles
+                        # ``AcpRuntimeError`` around ``spawn()``); a bare
+                        # ``ValueError`` would leave ``spawn()`` as an internal
+                        # failure with the actionable text unread.
+                        raise AcpRuntimeError(str(exc)) from exc
         except _KiroExecutableTrustError as exc:
             raise AcpRuntimeError(str(exc)) from exc
         # The handshake declaration is the harness's constant. A host that takes
@@ -3297,6 +3364,7 @@ class AcpRuntime:
         as a bare "process died during prompt", and a log line that says
         "killed" without saying WHO killed leaves nothing to correlate.
         """
+        self._process_tree_confirmed_dead = False
         try:
             await self._kill_inner(expected=expected, reason=reason)
         finally:
@@ -3370,6 +3438,7 @@ class AcpRuntime:
             # exactly this point. The drain's failure path raises instead, keeping
             # the placeholder true for a tree it could not confirm.
             self._note_reaped_after_kill(process.returncode)
+            self._process_tree_confirmed_dead = process.returncode is not None
             self._process = None
             self._process_instance = ""
             # Tracking was retired by the shared drain under the original pin.
@@ -3436,6 +3505,7 @@ class AcpRuntime:
                 await escalate()
             # Before the handle is dropped: the death line above was
             # written pre-signal and says returncode=<not reaped>.
+            root_confirmed_dead = self._process.returncode is not None
             self._note_reaped_after_kill(self._process.returncode)
             self._process = None
             # The id names the process that just ended; the next spawn mints its
@@ -3471,6 +3541,7 @@ class AcpRuntime:
             # entry of one still running is what the sweep needs to reap it.
             saved_children = dict(self._child_pids)
             self._child_pids = {}
+            survivors: list[int] = []
             if saved_children:
                 survivors = await asyncio.to_thread(_prune_dead_descendants, saved_children)
                 if survivors:
@@ -3480,6 +3551,7 @@ class AcpRuntime:
                         len(survivors),
                         survivors,
                     )
+            self._process_tree_confirmed_dead = root_confirmed_dead and not survivors
 
     # ── Reader Task (single owner of stdout) ──
 
@@ -3710,8 +3782,8 @@ class AcpRuntime:
             "wait resolves",
             self._max_answer_tasks,
             request_kind,
-            msg.id,
-            f" for session {session_id}" if session_id else "",
+            _loggable_request_id(msg.id),
+            f" for session {_loggable_request_id(session_id)}" if session_id else "",
             self._answer_cap_wait_secs,
         )
         # Audit before condemning the runtime, so the record for this decision
@@ -3790,8 +3862,8 @@ class AcpRuntime:
             "(tool: %s, reason: %s): no surface on this client can answer it "
             "right now; answering with %s so the backend subagent gets a tool "
             "error instead of hanging",
-            msg.id,
-            session_id,
+            _loggable_request_id(msg.id),
+            _loggable_request_id(session_id),
             title,
             reason,
             result["outcome"]["outcome"],
@@ -3802,13 +3874,15 @@ class AcpRuntime:
             # the pipe is wedged, and every further frame from it would
             # stack another blocked task (the OOM vector). Marking the
             # runtime dead resolves EVERY pending wait by teardown, so no
-            # request is left unanswered and nothing accumulates.
+            # request is left unanswered and nothing accumulates. This is
+            # the outer guard; send_response's own drain bound fires first
+            # on a paused writer and surfaces as AcpRuntimeDead below.
             await asyncio.wait_for(self.send_response(msg.id, result), timeout=30.0)
         except asyncio.TimeoutError:
             logger.error(
                 "answer for permission request id=%s could not be written in "
                 "30s — backend not reading stdin; marking runtime dead",
-                msg.id,
+                _loggable_request_id(msg.id),
             )
             # Audit BEFORE returning: the denial DECISION was made even
             # though delivery failed — mandatory SEL coverage applies to
@@ -3817,6 +3891,14 @@ class AcpRuntime:
                 msg, session_id, f"{reason}:send_stalled_runtime_dead", title=title
             )
             self._mark_dead("permission-answer write stalled (backend not reading)")
+            return
+        except AcpRuntimeStdinStalled:
+            # send_response's own no-progress bound fired ahead of the outer
+            # guard and already marked the runtime dead; same disposition, same
+            # audit reason, so the record does not depend on which bound won.
+            self._audit_denied_off_loop(
+                msg, session_id, f"{reason}:send_stalled_runtime_dead", title=title
+            )
             return
         except AcpRuntimeDead:
             # Runtime died mid-answer; the backend's wait dies with it.
@@ -3836,7 +3918,7 @@ class AcpRuntime:
             logger.exception(
                 "failed to answer unroutable permission request id=%s — "
                 "marking runtime dead so the requester cannot hang",
-                msg.id,
+                _loggable_request_id(msg.id),
             )
             self._audit_denied_off_loop(
                 msg, session_id, f"{reason}:send_failed_runtime_dead", title=title
@@ -3970,8 +4052,8 @@ class AcpRuntime:
             logger.debug(
                 "Dropped %d unroutable frame(s) for session %s (method=%s)",
                 count,
-                session_id,
-                method,
+                _loggable_request_id(session_id),
+                _loggable_request_id(method),
             )
         counts.clear()
 
@@ -4482,9 +4564,9 @@ class AcpRuntime:
         and answered once by its dispatch loop (``server_request_unknown``).
         """
         logger.debug(
-            "Ownerless server request answered -32601 — method=%s id=%r",
-            method,
-            request_id,
+            "Ownerless server request answered -32601 — method=%s id=%s",
+            _loggable_request_id(method),
+            _loggable_request_id(request_id),
         )
         try:
             await self.send_error(request_id, _JSONRPC_METHOD_NOT_FOUND, "Method not found")
@@ -4791,8 +4873,16 @@ class AcpRuntime:
         data = json.dumps(req.to_dict()) + "\n"
 
         try:
-            self._process.stdin.write(data.encode())
-            await self._process.stdin.drain()
+            # Under the write lock so a response frame waiting behind this
+            # (caller-sized, deliberately unbounded) frame measures the
+            # reader's progress exactly; see await_under_no_progress_bound.
+            async with self._stdin_write_lock():
+                self._refuse_write_if_dead()
+                self._process.stdin.write(data.encode())
+                await self._process.stdin.drain()
+        except AcpRuntimeDead:
+            self._routed_requests.pop(req_id, None)
+            raise
         except (BrokenPipeError, ConnectionResetError) as exc:
             self._routed_requests.pop(req_id, None)
             self._mark_dead(f"pipe broken: {exc}")
@@ -4817,13 +4907,98 @@ class AcpRuntime:
         data = json.dumps(msg) + "\n"
 
         try:
-            self._process.stdin.write(data.encode())
-            await self._process.stdin.drain()
+            # A notification (session/cancel) is fire-and-forget and is the one
+            # signal that can end a wedged turn: wait for the lock under the
+            # no-progress bound, append unlocked if it does not come, and never
+            # park on a drain behind a reader that stopped.
+            outcome = await write_notification_best_effort(
+                self._process.stdin,
+                self._stdin_write_lock(),
+                data.encode(),
+                bound_secs=_RESPONSE_WRITE_BOUND_SECS,
+                before_write=self._refuse_write_if_dead,
+            )
         except (BrokenPipeError, ConnectionResetError) as exc:
             self._mark_dead(f"pipe broken: {exc}")
             raise AcpRuntimeDead(f"pipe broken: {exc}") from exc
 
-        self._last_activity = time.monotonic()
+        # Only a drained frame is evidence the backend moved: an unlocked append
+        # or a stall must not refresh the activity clock the idle/wedged-turn
+        # probes read -- that would defer the probe at the very moment a failed
+        # write showed the backend is not reading.
+        if outcome == "drained":
+            self._last_activity = time.monotonic()
+        else:
+            logger.debug(
+                "send_notification method=%s: %s; activity clock not refreshed",
+                _loggable_request_id(method),
+                outcome,
+            )
+
+    def _refuse_write_if_dead(self) -> None:
+        """Re-check under the write lock, right before a frame goes out.
+
+        A writer that queued for the lock while a sibling's stall marked the
+        runtime dead must not write into the pipe afterwards: ``_mark_dead``
+        has already failed every pending request and poisoned every session
+        queue, and the recovery path requeues the turn -- a prompt written now
+        would run a second time. Every runtime writer calls this immediately
+        before writing: under the lock when it holds one, and on the unlocked
+        best-effort notification append as well.
+        """
+        if self._dead:
+            raise AcpRuntimeDead("runtime is dead")
+
+    def _stdin_write_lock(self) -> asyncio.Lock:
+        """The one lock every stdin write on this runtime takes (see
+        ``await_under_no_progress_bound`` in client.py for why the bound needs
+        it). Created on first use so a runtime built without ``__init__`` (test
+        doubles) has one."""
+        lock = getattr(self, "_stdin_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._stdin_lock = lock
+        return lock
+
+    async def _write_response_bounded(self, data: bytes, request_id: str | int) -> None:
+        """Write a response/error frame under the write lock and a no-progress bound.
+
+        Mirror of ``AcpClient._write_response_bounded`` for the shared runtime.
+        Every multiplexed session shares this one stdin, so a response can wait
+        behind another session's multi-MB prompt frame on a flow-control-paused
+        writer while the backend is perfectly healthy; the shared helper only
+        gives up when the write buffer has not shrunk for
+        ``_RESPONSE_WRITE_BOUND_SECS`` -- nothing consumed, reader gone -- which
+        on a shared pipe is a dead runtime, not a slow session. Marks the runtime
+        dead (resolving every pending wait by teardown) and raises
+        ``AcpRuntimeDead``, which the session provider translates to
+        ``AcpProcessDied`` so the caller takes the same session-reset +
+        bounded-requeue recovery the broken-pipe case uses. The request id
+        appears only through ``_loggable_request_id``.
+        """
+        assert self._process is not None and self._process.stdin is not None
+        if await write_response_frame_bounded(
+            self._process.stdin,
+            self._stdin_write_lock(),
+            data,
+            bound_secs=_RESPONSE_WRITE_BOUND_SECS,
+            before_write=self._refuse_write_if_dead,
+        ):
+            return
+        safe_id = _loggable_request_id(request_id)
+        window = response_write_window_secs(self._process.stdin, _RESPONSE_WRITE_BOUND_SECS)
+        logger.warning(
+            "ACP runtime stdin stalled: no write progress for %gs (floor %d bytes/window) "
+            "while delivering response to req=%s; marking runtime dead",
+            window,
+            _RESPONSE_WRITE_MIN_PROGRESS_BYTES,
+            safe_id,
+        )
+        self._mark_dead("response write stalled (backend not reading stdin)")
+        raise AcpRuntimeStdinStalled(
+            f"stdin stalled: no write progress for {window:g}s while "
+            f"delivering response to req={safe_id}"
+        )
 
     async def send_response(self, request_id: str | int, result: dict[str, Any]) -> None:
         """Send a JSON-RPC response (for server→client requests like permission)."""
@@ -4836,8 +5011,7 @@ class AcpRuntime:
         data = json.dumps(msg) + "\n"
 
         try:
-            self._process.stdin.write(data.encode())
-            await self._process.stdin.drain()
+            await self._write_response_bounded(data.encode(), request_id)
         except (BrokenPipeError, ConnectionResetError) as exc:
             self._mark_dead(f"pipe broken: {exc}")
             raise AcpRuntimeDead(f"pipe broken: {exc}") from exc
@@ -4853,8 +5027,7 @@ class AcpRuntime:
         data = json.dumps(msg) + "\n"
 
         try:
-            self._process.stdin.write(data.encode())
-            await self._process.stdin.drain()
+            await self._write_response_bounded(data.encode(), request_id)
         except (BrokenPipeError, ConnectionResetError) as exc:
             self._mark_dead(f"pipe broken: {exc}")
             raise AcpRuntimeDead(f"pipe broken: {exc}") from exc
@@ -5894,23 +6067,46 @@ class AcpRuntime:
                 if projection is not None
                 else {}
             )
-            native = await asyncio.to_thread(
+            mount = await asyncio.to_thread(
                 kiro_control_plane_servers,
                 agent,
                 work_dir=work_dir,
                 existing_names={str(entry.get("name")) for entry in entries},
                 **projection_kwargs,
             )
+            name = agent or self._agent
             if (
                 projection is not None
-                and (agent or self._agent) in projection.search_agents
-                and not any(entry.get("name") == "kirocrew-core" for entry in [*entries, *native])
+                and name in projection.search_agents
+                and not any(entry.get("name") == "kirocrew-core" for entry in mount.elements)
             ):
-                raise AcpRuntimeError(
-                    "Cannot bind skill_search to this session without losing native MCP restrictions. "
-                    "Check the agent's kirocrew-core server configuration."
-                )
-            return [*entries, *native]
+                # The mount did not produce the element itself: a settings file
+                # withheld it, or a broker stub already in ``entries`` pre-empted
+                # it (the mount emits no element for a name the array carries),
+                # or nothing grants it. The mount judged the files as they are
+                # now -- the projection judged the spec at spawn; the dashboard's
+                # tool toggle writes the global file while a runtime is warm, and
+                # a stub written from an earlier overlay carries the restriction
+                # no better than the element does -- and its verdict comes with
+                # the array, from the same read. Asking the files again here
+                # would open the window in which a toggle undone in between
+                # answers "allowed" and this session falls to the generic guard
+                # below, naming the wrong file. A withheld element refuses THIS
+                # session with the sentence that names the file and the way
+                # back; the spawn and every other agent's sessions stand.
+                # Refusing is the only honest answer: the view already dropped
+                # this agent's skill resources on the element's promise, and
+                # without the element kirocrew-core mounts natively, carries no
+                # identity and answers identity_unattested to every skill_search.
+                withheld = mount.withheld.get("kirocrew-core")
+                if withheld is not None:
+                    raise AcpRuntimeError(f"Agent {name!r}: {withheld.explain('skill search')}")
+                if not any(entry.get("name") == "kirocrew-core" for entry in entries):
+                    raise AcpRuntimeError(
+                        "Cannot bind skill_search to this session without losing native MCP "
+                        "restrictions. Check the agent's kirocrew-core server configuration."
+                    )
+            return [*entries, *mount.elements]
         return entries
 
     async def create_session(
@@ -6659,7 +6855,9 @@ class AcpRuntime:
         logger.info("Created session %s on runtime PID %d", session_id, self._pid or 0)
         return handle
 
-    async def probe_advertised_models(self) -> list[dict[str, str]]:
+    async def probe_advertised_models(
+        self, *, force: bool = False, not_before: float = 0.0
+    ) -> list[dict[str, str]]:
         """Fetch a fresh advertised-model (entitlement) snapshot from this backend.
 
         A session's ``availableModels`` is captured once, from its own
@@ -6671,9 +6869,31 @@ class AcpRuntime:
         process with a throwaway minimal session (no MCP servers, no mode
         activation), terminated before returning.
 
-        Single-flight + short TTL: concurrent callers share one probe, and a
-        fresh non-empty answer is reused for :data:`_ENTITLEMENT_PROBE_TTL_SECS`
-        so a burst of rejections costs one round-trip.
+        Single-flight + short TTL, on TWO clocks. A non-empty SUCCESS is replayed
+        for :data:`_ENTITLEMENT_PROBE_TTL_SECS` (its result clock); an empty or
+        FAILED attempt replays as ``[]`` (no evidence) for the same window (its
+        attempt clock) without re-opening a session, so a burst of failures on
+        the picker read path costs one round-trip. A failure never revives an
+        expired success — the two clocks are independent.
+
+        ``force=True`` skips ONLY the attempt-clock replay: a USER ACTION (an
+        explicit ``set_model`` pick, the spawn-time pin withhold) must earn a
+        fresh probe rather than be refused on a recent no-evidence failure: an
+        explicit action always earns a real answer. It still honours the
+        result-clock replay of a recent non-empty success (fresh evidence —
+        nothing is gained by re-probing) and still serializes on the
+        single-flight lock. The picker read path leaves ``force=False`` so it
+        keeps the burst cap.
+
+        ``not_before`` is a freshness floor on the result-clock replay: a caller
+        passes the monotonic time of the snapshot it already holds, and a replay
+        never answers with a result older than that snapshot. The shared result
+        cache spans every session on this process, so without the floor a broad
+        answer cached before an entitlement downgrade would overwrite a newer
+        session's correctly narrower ``session/new`` snapshot. A cached result
+        older than the floor is not evidence for that caller: the attempt-clock
+        logic below decides between ``[]`` and a fresh probe, whose result is
+        always newer than the floor.
 
         Returns the normalized advertised list, or ``[]`` when the probe fails
         or advertises nothing. An empty return is NOT evidence about
@@ -6681,11 +6901,35 @@ class AcpRuntime:
         """
         async with self._entitlement_probe_lock:
             now = time.monotonic()
+            # Two-clock guard so a failure never extends the life of an old
+            # success. If the last SUCCESSFUL result is still within TTL, replay
+            # it (even under force: a fresh success is fresh evidence). Otherwise,
+            # if the last ATTEMPT of any outcome (incl. a failure that re-stamped
+            # only the attempt clock) is within TTL, return [] — no evidence, fail
+            # open — WITHOUT opening a fresh session/new, UNLESS force=True, which
+            # a user action passes to earn a fresh probe rather than be refused on
+            # a recent no-evidence failure. Only past both windows (or forced past
+            # the attempt window) do we probe again. Both clocks are 0.0 until the
+            # first completed attempt, so neither branch fires before one. Both
+            # replays also require their clock to be at least as new as the
+            # caller's own snapshot (``not_before``): a cached answer never
+            # replaces a newer one, and a failed attempt that predates the
+            # caller's snapshot never stands in for the probe that snapshot has
+            # yet to receive.
             if (
                 self._entitlement_probe_result
-                and now - self._entitlement_probe_at < _ENTITLEMENT_PROBE_TTL_SECS
+                and self._entitlement_probe_result_at > 0.0
+                and self._entitlement_probe_result_at >= not_before
+                and now - self._entitlement_probe_result_at < _ENTITLEMENT_PROBE_TTL_SECS
             ):
                 return list(self._entitlement_probe_result)
+            if (
+                not force
+                and self._entitlement_probe_attempt_at > 0.0
+                and self._entitlement_probe_attempt_at >= not_before
+                and now - self._entitlement_probe_attempt_at < _ENTITLEMENT_PROBE_TTL_SECS
+            ):
+                return []
             if not self._initialized or self._dead or self._process is None:
                 return []
             params = build_session_new_params(await self._session_work_dir(), mcp_servers=[])
@@ -6704,7 +6948,18 @@ class AcpRuntime:
                     self._finish_session_init(session_id)
             except Exception:
                 logger.debug("entitlement probe session/new failed", exc_info=True)
+                # Stamp the ATTEMPT clock only (never the result clock), so a
+                # burst of failing reads costs one session/new within the TTL
+                # while the last SUCCESSFUL result keeps expiring on its own
+                # clock — a failure can never revive a stale success.
+                self._entitlement_probe_attempt_at = time.monotonic()
                 return []
+            # The answer's freshness is the moment it ARRIVED, stamped before the
+            # teardown below. Stamping after the terminate round-trip would date
+            # the answer later than a real session/new that completed during
+            # that await, and the freshness floor would then let this older
+            # answer replay over that session's newer snapshot.
+            completed_at = time.monotonic()
             try:
                 # Reads BOTH shapes, through the same fold the session-init capture
                 # uses. Reading only ``models`` answers [] for a host whose list is a
@@ -6717,9 +6972,16 @@ class AcpRuntime:
                     # Evict the probe session from the shared process; never
                     # raises (best-effort by contract).
                     await self.terminate_session(session_id)
+            # A non-empty answer updates the stored result and its OWN clock, so
+            # it is replayed until that clock expires. An empty answer leaves the
+            # stored result (and its clock) untouched — no evidence, fail open.
             if fresh:
                 self._entitlement_probe_result = list(fresh)
-                self._entitlement_probe_at = time.monotonic()
+                self._entitlement_probe_result_at = completed_at
+            # The attempt clock is stamped on EVERY completed probe, empty
+            # included, so a burst of reads within the TTL costs one session/new
+            # whether or not the backend advertised anything.
+            self._entitlement_probe_attempt_at = completed_at
             return fresh
 
     async def load_session(
@@ -7180,8 +7442,22 @@ class AcpRuntime:
         self._pending_requests[req_id] = future
 
         try:
-            self._process.stdin.write(data.encode())
-            await self._process.stdin.drain()
+            async with self._stdin_write_lock():
+                self._refuse_write_if_dead()
+                self._process.stdin.write(data.encode())
+                await self._process.stdin.drain()
+        except AcpRuntimeDead:
+            # Reached only through _refuse_write_if_dead: _mark_dead has already
+            # failed this future and cleared the map, so retrieve its exception
+            # (or cancel a still-pending one) rather than drop the last reference
+            # unretrieved and have asyncio log a handled error as unhandled.
+            self._pending_requests.pop(req_id, None)
+            if future.done():
+                if not future.cancelled():
+                    future.exception()
+            else:
+                future.cancel()
+            raise
         except (BrokenPipeError, ConnectionResetError) as exc:
             self._pending_requests.pop(req_id, None)
             self._mark_dead(f"pipe broken: {exc}")

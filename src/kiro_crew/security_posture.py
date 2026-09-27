@@ -1549,6 +1549,15 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
 # catches an omission.
 NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
     {
+        # The redaction cards' owner-only route (allowed hosts). It applies no
+        # redactor; the call-site scan matches its
+        # handler names (`api_redaction_allow_host`, ...).
+        "dashboard/handlers/redaction.py",
+        # Gate-side: the link-preview route runs both redactors on the URL it was
+        # asked to fetch only to REFUSE it (`400 blocked_url`) when either would
+        # change it, so a zero-click fetch never carries what redaction removes.
+        # Nothing it returns is redacted text, so it is a gate, not an egress sink.
+        "dashboard/handlers/link_meta.py",
         # Drives the backup redaction pass and reports what it did, but applies no
         # redactor itself: the outbound bytes are rewritten in `snapshot_redact.py`,
         # which is the registered sink. What matches the call-site scan here are the
@@ -1741,6 +1750,17 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         # read, not an egress pass.
         "autonudge.py",
         "autonudge_authz.py",
+        # Applies no redactor at all: the pipeline conductor's fleet probe BUILDS a
+        # command fragment for a `BANNED` line out of what can hold no secret -- a
+        # runner or launcher name drawn from a fixed vocabulary, and an option name
+        # with its value dropped, the cap flag's digits included -- and withholds
+        # every other token, counting it as `+<n>`. What matches the call-site scan
+        # here is the name of that builder (`_redacted_command`), not a call to a
+        # redactor: nothing is scrubbed, because nothing unrecognised is emitted in
+        # the first place. Registering it as a sink would make the panel claim this
+        # path is covered BY redaction, when what covers it is withholding -- the
+        # same overstatement the decision-seam entry above refuses for refusal.
+        "builtin_skills/pipeline-conductor/scripts/fleet_probe.py",
         # Inbound structured-monitor target validation. A canonical provider URL
         # is rejected when its path contains credential-shaped text, before the
         # target reaches persistence, inspection, or a wake envelope.

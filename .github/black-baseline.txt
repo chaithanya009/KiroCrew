@@ -169,7 +169,6 @@ src/kiro_crew/dashboard/handlers/ask_question.py
 src/kiro_crew/dashboard/handlers/files.py
 src/kiro_crew/dashboard/handlers/kiro_usage_api.py
 src/kiro_crew/dashboard/handlers/knowledge.py
-src/kiro_crew/dashboard/handlers/mcp_apps.py
 src/kiro_crew/dashboard/handlers/mcp_custom.py
 src/kiro_crew/dashboard/handlers/notifications_push.py
 src/kiro_crew/dashboard/handlers/security.py
@@ -278,7 +277,6 @@ src/kiro_crew/skill_usage.py
 src/kiro_crew/skills_dedupe.py
 src/kiro_crew/skills_script_validator.py
 src/kiro_crew/slack/blocks.py
-src/kiro_crew/slack/client.py
 src/kiro_crew/slack/enterprise.py
 src/kiro_crew/slack/events.py
 src/kiro_crew/slack/sessions_view.py
@@ -297,7 +295,6 @@ test/metrics/test_mcp_gateway_metrics.py
 test/metrics/test_schema.py
 test/metrics/test_telemetry_titles.py
 test/metrics/test_watchdog_metrics.py
-test/test_acp_dynamic_config.py
 test/test_acp_error_surface.py
 test/test_acp_liveness.py
 test/test_acp_metadata_fields.py
@@ -749,7 +746,6 @@ test/test_papyrus_tectonic.py
 test/test_parse_options.py
 test/test_parse_time_string_tz.py
 test/test_pending_skill_notification_content.py
-test/test_perf_boot_path.py
 test/test_perf_memory_quickwins.py
 test/test_perf_sampler.py
 test/test_persist_off_loop.py
@@ -873,7 +869,6 @@ test/test_slack_thread_sync.py
 test/test_slack_transport_integration.py
 test/test_slack_upload_binary.py
 test/test_slash_task_tracking.py
-test/test_slot_detail_offload.py
 test/test_slot_needs_input_status.py
 test/test_slot_sync_on_create.py
 test/test_slots_broadcast_coalesce.py

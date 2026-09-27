@@ -504,8 +504,8 @@ def normalize_workspace_path(raw: str) -> Path:
         return Path(raw)
 
 
-def _resolve_workspace_root(root: Path) -> Path:
-    """Realpath-normalize a workspace root after ensuring it exists.
+def _resolve_workspace_root(root: Path, *, create: bool = True) -> Path:
+    """Realpath-normalize a workspace root, by default after ensuring it exists.
 
     On hosts with a symlinked ``$HOME``/workspace path (e.g. ``/home/<u> ->
     /local/home/<u>``, ``/home/<u>/workplace -> /workplace/<u>``) the symlink-form
@@ -518,16 +518,21 @@ def _resolve_workspace_root(root: Path) -> Path:
     Normalizing here, at the single source, makes the SAME resolved path flow into
     spawn cwd and the persisted session_map cwd so write and resume always agree.
     This mirrors the existing ``os.path.realpath`` in ``default_project_dir``.
+
+    ``create=False`` is for a read-only caller (the doctor) that must not leave a
+    workspace tree behind on a host where no gateway ever ran; realpath of a
+    missing path resolves the components that do exist.
     """
     if not root.is_absolute():
         # A relative root would be created under whatever CWD this process has.
         logger.warning("workspace root %r is not absolute; using the default", str(root))
         root = _default_workspace_base() / _WORKSPACE_DIR_NAME
-    root.mkdir(parents=True, exist_ok=True)
+    if create:
+        root.mkdir(parents=True, exist_ok=True)
     return Path(os.path.realpath(str(root)))
 
 
-def workspace_root() -> Path:
+def workspace_root(*, create: bool = True) -> Path:
     """Return the top-level workspace root for LLM sessions and tasks.
 
     Resolution order:
@@ -537,20 +542,21 @@ def workspace_root() -> Path:
 
     Values are unquoted and ``~``-expanded; a non-absolute root is replaced by (3).
     The chosen root is realpath-normalized (see ``_resolve_workspace_root``) so
-    sessions resume correctly on hosts with a symlinked home/workspace path.
+    sessions resume correctly on hosts with a symlinked home/workspace path. It is
+    created unless ``create=False``, which only resolves the configured path.
     """
     override = os.environ.get("KIROCREW_WORKSPACE")
     if override:
-        return _resolve_workspace_root(normalize_workspace_path(override))
+        return _resolve_workspace_root(normalize_workspace_path(override), create=create)
     if _workspace_dir_file().is_file():
         try:
             saved = _workspace_dir_file().read_text(encoding="utf-8").strip()
             if saved:
-                return _resolve_workspace_root(normalize_workspace_path(saved))
+                return _resolve_workspace_root(normalize_workspace_path(saved), create=create)
         except OSError:
             pass
     base = _default_workspace_base()
-    return _resolve_workspace_root(base / _WORKSPACE_DIR_NAME)
+    return _resolve_workspace_root(base / _WORKSPACE_DIR_NAME, create=create)
 
 
 def _session_work_dir(session_key: str | None) -> Path:
@@ -2383,6 +2389,18 @@ def _default_memory_mode_from(raw: object) -> str:
     return raw if isinstance(raw, str) and raw in _DEFAULT_MEMORY_MODES else "temporary"
 
 
+def _folder_sort_from(raw: object) -> str:
+    """Normalize the sidebar folder sort mode; anything unknown is ``custom``.
+
+    ``custom`` is the stored-order behaviour every install had before the field
+    existed, so a missing, hand-edited or downgraded value changes nothing the
+    person sees. The sidebar's own reader makes the same choice.
+    """
+    if isinstance(raw, str) and raw in _sections.FOLDER_SORT_MODES:
+        return raw
+    return _sections.FOLDER_SORT_DEFAULT
+
+
 # (section, key, min, max) for each bounded field clamped at load time. The
 # mins match the runtime floors: subagent_auto_max has a floor of 3
 # (``subagent._LEGACY_DEFAULT_MAX`` — the auto-size minimum), so a value < 3 is
@@ -3481,6 +3499,9 @@ def _build_dashboard_config(_degraded: set[str], dashboard_data: dict) -> Dashbo
             0,
             RECENT_TINT_COUNT_MIN,
             RECENT_TINT_COUNT_MAX,
+        ),
+        folder_sort=_folder_sort_from(
+            dashboard_data.get("folder_sort", _sections.FOLDER_SORT_DEFAULT)
         ),
         update_nudge=(
             dashboard_data.get("update_nudge", {})
@@ -5659,6 +5680,7 @@ class KiroCrewConfig:
         from kiro_crew.providers.acp import (
             AcpProvider,  # circular: acp -> client -> session -> config.loader
         )
+        from kiro_crew.session_work_dir import is_disposable_session_key
 
         model = self.agent.model
         if model == DEFAULT_MODEL:
@@ -5852,6 +5874,10 @@ class KiroCrewConfig:
                 shared_scratch=shared_scratch,
                 on_gate_acquired=on_gate_acquired,
                 on_gate_queued=on_gate_queued,
+                # Only a work dir DERIVED from a one-run key is the provider's
+                # to reclaim at shutdown; an explicit ``cwd`` is the caller's
+                # directory whatever the key says (session_work_dir).
+                disposable_work_dir=not cwd and is_disposable_session_key(session_key),
             )
 
         return _acp

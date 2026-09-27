@@ -26,6 +26,7 @@ from kiro_crew import members as members_mod
 from kiro_crew import model_registry
 from kiro_crew.acp.client import AcpModelUnavailable
 from kiro_crew.agent_discovery import cached_project_agent_names, warm_project_agent_names
+from kiro_crew.agent_sdk.backends import ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS
 from kiro_crew.agent_sdk.capabilities import MODEL_NAMESPACE_ACP, capabilities_of
 from kiro_crew.agent_sdk.provider_identity import is_claude_code
 from kiro_crew.apps import permissions as app_permissions
@@ -54,8 +55,8 @@ from kiro_crew.dashboard.chat_delivery import (
     steer_into_running_turn,
 )
 from kiro_crew.dashboard.chat_folders import (
-    _resolve_folder_project_dir,
     _unhide_folder,
+    resolve_folder_project_dir_off_loop,
 )
 from kiro_crew.dashboard.chat_orchestrator import (
     _cancel_stage_subagents,
@@ -72,11 +73,15 @@ from kiro_crew.dashboard.chat_persistence import (
     COLOR_HEX_RE,
     _attach_variants,
     _rehydrate_slot_title,
+    _remember_reasoning_effort_for_restore,
     _restored_agent_name,
     _restored_mode,
     _validate_autocompact_pct,
+    cap_effort_capability_levels,
+    get_reasoning_effort_ordered,
     get_reasoning_effort_values,
     pin_private_agent_store,
+    register_reasoning_effort_values,
     release_prewarmed_session,
     save_slot_off_loop,
 )
@@ -114,12 +119,23 @@ from kiro_crew.dashboard.chat_utils import (
     _redact_meta,
     _redact_meta_for_role,
     _remove_queued_by_id,
+    _resettle_restricted_key,
     _sync_dashboard_slots,
     drained_to_thread,
     effective_session_key,
     history_corpus_unreadable,
+)
+from kiro_crew.dashboard.chat_utils import (
+    replacement_shares_transcript as _replacement_shares_transcript,
+)
+from kiro_crew.dashboard.chat_utils import (
+    restore_replacement_if_handover_did_not_land,
     slot_history_key,
     subagents_attached_async,
+    tighten_live_slot_memory_mode,
+)
+from kiro_crew.dashboard.chat_utils import (
+    tighten_replacement_to_restricted_original as _tighten_replacement_to_restricted_original,
 )
 from kiro_crew.dashboard.handlers._shared import _owner_denial_response, read_bounded_json
 from kiro_crew.dashboard.handlers.source_providers import is_owner_dashboard_request
@@ -137,6 +153,7 @@ from kiro_crew.dashboard.remote_adopt import (
 from kiro_crew.dashboard.remote_relay import (
     RemoteTurnError,
     create_peer_slot,
+    ensure_version_parity,
     forward_peer_selection,
     forward_peer_stop,
     peer_is_connected,
@@ -170,9 +187,19 @@ from kiro_crew.dashboard.state import (
 )
 from kiro_crew.dashboard.system_notices import SESSION_RELOAD_KIND, is_system_notice
 from kiro_crew.dashboard.turn_dispatch import spawn_guarded_turn
-from kiro_crew.history import carry_provenance, is_incognito_transcript, transcript_stems
+from kiro_crew.history import (
+    ConversationLog,
+    TranscriptBusy,
+    carry_provenance,
+    is_incognito_transcript,
+    transcript_lock_stems,
+    transcript_withholds_derivation,
+)
+from kiro_crew.history_projection import TranscriptRevisionChanged
+from kiro_crew.jsonl_util import OversizedRecord, SplitlinesBoundaryRecord
 from kiro_crew.llm_helpers import pick_epoch_host, slot_switch_session_lock
 from kiro_crew.memory_startup import MemoryStartupUnavailable, wait_for_memory_preparation
+from kiro_crew.memory_stores import UnknownMemoryStore
 from kiro_crew.messaging.link import canonical_key, is_channel_session_key
 from kiro_crew.providers.acp import AcpProvider
 from kiro_crew.providers.base import LLMProvider
@@ -1785,8 +1812,7 @@ async def api_chat_slot_summary(request: web.Request) -> web.Response:
     # stop serving summaries, not just stop producing them, or a sidecar written
     # during an earlier opt-in keeps being returned after opt-out.
     if enabled and log is not None:
-        history_key = slot_history_key(slot)
-        payload, stale = await asyncio.to_thread(log.read_intent_summary, history_key)
+        payload, stale = await _read_intent_summary_if_derivation_is_allowed(log, slot)
 
     body: dict = {
         "enabled": enabled,
@@ -1799,6 +1825,38 @@ async def api_chat_slot_summary(request: web.Request) -> web.Response:
         "generate_state": _generate_state(cfg, slot),
     }
     return web.json_response(body)
+
+
+async def _read_intent_summary_if_derivation_is_allowed(
+    log: ConversationLog, slot: Any
+) -> tuple[dict | None, bool]:
+    """Read *slot*'s ``.intents`` sidecar only if its transcript may be derived from.
+
+    The one read both summary routes use: the sidecar is itself derived from
+    the transcript, so it is served under the same two gates as the transcript
+    -- the live slot's mode, and the on-disk line validated while holding the
+    same physical lock as metadata writers. A ``.intents`` file can outlive the
+    persistent life that wrote it (the key is recreated restricted; the sidecar
+    stays, by design, for a later persistent holder), and
+    ``read_intent_summary`` reports its signature mismatch as ``stale`` rather
+    than dropping it, so a bare read would hand a restricted session its
+    predecessor's summary. Unreadable fails closed; a lock timeout is the same
+    empty result.
+    """
+    if is_incognito_transcript(getattr(slot, "memory_mode", "")):
+        return None, False
+    history_key = slot_history_key(slot)
+
+    def _read() -> tuple[dict | None, bool]:
+        with log.derivation_hold(transcript_lock_stems(history_key)):
+            if transcript_withholds_derivation(log, history_key):
+                return None, False
+            return log.read_intent_summary(history_key)
+
+    try:
+        return await asyncio.to_thread(_read)
+    except TranscriptBusy:
+        return None, False
 
 
 def _generate_state(cfg: KiroCrewConfig, slot: Any) -> str:
@@ -1916,9 +1974,11 @@ async def api_chat_slot_summary_generate(request: web.Request) -> web.Response:
 
     # Read back rather than trusting the return value: a forced pass returns
     # False both when it produced nothing AND when the cached summary was
-    # already current, and those are opposite outcomes for the panel.
-    history_key = slot_history_key(slot)
-    payload, stale = await asyncio.to_thread(log.read_intent_summary, history_key)
+    # already current, and those are opposite outcomes for the panel. Through
+    # the same gated read as the GET: a pass the generator skipped for
+    # ``memory_mode`` must not be answered with a sidecar left over from the
+    # key's earlier persistent life.
+    payload, stale = await _read_intent_summary_if_derivation_is_allowed(log, slot)
     if payload is None:
         return web.json_response(
             {"error": "could not summarize this session", "code": "summary_unavailable"},
@@ -2062,10 +2122,11 @@ def _snapshot_slot_window(slot: "_ChatSlot") -> tuple[int, list[dict]]:
     return disk_older_count, window
 
 
-def _append_unflushed_tail(
+def _append_unflushed_tail_from_offset(
     slot: "_ChatSlot",
     all_msgs: list[dict],
     *,
+    disk_offset: int,
     snapshot: tuple[int, list[dict]] | None = None,
 ) -> list[dict]:
     """Append window messages that are not yet on disk to a chained disk read.
@@ -2174,7 +2235,8 @@ def _append_unflushed_tail(
     if snapshot is None:
         snapshot = _snapshot_slot_window(slot)
     disk_older_count, window = snapshot
-    window_disk = all_msgs[disk_older_count:]
+    local_older_count = max(0, disk_older_count - disk_offset)
+    window_disk = all_msgs[local_older_count:]
     disk_mid_positions: dict[str, list[int]] = {}
     every_row_has_an_id = bool(window_disk)
     for i, m in enumerate(window_disk):
@@ -2220,7 +2282,7 @@ def _append_unflushed_tail(
             pending.append(m)
         if not owed_before and not pending:
             return all_msgs
-        merged: list[dict] = list(all_msgs[:disk_older_count])
+        merged: list[dict] = list(all_msgs[:local_older_count])
         for i, m in enumerate(window_disk):
             merged.extend(owed_before.get(i, ()))
             merged.append(m)
@@ -2228,7 +2290,7 @@ def _append_unflushed_tail(
         return merged
     else:
         start = 0
-        d = min(disk_older_count, len(all_msgs))
+        d = min(local_older_count, len(all_msgs))
         # An owed row is one the disk slice does not already carry, and this arm walks
         # the WHOLE window so that a single owed row cannot strand the rows behind it.
         # There are two ways to be owed, and both route to ``owed_rows``:
@@ -2317,6 +2379,116 @@ def _append_unflushed_tail(
             merged_idless.append(row)
         merged_idless.extend(tail)
         return merged_idless
+
+
+def _append_unflushed_tail(
+    slot: "_ChatSlot",
+    all_msgs: list[dict],
+    *,
+    snapshot: tuple[int, list[dict]] | None = None,
+) -> list[dict]:
+    """Compatibility wrapper for reconciliation against a complete disk read."""
+    return _append_unflushed_tail_from_offset(
+        slot,
+        all_msgs,
+        disk_offset=0,
+        snapshot=snapshot,
+    )
+
+
+class _DurablePrefixMismatch(Exception):
+    """The slot's raw and durable prefix counters disagree for this snapshot.
+
+    Deterministic for the snapshot, so the bounded path hands the request to
+    the full reader instead of retrying.
+    """
+
+
+def _durable_prefix_counter(slot: "_ChatSlot") -> int:
+    """The slot's durable-prefix counter, or a value the raw counter can never equal.
+
+    ``_ChatSlot`` always carries the counter. A stand-in that does not gets ``-1``,
+    which fails the prefix guard and routes the request to the full reader —
+    never a default equal to the raw counter, which would pass the guard vacuously.
+    """
+    value = getattr(slot, "_disk_older_durable_count", None)
+    return -1 if value is None else int(value)
+
+
+def _bounded_slot_page(
+    conversation_log: Any,
+    slot: "_ChatSlot",
+    history_key: str,
+    *,
+    limit: int,
+    before: int | None,
+    snapshot: tuple[int, list[dict]],
+    durable_prefix_count: int,
+) -> tuple[list[dict], int, bool, int]:
+    """Compose one display page from an indexed durable prefix and live suffix.
+
+    The sparse history projection owns durable row ranges. This helper reads at
+    most the resident disk/window suffix, applies the established reconciliation
+    oracle there, and fetches only the older range intersecting the requested
+    page. Unlimited callers keep using the complete-reader path.
+
+    The on-disk suffix is always read, a pending rewrite included: the full
+    reader keeps the pre-rewind rows until the rewrite flushes, and the same
+    reconciliation walk resolves them here, so both paths index one corpus and a
+    ``before`` cursor from either response addresses the same rows.
+    """
+    disk_older_count, _window = snapshot
+    if disk_older_count != durable_prefix_count:
+        # Deterministic for this snapshot (both counters are slot state, not file
+        # state), so retrying re-reads nothing new: hand over to the full reader.
+        raise _DurablePrefixMismatch("raw and durable history prefix counters differ")
+
+    # ``limit=0`` is the projection's total/revision probe: it stats and indexes
+    # the chain but decodes no rows.
+    total_probe = conversation_log.read_messages_chained_page(history_key, limit=0)
+    durable_total = total_probe.total
+    revision = total_probe.revision
+    prefix_total = min(disk_older_count, durable_total)
+
+    suffix_count = durable_total - prefix_total
+    disk_suffix = (
+        conversation_log.read_messages_chained_page(
+            history_key,
+            limit=suffix_count,
+            before=durable_total,
+            expected_revision=revision,
+        ).messages
+        if suffix_count > 0
+        else []
+    )
+
+    merged_suffix = _append_unflushed_tail_from_offset(
+        slot,
+        disk_suffix,
+        disk_offset=prefix_total,
+        snapshot=snapshot,
+    )
+    collapsed_suffix = _collapse_wire_rows(merged_suffix)
+    total = prefix_total + len(collapsed_suffix)
+    end = total if before is None else max(0, min(before, total))
+    start = max(0, end - limit)
+
+    messages: list[dict] = []
+    prefix_end = min(end, prefix_total)
+    if start < prefix_end:
+        messages.extend(
+            conversation_log.read_messages_chained_page(
+                history_key,
+                limit=prefix_end - start,
+                before=prefix_end,
+                expected_revision=revision,
+            ).messages
+        )
+    suffix_start = max(start, prefix_total) - prefix_total
+    suffix_end = max(0, end - prefix_total)
+    if suffix_start < suffix_end:
+        messages.extend(collapsed_suffix[suffix_start:suffix_end])
+    return messages, total, start > 0, start
 
 
 async def api_chat_slot_detail(request: web.Request) -> web.Response:
@@ -2573,74 +2745,160 @@ async def api_chat_slot_detail(request: web.Request) -> web.Response:
                     next_before = rotated_count
                     total += rotated_count
     else:
-        # Legacy pagination path (retained for programmatic callers).
-        # Always reads from chained disk history; no in-memory offset math.
-        # The FULL corpus — size-rotated archive heads included — so paging can
-        # walk past a rotation boundary instead of declaring the transcript
-        # complete at it (the reader's oldest messages live in archive/ after
-        # a big session rotates, and this path is their only way back in).
         history_key = slot_history_key(slot)
-        try:
-            all_msgs = (
-                await asyncio.to_thread(
-                    state.conversation_log.read_messages_chained_full, history_key
+        bounded_page: tuple[list[dict], int, bool, int] | None = None
+        requires_full_reader = False
+        if state.conversation_log:
+            try:
+                rotated = await asyncio.to_thread(
+                    state.conversation_log.read_rotated_messages_chained,
+                    history_key,
                 )
-                if state.conversation_log
-                else []
-            )
-        except Exception:
-            # NOT `all_msgs = []`. This is the legacy pagination path and the only
-            # way back into a rotated archive, so folding the failure into an empty
-            # corpus answers 200 with the live tail and `has_more` false -- the
-            # reader is told their older history does not exist. See
-            # `history_corpus_unreadable` for why all three sites share one answer.
-            logger.warning("read_messages_chained_full failed for %s", history_key, exc_info=True)
-            return history_corpus_unreadable()
-        # Append any un-flushed in-memory tail messages beyond what's on disk.
-        # Snapshot on the LOOP, after the disk read: the two reads inside the helper
-        # have no await between them, so a synchronous finalization cannot be caught
-        # half-done the way a worker thread can catch it.
-        tail_snapshot = _snapshot_slot_window(slot)
-        all_msgs = await asyncio.to_thread(
-            _append_unflushed_tail, slot, all_msgs, snapshot=tail_snapshot
-        )
-        # One row must mean one displayed message BEFORE `limit` is applied. The
-        # owed rows above can include `chunk`/`streaming`, and a segment still
-        # streaming is hundreds of rows that render as one message, so slicing
-        # first spends the caller's budget on rows the response will not carry
-        # and returns a mid-sentence fragment.
-        #
-        # Reduce the whole corpus, not a trailing slice: the helper places owed
-        # rows at the disk index they belong to, so they are not a contiguous
-        # suffix and a slice-scoped fold would miss the interleaved ones. In a
-        # thread for the same reason the append is -- whole-corpus work does not
-        # belong on the event loop.
-        #
-        # `done` is already excluded upstream (`_UNOWED_WINDOW_ROLES`), so on
-        # this path the reduction's remaining job is folding the chunk runs.
-        #
-        # CLIENT DEPENDENCY on this collapse shape: while a slot streams, the
-        # in-flight chunk run folds into ONE trailing row that carries no durable
-        # `meta.mid`, and the bounded window ends in it. The dashboard's
-        # `warmSlotCache` (website/src/store/chatSlice.ts) sizes its count-matched
-        # request to the durable rows a pane holds and asks for ONE EXTRA row on a
-        # running slot so the folded row does not displace a durable one out of
-        # the window. A change here that folds the run into more than one row, or
-        # stops folding, moves that `+1` out of step with the response.
-        all_msgs = await asyncio.to_thread(_collapse_wire_rows, all_msgs)
-        total = len(all_msgs)
-        if before is not None:
-            end = max(0, min(before, total))
+            except Exception:
+                logger.warning("rotated-archive read failed for %s", history_key, exc_info=True)
+                return history_corpus_unreadable()
+            requires_full_reader = bool(rotated)
+
+        # A memory-only gateway (no conversation log) has no durable rows to
+        # index; the fallback below already serves it from the resident window.
+        if state.conversation_log and not requires_full_reader:
+            for _attempt in range(_FLUSH_SNAPSHOT_RETRIES):
+                tail_snapshot = _snapshot_slot_window(slot)
+                durable_prefix_count = _durable_prefix_counter(slot)
+                version = (
+                    getattr(slot, "_dirty_gen", 0),
+                    slot._disk_older_count,
+                    durable_prefix_count,
+                )
+                try:
+                    candidate = await asyncio.to_thread(
+                        _bounded_slot_page,
+                        state.conversation_log,
+                        slot,
+                        history_key,
+                        limit=limit,
+                        before=before,
+                        snapshot=tail_snapshot,
+                        durable_prefix_count=durable_prefix_count,
+                    )
+                except UnicodeDecodeError:
+                    # Same posture as the full reader's strict text-mode read:
+                    # undecodable transcript bytes are not a page to serve.
+                    logger.warning(
+                        "bounded slot history is not valid UTF-8 for %s", history_key, exc_info=True
+                    )
+                    return history_corpus_unreadable()
+                except RecursionError:
+                    # A row nested past the parser's depth is a corrupt corpus,
+                    # not a page: the unlimited path answers the same 503 for it.
+                    logger.warning(
+                        "bounded slot history row exceeds JSON depth for %s",
+                        history_key,
+                        exc_info=True,
+                    )
+                    return history_corpus_unreadable()
+                except ValueError:
+                    # ``json.loads`` refusing a row for a reason other than
+                    # malformed JSON (an integer literal past the interpreter's
+                    # digit limit). Deterministic for the revision, and the full
+                    # reader raises the same error, so answer the 503 it would
+                    # answer instead of retrying toward it.
+                    logger.warning(
+                        "bounded slot history row is not decodable for %s",
+                        history_key,
+                        exc_info=True,
+                    )
+                    return history_corpus_unreadable()
+                except (OversizedRecord, SplitlinesBoundaryRecord):
+                    # Deterministic: the same row is over the cap, or holds a
+                    # boundary only the full reader's splitlines() honours, on
+                    # every attempt. Go straight to the authoritative full reader.
+                    logger.debug("bounded slot history hit an unframeable row for %s", history_key)
+                    break
+                except _DurablePrefixMismatch:
+                    # Deterministic for this snapshot: the raw and durable prefix
+                    # counters disagree (mid-flush bookkeeping). The full reader
+                    # below reconciles against the complete corpus.
+                    logger.debug("bounded slot history prefix counters differ for %s", history_key)
+                    break
+                except (TranscriptRevisionChanged, OSError):
+                    # Retryable: a concurrent write moved the revision or a
+                    # transient read failure. Anything else is a bug and propagates.
+                    last = _attempt + 1 == _FLUSH_SNAPSHOT_RETRIES
+                    logger.log(
+                        logging.WARNING if last else logging.DEBUG,
+                        "bounded slot history read failed for %s (attempt %d/%d)%s",
+                        history_key,
+                        _attempt + 1,
+                        _FLUSH_SNAPSHOT_RETRIES,
+                        "; falling back to the full reader" if last else "; retrying",
+                        exc_info=True,
+                    )
+                    continue
+                current_version = (
+                    getattr(slot, "_dirty_gen", 0),
+                    slot._disk_older_count,
+                    _durable_prefix_counter(slot),
+                )
+                if current_version == version:
+                    bounded_page = candidate
+                    break
+
+        if bounded_page is not None and state.conversation_log:
+            # The bounded reader walks only the live tab chain. A size rotation
+            # landing between the archive probe above and the range reads moves
+            # the head of this transcript into archive/ where the bounded index
+            # cannot see it, so the page would omit those rows and could report
+            # `has_more` false. Re-probe after composing: an archive that
+            # appeared means the archive-including full reader must serve this
+            # request instead.
+            try:
+                rotated_after = await asyncio.to_thread(
+                    state.conversation_log.read_rotated_messages_chained,
+                    history_key,
+                )
+            except Exception:
+                logger.warning("rotated-archive re-probe failed for %s", history_key, exc_info=True)
+                return history_corpus_unreadable()
+            if rotated_after:
+                bounded_page = None
+
+        if bounded_page is not None:
+            messages, total, has_more, next_before = bounded_page
         else:
-            end = total
-        start = max(0, end - limit)
-        messages = all_msgs[start:end]
-        has_more = start > 0
-        # The cursor the client should send next, in the RAW index space this
-        # slice was taken in. The client cannot derive it from the response:
-        # `_prepare_messages` drops `done`, so the returned row count is not
-        # the span consumed here.
-        next_before = start
+            try:
+                all_msgs = (
+                    await asyncio.to_thread(
+                        state.conversation_log.read_messages_chained_full,
+                        history_key,
+                    )
+                    if state.conversation_log
+                    else []
+                )
+            except Exception:
+                logger.warning(
+                    "read_messages_chained_full failed for %s", history_key, exc_info=True
+                )
+                return history_corpus_unreadable()
+            tail_snapshot = _snapshot_slot_window(slot)
+            all_msgs = await asyncio.to_thread(
+                _append_unflushed_tail, slot, all_msgs, snapshot=tail_snapshot
+            )
+            # CLIENT DEPENDENCY on this collapse shape: while a slot streams, the
+            # in-flight chunk run folds into ONE trailing row that carries no durable
+            # `meta.mid`, and the bounded window ends in it. The dashboard's
+            # `warmSlotCache` (website/src/store/chatSlice.ts) sizes its count-matched
+            # request to the durable rows a pane holds and asks for ONE EXTRA row on a
+            # running slot so the folded row does not displace a durable one out of
+            # the window. A change here that folds the run into more than one row, or
+            # stops folding, moves that `+1` out of step with the response.
+            all_msgs = await asyncio.to_thread(_collapse_wire_rows, all_msgs)
+            total = len(all_msgs)
+            end = max(0, min(before, total)) if before is not None else total
+            start = max(0, end - limit)
+            messages = all_msgs[start:end]
+            has_more = start > 0
+            next_before = start
 
     # Snapshot every slot field the response needs BEFORE leaving the event
     # loop: the render below runs in a worker thread, and it must not read
@@ -2649,13 +2907,19 @@ async def api_chat_slot_detail(request: web.Request) -> web.Response:
     # are shared with live mutation, which _prepare_messages tolerates by the
     # same snapshot discipline the flush-thread save path relies on.
     key = slot.key
+    workspace = slot.workspace
     running = slot.running
     stopping = slot._stopping
     display_title = slot.display_title
     # Shallow copies, so the off-loop render below reads a frozen entry while
     # the loop keeps editing the live one; the view helper does the redaction.
     queue_snapshot = [
-        {"id": q["id"], "content": q["content"], "meta": dict(q.get("meta") or {})}
+        {
+            "id": q["id"],
+            "content": q["content"],
+            "kind": q.get("kind", ""),
+            "meta": dict(q.get("meta") or {}),
+        }
         for q in slot._queue
     ]
     context_fields = await _context_snapshot_fields(state, slot)
@@ -2666,7 +2930,7 @@ async def api_chat_slot_detail(request: web.Request) -> web.Response:
         # blocked the event loop past the loop-stall watchdog's exit budget
         # and hard-exited the gateway. json.dumps of the same payload is a
         # second loop-blocking cost, so it lives in the thread too.
-        prepared = _prepare_messages(messages, running, live_child=live_child)
+        prepared = _prepare_messages(messages, running, live_child=live_child, workspace=workspace)
         return json.dumps(
             {
                 "key": key,
@@ -2713,6 +2977,25 @@ async def api_chat_slot_detail(request: web.Request) -> web.Response:
 # mode, or forking one with it as an override, is not a real flow, so those two
 # allowlists deliberately stay narrower — do not "sync" them to this one.
 _CREATABLE_MODES = ("", "orchestrator", "design-critique")
+
+# Deferral is an optimization, so a request shape added later must stay on the
+# synchronous path until its publication ordering has been reviewed explicitly.
+_DEFERRED_PLAIN_CREATE_KNOWN_KEYS = frozenset(
+    {
+        "name",
+        "agent",
+        "agent_kind",
+        "model",
+        "folder_id",
+        "instance_id",
+        "adopt_remote_slot",
+        "memory_mode",
+        "mode",
+        "title",
+        "artifact",
+        "ephemeral",
+    }
+)
 
 
 async def api_chat_slot_create(request: web.Request) -> web.Response:
@@ -2895,8 +3178,10 @@ async def api_chat_slot_create(request: web.Request) -> web.Response:
         folder_snapshot = await state.read_folders(
             lambda folders: [dict(folder) for folder in folders]
         )
-        folder_project, folder_project_error = await asyncio.to_thread(
-            _resolve_folder_project_dir, folder_snapshot, folder_id
+        # The chain walk runs on the loop; only a declared project's ``stat``
+        # hops to a worker thread (see `resolve_folder_project_dir_off_loop`).
+        folder_project, folder_project_error = await resolve_folder_project_dir_off_loop(
+            folder_snapshot, folder_id
         )
         if folder_project_error:
             return web.json_response(
@@ -3201,8 +3486,30 @@ async def api_chat_slot_create(request: web.Request) -> web.Response:
     # any client sees already carries the folder, title, artifact binding and
     # project. Otherwise each of those is a separate post-create correction the
     # UI renders as a jump.
+    #
+    # A successful ordinary local New Chat is different: the POST response itself
+    # carries the complete slot and the client inserts it before activating the
+    # tab. Serializing every open slot before returning only makes that first paint
+    # wait. The state-owned 10 ms handoff moves its coalesced full-list frame past
+    # the response. Only known request keys may qualify; metadata-bearing,
+    # app-owned, mode-specific, nonpersistent and remote creates remain
+    # synchronous. Errors before a successful handoff retain request-visible
+    # publication semantics; delayed publication failures are logged and retried
+    # once by the guarded callback.
+    defer_plain_create_broadcast = bool(
+        set(body).issubset(_DEFERRED_PLAIN_CREATE_KNOWN_KEYS)
+        and is_new_slot
+        and not request_app
+        and not instance_id
+        and not folder_id
+        and not _mode
+        and not body.get("title")
+        and not body.get("artifact")
+        and memory_mode == "persistent"
+        and not body.get("ephemeral")
+    )
     async with contextlib.AsyncExitStack() as creation_stack:
-        creation_stack.enter_context(state.suspend_slots_push())
+        request_deferred_flush = creation_stack.enter_context(state.suspend_slots_push())
         try:
             slot = state.get_or_create_slot(
                 name,
@@ -3551,6 +3858,8 @@ async def api_chat_slot_create(request: web.Request) -> web.Response:
         # placement. Inside the suspension this only marks a push owed, so the
         # new-slot path still emits exactly ONE coalesced frame.
         state.push_slots_update()
+        if defer_plain_create_broadcast:
+            request_deferred_flush(f"create slot {slot.key!r}")
     # Speculative session creation: overlap the ACP handshake with the user's
     # think-time before their first message. No-op unless session.eager_spawn.
     #
@@ -3619,67 +3928,6 @@ def _slot_still_ours(state: DashboardState, name: str, slot: _ChatSlot) -> bool:
     """
     current = state._slots.get(name)
     return current is None or current is slot
-
-
-def _replacement_shares_transcript(state: DashboardState, name: str, slot: _ChatSlot) -> bool:
-    """True iff a DIFFERENT slot now holds ``name`` AND writes ``slot``'s transcript.
-
-    Slot identity is not transcript ownership, and the archival save is scoped to
-    the TRANSCRIPT: it targets ``slot_history_key(slot)``, not ``name``. A slot
-    carrying a ``linked_session_key`` — channel-, cron- or workflow-born — keeps its
-    conversation under that linked key, while a replacement minted by a plain
-    ``get_or_create_slot(name)`` (the shape POST /api/chat and the session_close
-    verb take) is unbound and keeps its own under ``dashboard:{name}``. Same key,
-    two files. So :func:`_slot_still_ours` cannot decide the save: yielding the
-    archive to a replacement that shares nothing leaves the ORIGINAL's transcript
-    with no ``closed`` flag, and an absent flag is exactly what
-    ``channel_slots._close_stands`` reads as "the user never dismissed this" — the
-    reconcile pass then resurfaces the tab the user closed.
-
-    Compared as FILE identity, not as key strings, because the file is what the
-    write touches and the mapping is not injective: ``history._safe_key`` folds
-    ``slack:<ts>`` and the ``slack_<ts>`` filename stem onto one ``.jsonl``, and a
-    Slack thread predating the canonical key still resolves to its bare
-    ``thread_ts`` stem (:func:`~kiro_crew.history.transcript_stems` carries both).
-    The two errors are not symmetric: over-reporting "shared" only declines an
-    archive the next close will make, while under-reporting stamps ``closed`` onto a
-    file a live slot is still writing, which is the whole harm being guarded.
-    """
-    current = state._slots.get(name)
-    if current is None or current is slot:
-        return False
-    return bool(
-        set(transcript_stems(slot_history_key(current)))
-        & set(transcript_stems(slot_history_key(slot)))
-    )
-
-
-def _resettle_restricted_key(state: DashboardState, name: str) -> None:
-    """Re-derive ``dashboard:{name}``'s restricted marker from whoever owns ``name`` NOW.
-
-    ``state._restricted_keys`` is keyed by SESSION KEY, not by slot identity, so the
-    marker describes whatever object holds the key — never the object a close happens
-    to be carrying. Every exit of a teardown therefore owes the one postcondition
-    this function IS: ``dashboard:{name}`` is in the set iff the slot currently at
-    ``name`` is restricted, an absent key counting as unrestricted.
-
-    Two shapes of exit need it, and they need opposite answers. An ordinary close
-    pops the slot for good, so the marker must be DROPPED — otherwise an incognito
-    tab's key stays blocked for every later holder of it. A close that yields the key
-    to a concurrent same-key replacement must re-derive from the REPLACEMENT:
-    ``_is_restricted_session`` tests the key BEFORE it looks at the slot, so an
-    incognito original's leftover marker makes every memory, artifact and mcp-apps
-    call on a PERSISTENT replacement answer 403 for as long as that tab lives.
-
-    Re-derived rather than blindly discarded, because a replacement that is itself
-    restricted has to KEEP the marker: dropping it is the fail-OPEN direction.
-    """
-    key = f"dashboard:{name}"
-    current = state._slots.get(name)
-    if current is not None and current.is_restricted:
-        state._restricted_keys.add(key)
-    else:
-        state._restricted_keys.discard(key)
 
 
 class _HandoverDrainResult(NamedTuple):
@@ -3874,6 +4122,15 @@ async def _persist_handover_tail(
     the write stays as it is, and the loss is reported rather than silent.
     """
     try:
+        tightening = _tighten_replacement_to_restricted_original(state, name, slot)
+    except UnknownMemoryStore:
+        tightening = None
+        logger.warning(
+            "Slot %s: replacement rebound twice during tightening; writing the tail "
+            "under the ratcheted line without tightening the live replacement",
+            name,
+        )
+    try:
         slot.flush_deferred_notes()
     except Exception:
         # The flush puts the unwritten suffix back before raising, so this count is
@@ -3926,6 +4183,7 @@ async def _persist_handover_tail(
             issued_by_the_retraction=True,
         )
     except Exception:
+        await restore_replacement_if_handover_did_not_land(state, name, tightening, history_key)
         logger.error(
             "Slot %s: %d unpersisted row(s) could not be written to %s while handing "
             "the key to a concurrent recreate; they are lost with the original slot",
@@ -3943,6 +4201,7 @@ async def _persist_handover_tail(
             _report_lost_queued_prompts(state, name, lost, history_key)
         return _HandoverDrainResult(rows_committed=False, prompts_lost=lost)
     if not committed:
+        await restore_replacement_if_handover_did_not_land(state, name, tightening, history_key)
         # The save declined without writing: the session was permanently deleted
         # while this write awaited the lock, or the slot's routing moved off the
         # transcript this frame authorized. Neither leaves anywhere for these rows
@@ -3958,6 +4217,12 @@ async def _persist_handover_tail(
         if lost:
             _report_lost_queued_prompts(state, name, lost, history_key)
         return _HandoverDrainResult(rows_committed=False, prompts_lost=lost)
+    # Only a replacement that WRITES THIS TRANSCRIPT follows the committed rows'
+    # mode: a slot at ``name`` whose rows route elsewhere (a task-review or
+    # workflow slot with a divergent ``linked_session_key``) shares no file with
+    # the original and must not be ratcheted for rows it will never read.
+    if _replacement_shares_transcript(state, name, slot):
+        tighten_live_slot_memory_mode(state, name, slot.memory_mode)
     # The write committed, and it can still leave owed entries with no durable
     # future: a rows-only save over a line another live slot published defers
     # every slot-owned field, ``queued_prompts`` among them
@@ -6588,7 +6853,7 @@ async def _close_slot(
         _resettle_restricted_key(state, name)
         # Durable, so no rollback can retract this frame — a client pruning its
         # per-slot cards on it can never be pruning a slot that comes back.
-        state.push_slots_update()
+        state.push_slot_removed(name)
         discard_closing_failure_scopes()
     # The app was already told, and compensated if the persist above failed — see
     # the notify block before the pop and the rollback in the except branch.
@@ -6602,7 +6867,7 @@ async def _close_slot(
         await state.sessions.remove(_history_key_for(name))
     _release_closed_execution(state, slot, closing_key, closing_execution)
     _sync_dashboard_slots(state)
-    state.push_slots_update()
+    state.push_slot_removed(name)
     state.push_refresh("history")
 
 
@@ -7052,6 +7317,21 @@ async def _apply_remote_pick_locked(
     has several early returns, and a split makes "the lock covers all of them"
     checkable at a glance instead of by re-reading every exit.
     """
+    if control == "reasoning_effort":
+        try:
+            # Reserve durable restore capacity before the peer commits its pick.
+            # A post-commit marker failure cannot be reported as a successful
+            # selection that silently disappears after restart.
+            await asyncio.to_thread(_remember_reasoning_effort_for_restore, body[control])
+        except (OSError, ValueError) as exc:
+            logger.warning("Cannot retain remote effort selection: %s", exc)
+            return web.json_response(
+                {
+                    "error": "reasoning effort persistence unavailable",
+                    "code": "effort_marker_unavailable",
+                },
+                status=503,
+            )
     try:
         accepted = await forward_peer_selection(state, slot, control, body)
     except RemoteTurnError as exc:
@@ -7076,6 +7356,14 @@ async def _apply_remote_pick_locked(
         # Same reason the local path bumps it: an explicit pick has to outrank
         # the model-fallback restore probe.
         slot._model_pick_gen += 1
+    normalized_model = ""
+    if control == "reasoning_effort":
+        base, level = model_registry.split_effort_suffix(slot.model)
+        if level and accepted.get("model") == base:
+            # The peer moved a legacy Codex pair into separate model/effort
+            # fields. Mirror both fields in the same metadata transaction.
+            slot.model = base
+            normalized_model = base
     # Persist the accepted pick immediately, exactly as the local agent switch
     # does. The periodic dirty-slot flush would write it eventually (both save
     # routes rebuild these fields from the slot), but the two ends diverge inside
@@ -7085,21 +7373,27 @@ async def _apply_remote_pick_locked(
     # can only ever disagree with itself, which is why the local model/effort/
     # workspace routes can leave it to the flush and this one cannot.
     persisted: dict[str, Any] = {control: value}
+    if normalized_model:
+        persisted["model"] = normalized_model
     if control == "agent" and slot.workspace:
         # The mirrored workspace is as much the peer's committed state as the
         # agent is, so it goes in the same write — persisting one without the
         # other would restore the pair inconsistent after a restart.
         persisted["workspace"] = slot.workspace
-    if state.conversation_log and not slot.is_restricted:
+    conversation_log = state.conversation_log
+    if conversation_log and not slot.is_restricted:
         try:
             # update_metadata takes a flock and closes fds — blocking-on-loop
             # prohibited, so it goes to a worker thread (same reasoning as the
             # local agent switch).
-            await asyncio.to_thread(
-                state.conversation_log.update_metadata,
-                _history_key_for(slot.key),
-                persisted,
-            )
+            def persist_pick() -> None:
+                if control == "reasoning_effort":
+                    # A peer-only level needs its gateway-owned restore marker
+                    # before the transcript starts claiming the selected value.
+                    _remember_reasoning_effort_for_restore(value)
+                conversation_log.update_metadata(_history_key_for(slot.key), persisted)
+
+            await asyncio.to_thread(persist_pick)
         except Exception:
             # The peer COMMITTED this pick the moment it answered, so the local
             # write is the side that fell behind — re-arm the periodic
@@ -7117,7 +7411,14 @@ async def _apply_remote_pick_locked(
             )
     logger.info("Remote slot %s %s set to %r on %s", slot.key, control, value, slot.instance_id)
     state.push_slots_update()
-    return web.json_response({"ok": True, control: value, "remote": True})
+    return web.json_response(
+        {
+            "ok": True,
+            control: value,
+            "remote": True,
+            **({"model": normalized_model} if normalized_model else {}),
+        }
+    )
 
 
 async def _record_explicit_agent_selection(
@@ -7665,10 +7966,10 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
                             folder_snapshot = await state.read_folders(
                                 lambda folders: [dict(folder) for folder in folders]
                             )
-                            folder_project, folder_error = await asyncio.to_thread(
-                                _resolve_folder_project_dir,
-                                folder_snapshot,
-                                folder_id_at_read,
+                            folder_project, folder_error = (
+                                await resolve_folder_project_dir_off_loop(
+                                    folder_snapshot, folder_id_at_read
+                                )
                             )
                             if slot.folder_id == folder_id_at_read:
                                 break
@@ -9436,6 +9737,151 @@ async def api_chat_slots_model(request: web.Request) -> web.Response:
     )
 
 
+async def _configured_backend_for_slot(slot: _ChatSlot) -> str:
+    """Resolve a cold slot through the same member-aware gate as the provider factory."""
+    config = await asyncio.to_thread(KiroCrewConfig.load)
+    from kiro_crew.members import select_provider_backend
+
+    return select_provider_backend(
+        effective_session_key(slot),
+        config.agent.member_acp_backend,
+        config.agent.acp_backend,
+    )
+
+
+async def api_chat_slot_selection_capabilities(request: web.Request) -> web.Response:
+    """Report the live ACP session's model and effort selection capabilities.
+
+    An absent session is unknown, not unsupported. The composer can preserve its
+    cold-start behavior until the first ACP session has advertised its options.
+    """
+    state: DashboardState = request.app["state"]
+    name = request.match_info["slot"]
+    slot = state._slots.get(name)
+    if slot is None:
+        return _slot_not_found()
+    denied = _deny_cross_app_slot_access(request, slot, name, "slot_selection_capabilities")
+    if denied is not None:
+        return denied
+    if slot.is_remote:
+        denied = deny_non_owner_remote_operation(request, slot, "slot_selection_capabilities")
+        if denied is not None:
+            return denied
+        mgr = getattr(state, "instances_manager", None)
+        if mgr is None:
+            return web.json_response(
+                {"error": "peer unavailable", "code": "peer_unavailable"}, status=503
+            )
+        try:
+            await ensure_version_parity(mgr, slot.instance_id)
+            async with mgr.proxy_request(
+                slot.instance_id,
+                "GET",
+                f"api/chat/slots/{slot.remote_slot}/selection-capabilities",
+            ) as upstream:
+                raw = await upstream.content.read(4097)
+                status = upstream.status
+            if status != 200 or len(raw) > 4096:
+                return web.json_response(
+                    {
+                        "error": "peer capabilities unavailable",
+                        "code": "peer_capabilities_unavailable",
+                    },
+                    status=502,
+                )
+            peer = json.loads(raw)
+        except Exception as exc:
+            logger.debug("Peer selection capabilities unavailable (%s)", type(exc).__name__)
+            return web.json_response(
+                {"error": "peer capabilities unavailable", "code": "peer_capabilities_unavailable"},
+                status=502,
+            )
+        if not isinstance(peer, dict):
+            return web.json_response(
+                {"error": "invalid peer capabilities", "code": "invalid_peer_capabilities"},
+                status=502,
+            )
+        if peer.get("known") is not True:
+            return web.json_response(
+                {
+                    "known": False,
+                    "model_effort_pair_ids": peer.get("model_effort_pair_ids") is True,
+                }
+            )
+        backend = peer.get("backend")
+        if not isinstance(backend, str) or len(backend) > 32:
+            return web.json_response(
+                {"error": "invalid peer capabilities", "code": "invalid_peer_capabilities"},
+                status=502,
+            )
+        levels = peer.get("effort_levels")
+        levels = (
+            cap_effort_capability_levels(levels, source="peer live")
+            if isinstance(levels, list)
+            else []
+        )
+        # The peer may advertise an ACP level (for example Pi's "minimal")
+        # that this hub has not seen locally. Register the sanitized levels
+        # before the composer offers them; the POST validates against this set.
+        if peer.get("effort_supported") is True and levels:
+            levels = register_reasoning_effort_values(levels)
+        return web.json_response(
+            {
+                "known": True,
+                "backend": backend,
+                "effort_supported": peer.get("effort_supported") is True and bool(levels),
+                "effort_levels": levels,
+                "model_effort_pair_ids": backend in ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS,
+            }
+        )
+    provider = state.sessions.get_provider(effective_session_key(slot))
+    if not isinstance(provider, AcpProvider):
+        # The slot can exist before its ACP session. The configured harness
+        # still knows whether model IDs encode effort, so the picker can render
+        # the base rows while live effort options are pending.
+        backend = await _configured_backend_for_slot(slot)
+        return web.json_response(
+            {
+                "known": False,
+                "model_effort_pair_ids": backend in ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS,
+            }
+        )
+    backend = provider.capabilities.backend
+    supported = provider.supports_effort()
+    levels = (
+        cap_effort_capability_levels(
+            (
+                level
+                for level in provider.get_valid_effort_levels()
+                if isinstance(level, str) and level in get_reasoning_effort_values()
+            ),
+            source="local live",
+        )
+        if supported
+        else []
+    )
+    if supported and not levels:
+        # Some model-scoped harnesses (notably kiro-cli) accept effort but do
+        # not advertise an ACP config option. Keep the existing fallback menu.
+        levels = cap_effort_capability_levels(
+            (
+                level
+                for level in get_reasoning_effort_ordered()
+                if level in get_reasoning_effort_values()
+            ),
+            source="local fallback",
+        )
+    return web.json_response(
+        {
+            "known": True,
+            "backend": backend,
+            "effort_supported": supported and bool(levels),
+            "effort_levels": levels,
+            "model_effort_pair_ids": backend in ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS,
+        }
+    )
+
+
 async def api_chat_slot_reasoning_effort(request: web.Request) -> web.Response:
     """POST /api/chat/slots/{slot}/reasoning-effort — set reasoning effort.
 
@@ -9520,11 +9966,41 @@ async def api_chat_slot_reasoning_effort(request: web.Request) -> web.Response:
         denied = _app_cancel_denied(request, slot, "chat.slot_reasoning_effort", session_key)
         if denied is not None:
             return denied
-        if slot.reasoning_effort == effort:
+        try:
+            await asyncio.to_thread(_remember_reasoning_effort_for_restore, effort)
+        except (OSError, ValueError) as exc:
+            logger.warning("Cannot retain effort selection: %s", exc)
+            return web.json_response(
+                {
+                    "error": "reasoning effort persistence unavailable",
+                    "code": "effort_marker_unavailable",
+                },
+                status=503,
+            )
+        provider = state.sessions.get_provider(session_key)
+        legacy_model = slot.model
+        split_base, legacy_level = model_registry.split_effort_suffix(legacy_model)
+        legacy_base = ""
+        if legacy_level:
+            backend = (
+                provider.capabilities.backend
+                if isinstance(provider, AcpProvider)
+                else await _configured_backend_for_slot(slot)
+            )
+            if backend in ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS:
+                legacy_base = split_base
+
+        def normalize_legacy_model() -> dict[str, str]:
+            if not legacy_base or slot.model != legacy_model:
+                return {}
+            slot.model = legacy_base
+            slot._dirty = True
+            return {"model": legacy_base}
+
+        if slot.reasoning_effort == effort and not legacy_base:
             return web.json_response({"ok": True, "reasoning_effort": effort})
         logger.info("Slot %s reasoning_effort switched to %r", name, effort or "default")
 
-        provider = state.sessions.get_provider(session_key)
         _updated_live: bool | None = False
         if isinstance(provider, AcpProvider) and provider.supports_effort():
             # Guard against racing the in-flight prompt read loop: a live
@@ -9538,8 +10014,11 @@ async def api_chat_slot_reasoning_effort(request: web.Request) -> web.Response:
                 # This path's success point: the override is recorded on the
                 # slot now and pushed to the live session next turn.
                 slot.reasoning_effort = effort
+                normalized = normalize_legacy_model()
                 state.push_slots_update()
-                return web.json_response({"ok": True, "reasoning_effort": effort, "deferred": True})
+                return web.json_response(
+                    {"ok": True, "reasoning_effort": effort, "deferred": True, **normalized}
+                )
             # change_effort handles both backends and persists the per-model
             # override + overlay. "" clears the override → fall back to model
             # default (kiro: /effort with model default; claude: leave as-is).
@@ -9589,11 +10068,13 @@ async def api_chat_slot_reasoning_effort(request: web.Request) -> web.Response:
             # override. Commit the slot value (it is what the new binding's
             # next cold start reads) and report the rebind as a warning.
             slot.reasoning_effort = effort
+            normalized = normalize_legacy_model()
             state.push_slots_update()
             return web.json_response(
                 {
                     "ok": True,
                     "reasoning_effort": effort,
+                    **normalized,
                     "warning": "slot session was rebound during the switch; "
                     "the new binding applies on its next cold start",
                 }
@@ -9747,19 +10228,22 @@ async def api_chat_slot_reasoning_effort(request: web.Request) -> web.Response:
                     status=409,
                 )
             if teardown_incomplete:
+                normalized = normalize_legacy_model()
                 state.push_slots_update()
                 return web.json_response(
                     {
                         "ok": True,
                         "reasoning_effort": effort,
+                        **normalized,
                         "warning": _TEARDOWN_INCOMPLETE_WARNING,
                     }
                 )
         # Live-update and deferral paths commit here (the reset path already
         # committed before its reset, and assigning again is a no-op).
         slot.reasoning_effort = effort
+        normalized = normalize_legacy_model()
     state.push_slots_update()
-    return web.json_response({"ok": True, "reasoning_effort": effort})
+    return web.json_response({"ok": True, "reasoning_effort": effort, **normalized})
 
 
 async def api_chat_slot_reload(request: web.Request) -> web.Response:
@@ -10864,7 +11348,10 @@ async def _live_slot_resume_response(
         total = len(window)
         recent = window[-200:] if total > 200 else window
         prepared = _prepare_messages(
-            recent, existing.running, live_child=_live_child_instance(state, existing)
+            recent,
+            existing.running,
+            live_child=_live_child_instance(state, existing),
+            workspace=existing.workspace,
         )
         # Raw index this window starts at: the frozen on-disk prefix plus the
         # in-memory rows it skipped. has_more is derived from the same number so
@@ -11840,7 +12327,10 @@ async def api_chat_slot_resume(request: web.Request) -> web.Response:
             # raw index the next older page starts from.
             "next_before": total - len(recent),
             "messages": _prepare_messages(
-                recent, slot.running, live_child=_live_child_instance(state, slot)
+                recent,
+                slot.running,
+                live_child=_live_child_instance(state, slot),
+                workspace=slot.workspace,
             ),
             "queue": [queue_entry_view(q) for q in slot._queue],
             "total": total,

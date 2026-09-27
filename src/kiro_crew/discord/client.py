@@ -101,6 +101,12 @@ _MIN_HEALTHY_CONN_SECS = 5.0
 # lands in the conversation the recipient is reading.
 _NO_MENTIONS: dict[str, Any] = {"parse": []}
 
+#: Discord message flag SUPPRESS_EMBEDS (``1 << 2``). Every outbound message
+#: carries it so an agent-written URL cannot trigger a server-side link-preview
+#: fetch. This client constructs no explicit rich embeds, so suppressing embeds
+#: does not remove any intentional message content.
+_FLAG_SUPPRESS_EMBEDS = 1 << 2
+
 
 def _message_payload(
     text: str,
@@ -117,6 +123,7 @@ def _message_payload(
     payload: dict[str, Any] = {
         "content": text[:DISCORD_MAX_TEXT],
         "allowed_mentions": _NO_MENTIONS,
+        "flags": _FLAG_SUPPRESS_EMBEDS,
     }
     include = components is not None if keep_empty_components else bool(components)
     if include:
@@ -292,6 +299,61 @@ _MAX_SNOWFLAKE_LEN = 32
 #: a caller, and an operator reading the log, can tell a withdrawn destination
 #: from a tripped breaker.
 _REVOKED_DETAIL = "destination authorization withdrawn mid-send"
+
+#: ``DiscordApiResult.detail`` when nothing available here can ATTRIBUTE the
+#: destination: no current roster places it and no DM pairing names its peer. The
+#: send still stops, because at an egress boundary "cannot tell" reads as no, but
+#: the two grounds are different events and an operator debugging a dropped
+#: notification is owed the one that happened. Saying a destination cannot be
+#: placed is not the claim that someone withdrew it.
+_UNATTRIBUTABLE_DETAIL = "destination unattributable mid-send: no roster entry, no DM pairing"
+
+#: ``DiscordApiResult.detail`` when the re-check ITSELF failed: the installed
+#: predicate raised, so no authority answered about this destination at all. The
+#: send still stops, and that is the whole point of failing closed, but this is a
+#: third event again -- a roster that refused, a destination nothing could place,
+#: and a check that could not run are three different things to go and fix.
+_UNANSWERABLE_DETAIL = "destination unanswerable mid-send: the authorization check failed"
+
+
+@dataclass(frozen=True)
+class SendPermission:
+    """One mid-send answer about one destination, carrying its own ground.
+
+    The transport's rosters are the only thing that knows WHY a destination is
+    refused, and the ladder is the only thing that reports it, so the reason
+    travels with the decision rather than being guessed at the other end. A
+    refusal's ``detail`` reaches the caller as ``DiscordApiResult.detail``.
+
+    ``permitted`` is the whole decision; ``detail`` is empty when permitted. The
+    four named constructors are the only grounds a destination re-check has, and
+    they exist so the refusal wording lives here once instead of in every module
+    that answers.
+    """
+
+    permitted: bool
+    detail: str = ""
+
+    @classmethod
+    def allow(cls) -> SendPermission:
+        """This destination may still be written to."""
+        return cls(True)
+
+    @classmethod
+    def revoked(cls) -> SendPermission:
+        """An authority that CAN place this destination refuses to admit it."""
+        return cls(False, _REVOKED_DETAIL)
+
+    @classmethod
+    def unattributable(cls) -> SendPermission:
+        """Nothing available can place this destination, so it cannot be judged."""
+        return cls(False, _UNATTRIBUTABLE_DETAIL)
+
+    @classmethod
+    def unanswerable(cls) -> SendPermission:
+        """The check itself failed, so no authority answered about this at all."""
+        return cls(False, _UNANSWERABLE_DETAIL)
+
 
 #: Path segments whose FOLLOWING id is one of Discord's "major parameters":
 #: those buckets are per-id, everything else shares one bucket across ids, so
@@ -656,7 +718,10 @@ class DiscordClient:
         #: own. Unwired (a bare client in a unit harness) the ceiling stands alone.
         #: A raise is read as a REFUSAL: this is a network egress boundary, and a
         #: predicate that cannot answer has not said yes.
-        self.still_permitted: Callable[[str], bool] | None = None
+        #:
+        #: It answers a :class:`SendPermission`, so a refusal reports WHY, which
+        #: only the rosters can tell.
+        self.still_permitted: Callable[[str], SendPermission] | None = None
 
     async def wait_ready(self, timeout: float = 15.0) -> bool:
         """Wait for the Gateway handshake to reach READY. Returns False on
@@ -1004,12 +1069,12 @@ class DiscordClient:
         member who can see it. A caller that genuinely wants a visible message
         passes ``ephemeral=False`` and says why.
         """
+        data = _message_payload(text, components, keep_empty_components=False)
+        if ephemeral:
+            data["flags"] = int(data["flags"]) | _FLAG_EPHEMERAL
         payload: dict[str, Any] = {
             "type": _CALLBACK_CHANNEL_MESSAGE_WITH_SOURCE,
-            "data": {
-                **_message_payload(text, components, keep_empty_components=False),
-                **({"flags": _FLAG_EPHEMERAL} if ephemeral else {}),
-            },
+            "data": data,
         }
         result = await self._api(
             "POST",
@@ -1182,7 +1247,10 @@ class DiscordClient:
         result = await self._api(
             "PATCH",
             f"/channels/{channel_id}/messages/{message_id}",
-            {"components": components},
+            {
+                "components": components,
+                "flags": _FLAG_SUPPRESS_EMBEDS,
+            },
         )
         return result is not None
 
@@ -1536,7 +1604,9 @@ class DiscordClient:
             return wait
         return 0.0
 
-    async def _destination_still_permitted(self, path: str, destination_hint: str = "") -> bool:
+    async def _destination_still_permitted(
+        self, path: str, destination_hint: str = ""
+    ) -> SendPermission:
         """May this route still reach its destination RIGHT NOW? Fails closed.
 
         Asked again after each of the ladder's own waits, because a wait is time
@@ -1577,15 +1647,15 @@ class DiscordClient:
         # token, so its path cannot yield one while the dispatcher holds it.
         destination = _guarded_destination(path) or destination_hint
         if not destination:
-            return True
+            return SendPermission.allow()
         if not await channel_outbound_permitted("discord"):
             self._audit_mid_send_decision(destination, "channels_ceiling", "denied")
-            return False
+            return SendPermission.revoked()
         if self.still_permitted is None:
             # The ceiling is the whole decision when no roster is installed, so it
             # is the allow that gets recorded.
             self._audit_mid_send_decision(destination, "channels_ceiling", "allowed")
-            return True
+            return SendPermission.allow()
         # The governance read above is itself an await, so any roster reading taken
         # before it describes a destination that could have been withdrawn since.
         # This read is the LAST thing that happens before the caller writes, which
@@ -1594,19 +1664,24 @@ class DiscordClient:
         # layer up.
         return self._roster_still_permits(destination)
 
-    def _roster_still_permits(self, destination: str) -> bool:
+    def _roster_still_permits(self, destination: str) -> SendPermission:
         """Ask the transport's live rosters about one destination. Fails closed.
 
         Synchronous and in-memory by contract, so it is the half of the re-check a
         deadline-bound route can afford. A predicate that cannot answer is read as
         a refusal: this is a network egress boundary.
+
+        The predicate's own answer carries the refusal's ground, because the rosters
+        are the only thing that can tell a destination an operator withdrew from one
+        that nothing there can place.
         """
         if self.still_permitted is None:
-            return True
+            return SendPermission.allow()
         try:
-            if self.still_permitted(destination):
+            permission = self.still_permitted(destination)
+            if permission.permitted:
                 self._audit_mid_send_decision(destination, "roster", "allowed")
-                return True
+                return permission
             # A destination whose pairing THIS process dropped to honour the cap is
             # refused for want of a peer, which is not the same event as an operator
             # withdrawing it. Reading them as one sends whoever is debugging it after
@@ -1615,15 +1690,16 @@ class DiscordClient:
                 "pairing_truncated" if destination in self._evicted_dm_channels else "roster"
             )
             self._audit_mid_send_decision(destination, authority, "denied")
-            return False
+            return permission
         except Exception:
             logger.warning(
                 "Discord REST: the destination predicate raised while re-checking a "
-                "route after a wait; treating the destination as withdrawn",
+                "route after a wait; refusing the send, and reporting that the check "
+                "itself could not answer",
                 exc_info=True,
             )
             self._audit_mid_send_decision(destination, "predicate_raised", "denied")
-            return False
+            return SendPermission.unanswerable()
 
     def _audit_mid_send_decision(self, destination: str, authority: str, outcome: str) -> None:
         """Record one mid-send egress decision, naming which authority decided.
@@ -1647,7 +1723,7 @@ class DiscordClient:
 
     async def _wait_then_revalidate(
         self, path: str, delay: float, destination_hint: str = ""
-    ) -> bool:
+    ) -> SendPermission:
         """Serve one of the ladder's back-offs, then re-ask authorization.
 
         The two belong together: a back-off served without the re-check after it
@@ -1845,8 +1921,9 @@ class DiscordClient:
                 return _failed(DISCORD_BLOCKED, detail="invalid-request breaker open")
             if not served_backoff:
                 if await self._await_capacity(route, exempt=exempt) > 0:
-                    if not await self._destination_still_permitted(path, destination):
-                        return _failed(DISCORD_BLOCKED, detail=_REVOKED_DETAIL)
+                    permission = await self._destination_still_permitted(path, destination)
+                    if not permission.permitted:
+                        return _failed(DISCORD_BLOCKED, detail=permission.detail)
             served_backoff = False
             try:
                 async with session.request(
@@ -1889,8 +1966,9 @@ class DiscordClient:
                                 delay,
                             )
                             return _failed(DISCORD_TRANSIENT, status=429, detail="rate limited")
-                        if not await self._wait_then_revalidate(path, delay, destination):
-                            return _failed(DISCORD_BLOCKED, detail=_REVOKED_DETAIL)
+                        permission = await self._wait_then_revalidate(path, delay, destination)
+                        if not permission.permitted:
+                            return _failed(DISCORD_BLOCKED, detail=permission.detail)
                         served_backoff = True
                         continue
                     if resp.status >= 500:
@@ -1913,8 +1991,9 @@ class DiscordClient:
                             resp.status,
                             backoff,
                         )
-                        if not await self._wait_then_revalidate(path, backoff, destination):
-                            return _failed(DISCORD_BLOCKED, detail=_REVOKED_DETAIL)
+                        permission = await self._wait_then_revalidate(path, backoff, destination)
+                        if not permission.permitted:
+                            return _failed(DISCORD_BLOCKED, detail=permission.detail)
                         continue
                     # Anything else below 500 will fail identically forever: a
                     # retry cannot grant a permission or undelete a message, it
@@ -1943,10 +2022,11 @@ class DiscordClient:
                 )
                 if transient > _TRANSIENT_RETRIES:
                     return _failed(DISCORD_TRANSIENT, detail=type(exc).__name__)
-                if not await self._wait_then_revalidate(
+                permission = await self._wait_then_revalidate(
                     path, _TRANSIENT_BACKOFF_SECS * transient, destination
-                ):
-                    return _failed(DISCORD_BLOCKED, detail=_REVOKED_DETAIL)
+                )
+                if not permission.permitted:
+                    return _failed(DISCORD_BLOCKED, detail=permission.detail)
 
 
 def _safe_description(alt: str) -> str:

@@ -12,7 +12,7 @@ import threading
 import time
 import uuid
 from collections import OrderedDict, deque
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from itertools import islice
 from pathlib import Path
 
@@ -38,11 +38,14 @@ from kiro_crew.dashboard.chat_utils import (
     _normalize_model,
     _redact_meta_for_role,
     _sync_dashboard_slots,
+    apply_pending_slot_memory_mode,
+    drop_records_without_placeholders,
     effective_session_key,
     redact_display_content,
     session_key_for,
     slot_history_key,
     slot_transcript_key,
+    with_bounded_redaction_records,
 )
 from kiro_crew.dashboard.slot_buffers import (
     committed_filtered_note_ids,
@@ -65,7 +68,16 @@ from kiro_crew.dashboard.state import (
     row_mid,
 )
 from kiro_crew.effort import EFFORT_LEVELS, EFFORT_VALUES
+from kiro_crew.execution_context import (
+    EXECUTION_CONTEXT_KEY,
+    MEMORY_MODES,
+    STRICTEST_MEMORY_MODE,
+    canonical_memory_mode,
+    read_session_execution,
+    stricter_memory_mode,
+)
 from kiro_crew.history import (
+    METADATA_LINE_CORRUPT,
     ROWS_ONLY_DEFERRED_META_KEYS,
     ROWS_ONLY_OWNED_META_KEYS,
     SLOT_OWNED_META_KEYS,
@@ -79,6 +91,7 @@ from kiro_crew.history import (
 )
 from kiro_crew.memory_stores import UnknownMemoryStore, named_store_or_empty
 from kiro_crew.messaging.link import is_channel_session_key
+from kiro_crew.platform_compat import file_lock
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
 from kiro_crew.session_agent_selection import session_agent_selection_name
@@ -280,6 +293,9 @@ _REASONING_EFFORT_FALLBACK = EFFORT_VALUES
 # the read path too, not just the API.
 _reasoning_effort_values: set[str] = set(_REASONING_EFFORT_FALLBACK)
 _reasoning_effort_ordered: list[str] = list(_REASONING_EFFORT_FALLBACK_ORDER)
+# Levels backed by gateway-owned markers. At the advertised-level cap, a
+# marked restore outranks a peer level that no owner has selected.
+_reasoning_effort_marked: set[str] = set()
 
 # Re-exported (back-compat) for any caller importing the static allowlist.
 _REASONING_EFFORT_VALUES = EFFORT_VALUES
@@ -299,17 +315,93 @@ def get_reasoning_effort_ordered() -> list[str]:
 # "low\n" is rejected — ``$`` would match before the newline and let it through
 # to the persistence/subprocess boundary.
 _SAFE_EFFORT_RE = re.compile(r"[a-z][a-z0-9_-]{0,20}\Z")
+MAX_EFFORT_LEVELS_PER_CAPABILITY = 32
+MAX_RETAINED_REASONING_EFFORT_VALUES = 256
+# Crew panels are gateway-owned, precreated, and masked under both ordinary and
+# relocated data homes. Their record reader uses flat *.json names, so this
+# separate subdirectory cannot be mistaken for a panel.
+_VALIDATED_EFFORT_DIR = "crew-panels/validated_effort_levels"
+
+
+def _effort_marker_path(directory: Path, level: str) -> Path:
+    """Use a portable basename, including for Windows device names like con."""
+    return directory / hashlib.sha256(level.encode("utf-8")).hexdigest()
+
+
+def cap_effort_capability_levels(levels: Iterable[object], *, source: str) -> list[str]:
+    """Validate before applying the per-response cap, preserving safe input order."""
+    accepted: list[str] = []
+    dropped = 0
+    for level in levels:
+        if not isinstance(level, str) or not _SAFE_EFFORT_RE.fullmatch(level):
+            continue
+        if len(accepted) < MAX_EFFORT_LEVELS_PER_CAPABILITY:
+            accepted.append(level)
+        else:
+            dropped += 1
+    if dropped:
+        logger.warning(
+            "Dropped %d %s effort capability level(s): per-response limit %d reached",
+            dropped,
+            source,
+            MAX_EFFORT_LEVELS_PER_CAPABILITY,
+        )
+    return accepted
+
+
+def _retain_reasoning_effort_values(acp_levels: list[str], *, source: str) -> list[str]:
+    """Keep safe levels up to the process-wide cap, preserving input order."""
+    global _reasoning_effort_values
+    retained = set(_reasoning_effort_values)
+    accepted: list[str] = []
+    accepted_set: set[str] = set()
+    dropped = 0
+    for level in acp_levels:
+        if (
+            not isinstance(level, str)
+            or not _SAFE_EFFORT_RE.fullmatch(level)
+            or level in accepted_set
+        ):
+            continue
+        if level not in retained:
+            if len(retained) >= MAX_RETAINED_REASONING_EFFORT_VALUES:
+                dropped += 1
+                continue
+            retained.add(level)
+        accepted.append(level)
+        accepted_set.add(level)
+    if dropped:
+        logger.warning(
+            "Dropped %d %s effort level(s): retained limit %d reached",
+            dropped,
+            source,
+            MAX_RETAINED_REASONING_EFFORT_VALUES,
+        )
+    if retained != _reasoning_effort_values:
+        _reasoning_effort_values = retained
+    return accepted
+
+
+def register_reasoning_effort_values(acp_levels: list[str]) -> list[str]:
+    """Allow peer-advertised levels without replacing the local display order.
+
+    A remote crew's options can reach the composer before its first turn. They
+    must pass the hub's POST allowlist, but their order belongs to that slot,
+    not the process-global fallback for unrelated local sessions. Return only
+    retained levels so an over-cap peer option is never offered by the picker.
+    """
+    return _retain_reasoning_effort_values(acp_levels, source="peer")
 
 
 def update_reasoning_effort_values(acp_levels: list[str]) -> None:
     """Update valid effort levels from ACP session config.
 
     Preserves ACP order for display. The validation set grows monotonically —
-    it UNIONS the new levels onto the existing set (and the fallback) and never
-    shrinks, so a level that a prior session reported (and that a slot may have
-    persisted) stays valid even after another session reports a narrower config.
+    it UNIONS new levels onto the existing set (and the fallback) up to a named
+    total cap, and never shrinks. A retained level that a slot persisted stays
+    valid after another session reports a narrower config.
 
-    Sanitizes input: only lowercase alphanumeric strings pass through
+    Sanitizes input: only safe lowercase effort names pass through
     (defense-in-depth for subprocess boundary).
 
     Note: ``_reasoning_effort_ordered`` is a process-global *fallback* display
@@ -317,28 +409,97 @@ def update_reasoning_effort_values(acp_levels: list[str]) -> None:
     provider (see ``api_effort_levels``); this global is served only when no
     live provider is available.
     """
-    global _reasoning_effort_values, _reasoning_effort_ordered
-    safe_levels = [
-        level for level in acp_levels if isinstance(level, str) and _SAFE_EFFORT_RE.match(level)
-    ]
-    level_set = set(safe_levels)
-    # Union-only: never drop a previously-valid level (persistence safety).
-    merged = _reasoning_effort_values | set(_REASONING_EFFORT_FALLBACK) | level_set | {""}
-    ordered = [level for level in safe_levels if level]
-    if merged != _reasoning_effort_values or ordered != _reasoning_effort_ordered:
+    global _reasoning_effort_ordered
+    ordered = _retain_reasoning_effort_values(acp_levels, source="ACP")
+    if acp_levels and not ordered:
+        # Every advertised level was rejected at the cap. Keep the prior
+        # fallback menu instead of replacing it with an empty one.
+        return
+    if ordered != _reasoning_effort_ordered:
         logger.info("Effort levels updated from ACP: %s", ordered)
-        _reasoning_effort_values = merged
         _reasoning_effort_ordered = ordered
 
 
-def _validate_reasoning_effort(raw: object) -> str:
+def _remember_reasoning_effort_for_restore(level: str) -> None:
+    """Durably retain a selected ACP level before writing it to a transcript.
+
+    The transcript is agent-writable, so its value alone cannot expand the
+    restore allowlist. Each non-fallback level gets a separate owner-only marker
+    after ACP or a peer has validated it. Separate files avoid a lost update
+    when two slot-save workers select different levels concurrently.
+    """
+    if level in _REASONING_EFFORT_FALLBACK or level not in _reasoning_effort_values:
+        return
+    if not _SAFE_EFFORT_RE.fullmatch(level):
+        return
+    directory = config_dir() / _VALIDATED_EFFORT_DIR
+    if directory.parent.is_symlink():
+        raise OSError("validated effort parent is a symlink")
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if directory.is_symlink():
+        raise OSError("validated effort directory is a symlink")
+    path = _effort_marker_path(directory, level)
+    # Old raw-name markers remain readable after upgrade. Avoid creating a
+    # duplicate that would count twice against the durable bound.
+    lock_fd = os.open(directory / ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+    with os.fdopen(lock_fd, "r+b") as lock_file, file_lock(lock_file.fileno(), required=True):
+        if path.is_symlink():
+            raise OSError("validated effort marker is a symlink")
+        if not _has_validated_effort_marker(level):
+            max_markers = max(
+                0, MAX_RETAINED_REASONING_EFFORT_VALUES - len(_REASONING_EFFORT_FALLBACK)
+            )
+            markers = sum(
+                1
+                for entry in directory.iterdir()
+                if entry.name != ".lock" and not entry.is_symlink() and entry.is_file()
+            )
+            if markers >= max_markers:
+                raise ValueError("validated effort marker limit reached")
+            atomic_write(path, "", fsync=True, restrict_to_owner=True)
+    _reasoning_effort_marked.add(level)
+
+
+def _has_validated_effort_marker(raw: object) -> bool:
+    """Read a gateway-owned marker during the off-loop restore prefetch."""
+    if not isinstance(raw, str) or not _SAFE_EFFORT_RE.fullmatch(raw):
+        return False
+    directory = config_dir() / _VALIDATED_EFFORT_DIR
+    if directory.parent.is_symlink() or directory.is_symlink():
+        return False
+    for marker in (_effort_marker_path(directory, raw), directory / raw):
+        try:
+            if not marker.is_symlink() and marker.is_file():
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _validate_reasoning_effort(raw: object, *, persisted_marker: bool = False) -> str:
     """Return *raw* if it's a valid reasoning_effort string, else "".
 
     Used by the persistence restore paths so a tampered/corrupted
     metadata file cannot smuggle an arbitrary string into the CC
     ``--effort`` subprocess argument.
     """
+    global _reasoning_effort_values
     if isinstance(raw, str) and raw in _reasoning_effort_values:
+        if persisted_marker:
+            _reasoning_effort_marked.add(raw)
+        return raw
+    if persisted_marker and isinstance(raw, str) and _SAFE_EFFORT_RE.fullmatch(raw):
+        retained = set(_reasoning_effort_values)
+        if len(retained) >= MAX_RETAINED_REASONING_EFFORT_VALUES:
+            unselected = retained - _REASONING_EFFORT_FALLBACK - _reasoning_effort_marked
+            if unselected:
+                retained.remove(min(unselected))
+            else:
+                logger.warning("Discarding persisted reasoning_effort at retained limit: %r", raw)
+                return ""
+        retained.add(raw)
+        _reasoning_effort_values = retained
+        _reasoning_effort_marked.add(raw)
         return raw
     if raw:
         logger.warning("Discarding invalid persisted reasoning_effort: %r", raw)
@@ -535,7 +696,7 @@ def _prefetch_rehydrate_inputs(
     kiro_model_map: dict[str, str] | None = None,
     with_status: bool = False,
 ) -> tuple[
-    dict, bool, list[dict] | None, dict[str, str] | None, tuple[str, str] | None, str | None
+    dict, bool, list[dict] | None, dict[str, str] | None, tuple[str, str] | None, str | None, bool
 ]:
     """Read everything :func:`_rehydrate_slot_from_history` needs, off the loop.
 
@@ -553,7 +714,9 @@ def _prefetch_rehydrate_inputs(
     retries", and treating the second as the first is what silently discards a
     live tab.
 
-    Returns ``(meta, readable, messages, model_map, member_identity, agent)``.
+    Returns ``(meta, readable, messages, model_map, member_identity, agent,
+    effort_marker)``. The marker check is filesystem work too, so it belongs
+    in this prefetch rather than the loop-affine apply phase.
     *messages* and *model_map* are ``None`` when there is nothing to build — no
     metadata, an unreadable read, or a session closed with ✕ that the caller did
     not opt to adopt — so a caller can decide without a second disk round trip.
@@ -566,7 +729,7 @@ def _prefetch_rehydrate_inputs(
     else:
         meta, readable = conv_log.get_metadata(history_key), True
     if not readable or not meta or (meta.get("closed") and not adopt_closed):
-        return meta or {}, readable, None, None, None, None
+        return meta or {}, readable, None, None, None, None, False
     return (
         meta,
         readable,
@@ -576,6 +739,7 @@ def _prefetch_rehydrate_inputs(
         # property of the slot name.
         _member_restore_identity(history_key.removeprefix("dashboard:")),
         _restored_agent_name(str(meta.get("linked_session_key") or history_key), meta),
+        _has_validated_effort_marker(meta.get("reasoning_effort")),
     )
 
 
@@ -615,7 +779,7 @@ def _restore_open_slots_steps(state: DashboardState) -> "Iterator[int]":
             # These reads MUST stay inside the per-tab guard. The async driver
             # has no except at its call site either, so anything escaping here
             # aborts dashboard startup and costs every LATER tab too.
-            meta, readable, messages, model_map, member_identity, agent = (
+            meta, readable, messages, model_map, member_identity, agent, effort_marker = (
                 _prefetch_rehydrate_inputs(
                     state.conversation_log,
                     slot_transcript_key(key),
@@ -632,6 +796,7 @@ def _restore_open_slots_steps(state: DashboardState) -> "Iterator[int]":
                 model_map=model_map,
                 member_identity=member_identity,
                 agent=agent,
+                effort_marker=effort_marker,
                 unrestored=unrestored,
             )
         except Exception:
@@ -736,6 +901,7 @@ def _apply_restored_open_slot(
     unrestored: set[str],
     member_identity: tuple[str, str] | None = _IDENTITY_UNRESOLVED,
     agent: str | None = None,
+    effort_marker: bool = False,
     conv_log: ConversationLog | None = None,
     started: float | None = None,
 ) -> int:
@@ -801,6 +967,7 @@ def _apply_restored_open_slot(
         _prefetched_messages=messages,
         _prefetched_member_identity=member_identity,
         _prefetched_agent=agent,
+        _prefetched_effort_marker=effort_marker,
     )
     return 1 if slot is not None else 0
 
@@ -886,7 +1053,7 @@ async def restore_open_slots_async(state: DashboardState) -> int:
                 continue
             try:
                 started = time.time()
-                meta, readable, messages, model_map, member_identity, agent = (
+                meta, readable, messages, model_map, member_identity, agent, effort_marker = (
                     await asyncio.to_thread(
                         _prefetch_rehydrate_inputs,
                         conv_log,
@@ -904,6 +1071,7 @@ async def restore_open_slots_async(state: DashboardState) -> int:
                     model_map=model_map,
                     member_identity=member_identity,
                     agent=agent,
+                    effort_marker=effort_marker,
                     unrestored=unrestored,
                     # Opts into the post-hop re-checks (close tombstone +
                     # deletion): this driver's read ran in a worker thread, so
@@ -1015,10 +1183,12 @@ def _attach_variants(slot: _ChatSlot, m: dict) -> None:
     """Copy variant history from a persisted message onto the slot's last message, with redaction."""
     if m.get("variants"):
         slot.messages[-1]["variants"] = [  # type: ignore[assignment]
-            {
-                **v,
-                "content": redact_display_content(v.get("content", "")),
-            }
+            with_bounded_redaction_records(
+                {
+                    **v,
+                    "content": redact_display_content(v.get("content", "")),
+                }
+            )
             for v in m["variants"]
             if isinstance(v, dict)
         ]
@@ -1339,6 +1509,7 @@ def _rehydrate_slot_from_history(
     _prefetched_messages: list[dict] | None = None,
     _prefetched_member_identity: tuple[str, str] | None = _IDENTITY_UNRESOLVED,
     _prefetched_agent: str | None = None,
+    _prefetched_effort_marker: bool = False,
 ) -> _ChatSlot | None:
     """Rehydrate a single dashboard slot from persisted history.
 
@@ -1514,7 +1685,9 @@ def _rehydrate_slot_from_history(
         # the slot on its persisted model -- the documented refusal -- and the owner
         # re-picks "Auto (Jev)" to route again.
         if meta.get("reasoning_effort"):
-            slot.reasoning_effort = _validate_reasoning_effort(meta["reasoning_effort"])
+            slot.reasoning_effort = _validate_reasoning_effort(
+                meta["reasoning_effort"], persisted_marker=_prefetched_effort_marker
+            )
         if meta.get("autocompact_pct") is not None:
             slot.autocompact_pct = _validate_autocompact_pct(meta["autocompact_pct"])
         if meta.get("workspace"):
@@ -1782,8 +1955,14 @@ def _rehydrate_slot_from_history(
                 # the large payloads, so meta redaction was ~5.5s of a ~7s restore
                 # while content redaction was only ~0.4s. Redacted at emit instead
                 # (chat_utils._prepare_messages), which is the only path that returns
-                # meta to a client.
-                meta=(m["meta"] if isinstance(m.get("meta"), dict) else None),
+                # meta to a client. Blocked-link records are the exception: they are
+                # BOUNDED here because this is where the slot retains them, and the
+                # bound is a no-op for a row that carries none.
+                meta=(
+                    with_bounded_redaction_records(m["meta"])
+                    if isinstance(m.get("meta"), dict)
+                    else None
+                ),
                 mint_mid=False,
             )
             # Provenance is not a slot.append() argument, so carry it onto the
@@ -1892,12 +2071,14 @@ async def rehydrate_slot_from_history_async(
     conv_log = state.conversation_log
 
     started = time.time()
-    _meta, _readable, messages, model_map, _member_id, agent = await asyncio.to_thread(
-        _prefetch_rehydrate_inputs,
-        conv_log,
-        history_key,
-        adopt_closed=adopt_closed,
-        kiro_model_map=kiro_model_map,
+    _meta, _readable, messages, model_map, _member_id, agent, effort_marker = (
+        await asyncio.to_thread(
+            _prefetch_rehydrate_inputs,
+            conv_log,
+            history_key,
+            adopt_closed=adopt_closed,
+            kiro_model_map=kiro_model_map,
+        )
     )
     # ``messages is None`` covers both "never persisted" and "closed with ✕"
     # — the prefetch already applied the same guards the synchronous form does.
@@ -1971,6 +2152,7 @@ async def rehydrate_slot_from_history_async(
         _prefetched_messages=messages,
         _prefetched_member_identity=_member_id,
         _prefetched_agent=agent,
+        _prefetched_effort_marker=effort_marker,
     )
     if _restored is not None:
         # Claim recovery belongs HERE, not in each caller: this function is how
@@ -2016,14 +2198,14 @@ def _prefetch_recent_session(
     *,
     folders_only: bool,
     cutoff: float | None,
-) -> tuple[dict | None, list[dict] | None, tuple[str, str] | None, str | None]:
+) -> tuple[dict | None, list[dict] | None, tuple[str, str] | None, str | None, bool]:
     """Read one candidate session's metadata + transcript, off the loop.
 
     Applies the selection filters BETWEEN the two reads so a session that is
     going to be skipped never pays for its transcript walk — the metadata read is
     what the filters need, and it is the cheap one.
 
-    Returns ``(None, None, None, None)`` for a session this pass must skip (not
+    Returns ``(None, None, None, None, False)`` for a session this pass must skip (not
     folder'd / pinned under ``folders_only``, closed with ✕, or outside the
     mtime window). The third element is the prefetched
     ``_member_restore_identity`` answer — dm.json is file IO too, and the apply
@@ -2044,16 +2226,16 @@ def _prefetch_recent_session(
         # deleted. ``_rehydrate_slot_from_history`` already refuses on empty
         # metadata for exactly this reason ("don't create a phantom slot"); this
         # makes the recent-sessions path agree with it.
-        return None, None, None, None
+        return None, None, None, None, False
     has_folder = bool(meta.get("folder_id"))
     has_pin = bool(meta.get("pinned"))
     if folders_only and not has_folder and not has_pin:
-        return None, None, None, None
+        return None, None, None, None, False
     if meta.get("closed"):
-        return None, None, None, None
+        return None, None, None, None, False
     if not has_folder and not has_pin:
         if cutoff is not None and session.get("modified", 0) < cutoff:
-            return None, None, None, None
+            return None, None, None, None, False
     return (
         meta,
         conv_log.read_messages_chained(key),
@@ -2065,6 +2247,7 @@ def _prefetch_recent_session(
             ),
             meta,
         ),
+        _has_validated_effort_marker(meta.get("reasoning_effort")),
     )
 
 
@@ -2081,6 +2264,7 @@ def _apply_recent_session(
     restore_cfg: "KiroCrewConfig | None",
     member_identity: tuple[str, str] | None = _IDENTITY_UNRESOLVED,
     agent: str | None = None,
+    effort_marker: bool = False,
 ) -> None:
     """Build the slot for one prefetched recent session.
 
@@ -2168,7 +2352,9 @@ def _apply_recent_session(
     # `jev_route` is neither written nor read here, for the reason the rehydrate
     # path above states: it is an owner pick, and this file is agent-writable.
     if meta.get("reasoning_effort"):
-        slot.reasoning_effort = _validate_reasoning_effort(meta["reasoning_effort"])
+        slot.reasoning_effort = _validate_reasoning_effort(
+            meta["reasoning_effort"], persisted_marker=effort_marker
+        )
     if meta.get("autocompact_pct") is not None:
         slot.autocompact_pct = _validate_autocompact_pct(meta["autocompact_pct"])
     if meta.get("workspace"):
@@ -2309,7 +2495,13 @@ def _apply_recent_session(
             cls,
             ts=m.get("ts", ""),
             broadcast=False,
-            meta=(m["meta"] if isinstance(m.get("meta"), dict) else None),
+            # Blocked-link records bounded where the slot retains them; see the
+            # equivalent append in _rehydrate_slot_from_history.
+            meta=(
+                with_bounded_redaction_records(m["meta"])
+                if isinstance(m.get("meta"), dict)
+                else None
+            ),
             mint_mid=False,
         )
         # See the equivalent call in _rehydrate_slot_from_history.
@@ -2350,7 +2542,7 @@ def _restore_recent_sessions_steps(
         slot_name = _recent_session_slot_name(key)
         if slot_name is None or slot_name in state._slots:
             continue
-        meta, messages, _member_id, agent = _prefetch_recent_session(
+        meta, messages, _member_id, agent, effort_marker = _prefetch_recent_session(
             conv_log, key, s, folders_only=folders_only, cutoff=cutoff
         )
         if meta is None or messages is None:
@@ -2367,6 +2559,7 @@ def _restore_recent_sessions_steps(
             restore_cfg=_restore_cfg,
             member_identity=_member_id,
             agent=agent,
+            effort_marker=effort_marker,
         )
         restored += 1
         # Recover an app flag whose claim outlived its row, as the open-slots
@@ -2430,7 +2623,7 @@ async def restore_recent_sessions_async(
             if slot_name is None or slot_name in state._slots:
                 continue
             started = time.time()
-            meta, messages, _member_id, agent = await asyncio.to_thread(
+            meta, messages, _member_id, agent, effort_marker = await asyncio.to_thread(
                 _prefetch_recent_session,
                 conv_log,
                 key,
@@ -2500,6 +2693,7 @@ async def restore_recent_sessions_async(
                 restore_cfg=_restore_cfg,
                 member_identity=_member_id,
                 agent=agent,
+                effort_marker=effort_marker,
             )
             restored += 1
             # Same recovery, with the spool read awaited: this driver is
@@ -2909,14 +3103,30 @@ def _build_message_entry_uncached(
                     vc = rewritten
             vc, _ = redact_exfiltration_urls(vc)
             vc, _ = redact_credentials(vc)
-            redacted_variants.append({**v, "content": vc})
+            v_entry = {**v, "content": vc}
+            # A variant's records are ITS OWN, under the same rule the row obeys:
+            # they describe this variant's text, so they ride with it, they go
+            # through their bounded constructors, and they are dropped when that
+            # text holds no placeholder to explain.
+            drop_records_without_placeholders(v_entry, vc)
+            v_entry = with_bounded_redaction_records(v_entry)
+            redacted_variants.append(v_entry)
         entry["variants"] = redacted_variants
         entry["variant_idx"] = m.get("variant_idx", 0)
     cls_val = m.get("cls", "")
     if role == "system" and cls_val:
         entry["cls"] = cls_val
-    if isinstance(m.get("meta"), dict):
-        entry["meta"] = _redact_meta_for_role(role, m["meta"])
+    meta_src = m.get("meta") if isinstance(m.get("meta"), dict) else None
+    if meta_src is not None:
+        meta_in = dict(meta_src)
+        # Records are CARRIED, never re-derived here. They are born at the one
+        # moment the URL exists -- the redaction that produces this row's text --
+        # so by the time this function sees the content it holds the placeholder
+        # and a scan of it would describe nothing. The records still have to
+        # DESCRIBE this text, so a row whose content shows no placeholder does not
+        # keep them; `_redact_meta_for_role` re-validates whatever survives.
+        drop_records_without_placeholders(meta_in, content)
+        entry["meta"] = _redact_meta_for_role(role, meta_in)
     return entry
 
 
@@ -3352,6 +3562,64 @@ def _frozen_prefix_and_foreign_appends(
     return (prefix, foreign, dedup_dropped)
 
 
+def _tighten_carried_execution(meta_line: dict, mode: str) -> None:
+    """Fold *mode* into a carried durable execution record on ``meta_line``.
+
+    A persistent session's execution carrier is DURABLE: ``bind_session_execution``
+    writes it into the metadata line under ``execution_context``, with a
+    ``memory_mode`` of its own, and ``read_session_execution`` answers from that
+    record when no live carrier exists. The save carries the record rather than
+    owning it, so when the line's ``memory_mode`` is ratcheted to a stricter value
+    -- a restricted original's rows landing under a persistent same-key
+    replacement's line -- the record would keep saying ``persistent`` and every
+    reader of the session's execution would take the looser mode from it. The
+    record is a ratchet like the line: it is only ever tightened, never rebuilt,
+    so the identity it carries is untouched and a record that is already at least
+    as strict is left exactly as it was. A malformed record is left alone too --
+    the read path refuses it on its own terms, and a save is not where to judge it.
+    """
+    if mode == "persistent":
+        return
+    payload = meta_line.get(EXECUTION_CONTEXT_KEY)
+    if not isinstance(payload, dict):
+        return
+    record_mode = canonical_memory_mode(payload.get("memory_mode"))
+    retained = stricter_memory_mode(record_mode, mode)
+    if retained == record_mode:
+        return
+    meta_line[EXECUTION_CONTEXT_KEY] = {**payload, "memory_mode": retained}
+
+
+# One lock for every save thread's pending-mode fold. Two saves of one slot can
+# complete on different worker threads (the full save records inside the
+# transcript lock, the empty-window merge after ``update_metadata_if`` returns),
+# and the fold is a read-then-write: without the lock the later, stricter value
+# could be overwritten by an earlier completion's looser one. The value itself
+# is monotonic -- it only ever moves to a stricter mode and the loop-side
+# consumer never clears it -- so holding this lock for the fold is all the
+# ordering the seam needs.
+_PENDING_MEMORY_MODE_LOCK = threading.Lock()
+
+
+def _record_pending_memory_mode(slot: _ChatSlot, memory_mode: str) -> None:
+    """Record a committed line tightening without mutating loop-affine state."""
+    with _PENDING_MEMORY_MODE_LOCK:
+        current = canonical_memory_mode(getattr(slot, "memory_mode", "persistent"))
+        pending = getattr(slot, "_pending_memory_mode", None)
+        folded = stricter_memory_mode(current, canonical_memory_mode(memory_mode))
+        if pending is not None:
+            folded = stricter_memory_mode(folded, canonical_memory_mode(pending))
+        if folded != "persistent":
+            slot._pending_memory_mode = folded
+
+
+def pending_slot_memory_mode(slot: _ChatSlot) -> str | None:
+    """Read the monotonic worker-to-loop privacy witness under its lock."""
+    with _PENDING_MEMORY_MODE_LOCK:
+        pending = getattr(slot, "_pending_memory_mode", None)
+        return canonical_memory_mode(pending) if pending is not None else None
+
+
 def _save_slot_to_history(
     state: DashboardState,
     slot: _ChatSlot,
@@ -3365,6 +3633,7 @@ def _save_slot_to_history(
     expected_disk_older_count: int | None = None,
     expected_slot_name: str | None = None,
     rows_only: bool = False,
+    pending_mode_slot: _ChatSlot | None = None,
 ) -> bool:
     """Persist slot messages to JSONL history (append-safe).
 
@@ -3443,8 +3712,9 @@ def _save_slot_to_history(
     persisted and must not be treated as durable. Every other completion
     (including the benign no-op skips) returns ``True``.
     """
-    if not state.conversation_log or getattr(slot, "memory_mode", "persistent") != "persistent":
+    if not state.conversation_log:
         return True
+    pending_mode_target = pending_mode_slot or slot
     # An explicit message snapshot always means "this is the full authoritative
     # window state" → rewrite. Edit paths (rewind/regenerate/fork) pass a snapshot.
     # A slot left in _pending_rewrite by a failed inline rewrite also takes
@@ -3547,12 +3817,24 @@ def _save_slot_to_history(
         history_key = slot_history_key(slot)
         if getattr(slot, "linked_session_key", "") == routing:
             break
-    from kiro_crew.execution_context import read_session_execution
     from kiro_crew.memory_stores import MissingExecutionIdentity
 
-    def retention_allows_write() -> bool:
-        if getattr(slot, "memory_mode", "persistent") != "persistent":
-            return False
+    def retained_memory_mode() -> str:
+        """The ``memory_mode`` this save records: the strictest one known.
+
+        Every mode writes its transcript -- an incognito or temporary chat is
+        one the user can reopen from History; what the mode withholds is
+        learning FROM it (consolidation, lessons, memory injection), and every
+        one of those readers gates on the ``memory_mode`` this line carries. So
+        the field is the privacy contract of the file, and it must never be
+        looser than what the session is actually running under. The slot's own
+        mode and the live execution carrier can disagree for a moment (a mode
+        switch publishes the carrier first; a queued-prompt flush can outlive
+        the slot's own tightening), and stricter-wins closes that window: a
+        restart re-reads this line, so a looser value here would be exactly
+        the weaker mode a restart must never recover.
+        """
+        slot_mode = canonical_memory_mode(getattr(slot, "memory_mode", "persistent"))
         try:
             execution = read_session_execution(note_auth_key)
         except MissingExecutionIdentity as exc:
@@ -3560,26 +3842,40 @@ def _save_slot_to_history(
             # member or private store but has no ``execution_context`` field at
             # all -- a session written before that field existed. This write is
             # the TRANSCRIPT, not private memory: the carrier only decides
-            # retention here, and with none to read the slot's own mode
-            # (already ``persistent`` above) is the only retention there is.
-            # Refusing would fail every save and every close of such a
-            # session, which then restores itself to the list forever.
-            # Every other ``UnknownMemoryStore`` (unreadable record, a
+            # retention here, and with none to read the slot's own mode is the
+            # only retention there is. Refusing would fail every save and every
+            # close of such a session, which then restores itself to the list
+            # forever. Every other ``UnknownMemoryStore`` (unreadable record, a
             # present-but-malformed carrier, an undeclared store) propagates:
-            # its retention is unknown, so the refusal stands. Authorizing
-            # private memory from the store name stays refused where it is
-            # read for that purpose.
+            # its retention is unknown, so the save fails rather than record a
+            # mode it cannot vouch for. Authorizing private memory from the
+            # store name stays refused where it is read for that purpose.
             logger.debug(
                 "Slot %s predates canonical execution identity (%s); saving its "
                 "transcript under the slot's own retention mode",
                 slot.key,
                 exc,
             )
-            return True
-        return execution is None or execution.memory_mode == "persistent"
+            return slot_mode
+        if execution is None:
+            return slot_mode
+        return stricter_memory_mode(slot_mode, execution.memory_mode)
 
-    if not retention_allows_write():
-        return True
+    def line_memory_mode(meta: dict) -> str:
+        """The ``memory_mode`` the on-disk line already carries, canonicalised.
+
+        The line is a RATCHET: a later writer on the same key folds this value
+        in with :func:`stricter_memory_mode` and can only tighten it. The rows a
+        restricted slot committed stay in the file after that slot is popped,
+        and a persistent slot recreated on the freed key rebuilds the line from
+        its own state -- without the fold it would relabel those rows
+        persistent and hand them to every learning reader. An absent or
+        unrecognised value after case canonicalisation reads as persistent, so
+        it never tightens anything.
+        """
+        line_mode = str(meta.get("memory_mode") or "persistent").lower()
+        return line_mode if line_mode in MEMORY_MODES else "persistent"
+
     if expected_history_key is not None and history_key != expected_history_key:
         # The caller authorized a write against a specific transcript and the
         # slot's routing moved before this snapshot (a rebind on the event
@@ -3650,7 +3946,7 @@ def _save_slot_to_history(
             # (unfiled / untagged / unpinned / untitled / default mode). Fails
             # closed on an unreadable record, per `update_metadata_if`'s own
             # contract.
-            def _fresh_fields() -> dict:
+            def _fresh_fields(meta: dict) -> dict:
                 # Mirrors the FULL save's slot-owned enumeration (the
                 # ``meta_line`` construction below), so a forced save of an
                 # empty slot persists exactly what a forced save of a
@@ -3668,6 +3964,11 @@ def _save_slot_to_history(
                 #   truthy, exactly like the full save (origin's fail-closed
                 #   sentinel and the once-flags must never be erased by a
                 #   writer that has not learned them).
+                if slot.reasoning_effort:
+                    _remember_reasoning_effort_for_restore(slot.reasoning_effort)
+                # ``meta`` is the line as the guard read it under the lock, so
+                # the ratchet folds the CURRENT on-disk mode, not a snapshot.
+                _mode = stricter_memory_mode(line_memory_mode(meta), retained_memory_mode())
                 fields: dict = {
                     "folder_id": slot.folder_id or "",
                     "tags": list(slot.tags),
@@ -3678,7 +3979,7 @@ def _save_slot_to_history(
                     "color_index": slot.color_index,
                     "color_hex": slot.color_hex or "",
                     "color_theme": slot.color_theme or "",
-                    "memory_mode": slot.memory_mode,
+                    "memory_mode": _mode,
                     "model": slot.model,
                     # CLEARABLE: the queued prompts a restore hands back. Written
                     # even when empty, so a drain that emptied the queue is not
@@ -3727,7 +4028,10 @@ def _save_slot_to_history(
                 # rehydrate mirror and the consolidator's own resolver both treat
                 # falsy as "the global store", which is also how a session written
                 # before crew stores existed reads.
-                fields["memory_store"] = named_store_or_empty(slot.memory_store)
+                # A RESTRICTED line names no store (see the full save below).
+                fields["memory_store"] = (
+                    named_store_or_empty(slot.memory_store) if _mode == "persistent" else ""
+                )
                 # Clearable like memory_store: a name-only pick after a template
                 # pick must not keep advertising the template namespace.
                 fields["agent_kind"] = slot.agent_kind
@@ -3807,12 +4111,10 @@ def _save_slot_to_history(
 
             def _refresh_under_lock(meta: dict) -> bool:
                 guard_state["ran"] = True
-                if not retention_allows_write():
-                    return False
                 if not meta:
                     return False
                 merged_fields.clear()
-                merged_fields.update(_fresh_fields())
+                merged_fields.update(_fresh_fields(meta))
                 # Held /note lines: a MERGE writer, so it unions
                 # with the on-disk hold and never shrinks it. A live-state
                 # mirror here could race a turn-end flush that just delivered
@@ -3830,6 +4132,9 @@ def _save_slot_to_history(
                 history_key,
                 merged_fields,
                 _refresh_under_lock,
+                after_commit_under_lock=lambda: _record_pending_memory_mode(
+                    pending_mode_target, merged_fields["memory_mode"]
+                ),
             )
             if not applied and not guard_state["ran"]:
                 # `update_metadata_if` fails CLOSED on an unreadable record
@@ -3889,8 +4194,6 @@ def _save_slot_to_history(
         # ``save_slot_off_loop`` helper routes on-loop callers to a worker thread
         # so they take the patient acquire path instead of dropping the save.
         with state.conversation_log._locked(history_key):
-            if not retention_allows_write():
-                return True
             # Status form, not bare ``get_metadata``: the delete-won identity
             # comparison below is exactly the "empty result triggers something
             # destructive" case that ``get_metadata_status`` exists for — a
@@ -3899,6 +4202,49 @@ def _save_slot_to_history(
             # identity check and let a pending save overwrite a replacement
             # session with deleted content.
             existing_meta, _meta_readable = state.conversation_log.get_metadata_status(history_key)
+            # Set when the first line is bytes that are not JSON: this save
+            # REWRITES it (below) instead of deferring, because no retry will
+            # ever read it and a save that keeps deferring never persists a row
+            # again -- ``closed`` never lands and the tab resurrects on restart.
+            _line_corrupt = False
+            if not _meta_readable:
+                # The line EXISTS but could not be read (``get_metadata_status``
+                # reports an absent file as readable-and-empty). Everything
+                # below folds ``existing_meta`` -- the ``memory_mode`` ratchet
+                # above all -- and an empty dict would read as ``persistent``,
+                # so a transient read failure on a restricted line would let this
+                # save relabel it persistent and stamp a store name on it: the
+                # one write the ratchet exists to make impossible. Fail CLOSED
+                # the way the identity check below does: raise, so the outer
+                # handler leaves ``_dirty`` armed and the flush retries once the
+                # read clears, rather than returning False and dropping rows.
+                # Only a line the companion state read calls CORRUPT is treated
+                # otherwise; a disagreement between the two reads (the file
+                # changed in between) stays transient.
+                if state.conversation_log.metadata_line_state(history_key) != METADATA_LINE_CORRUPT:
+                    raise OSError(
+                        f"history metadata for {history_key} is transiently unreadable; "
+                        "cannot vouch for the line's privacy contract before writing -- "
+                        "save deferred for retry"
+                    )
+                logger.warning(
+                    "Slot %s: history metadata line for %s is corrupt (not JSON); "
+                    "rewriting it under the %s mode so the transcript's rows can land",
+                    slot.key,
+                    history_key,
+                    STRICTEST_MEMORY_MODE,
+                )
+                _line_corrupt = True
+                # The line as this save will rebuild it, in place of the empty
+                # dict: no identity (``created_at`` comes from the slot below),
+                # no store, and the STRICTEST mode. The line's real contract is
+                # unknowable and the ratchet forbids relabelling it looser, so
+                # the strictest mode is the only value the rewrite may carry;
+                # every fold below -- the full save's, the rows-only carry's --
+                # reads it from here. The rows after the corrupt line are kept
+                # by the frozen-prefix read, which skips the first line by
+                # position.
+                existing_meta = {"memory_mode": STRICTEST_MEMORY_MODE}
 
             # ── Stale-queue guard ───────────────────────────────────────────
             # The lock orders the queue writers' commits, not their reads, so a
@@ -3989,8 +4335,12 @@ def _save_slot_to_history(
                     # of the delete-won path discarding the content. A
                     # readable-but-absent ``created_at`` (legacy meta) fails
                     # open for an EXISTING file only — a missing file is the
-                    # legacy delete witness via the observation bit above.
-                    if not _meta_readable:
+                    # legacy delete witness via the observation bit above. A
+                    # CORRUPT line (``_line_corrupt``) carries no identity to
+                    # compare and is rewritten by this save; it fails open here
+                    # like a legacy line does, since a fresh incarnation minted
+                    # by another writer after a delete starts with a valid line.
+                    if not _meta_readable and not _line_corrupt:
                         raise OSError(
                             f"history metadata for {history_key} is transiently "
                             "unreadable; cannot verify the session's identity "
@@ -4084,7 +4434,15 @@ def _save_slot_to_history(
                 # save-time fallback covers callers with no user gesture to
                 # anchor to (and legacy call sites).
                 meta_line["closed_at"] = closed_at if closed_at is not None else time.time()
-            meta_line["memory_mode"] = slot.memory_mode
+            # Read INSIDE the lock, like every other slot field on this line: a
+            # mode switch that committed while this save waited must land here,
+            # or the restart re-reads the looser value. Folded with the mode the
+            # line already carries (``existing_meta``, read under this same lock)
+            # because the line is a ratchet: the rows a restricted slot committed
+            # outlive that slot, and a persistent slot recreated on the freed key
+            # must not relabel them by rebuilding the line from its own state.
+            _mode = stricter_memory_mode(line_memory_mode(existing_meta), retained_memory_mode())
+            meta_line["memory_mode"] = _mode
             if slot.title and slot.title != slot.key:
                 meta_line["title"] = slot.title
                 # Persist the title's provenance next to it (mirrors
@@ -4110,6 +4468,7 @@ def _save_slot_to_history(
                 meta_line["agent"] = slot.agent
             meta_line["model"] = slot.model
             if slot.reasoning_effort:
+                _remember_reasoning_effort_for_restore(slot.reasoning_effort)
                 meta_line["reasoning_effort"] = slot.reasoning_effort
             # Unconditional, matching the empty-window merge mirror: None is
             # the cleared "follow the global" value, not an absent field.
@@ -4118,7 +4477,16 @@ def _save_slot_to_history(
                 meta_line["mode"] = slot.mode
             if slot.workspace and slot.workspace != "default":
                 meta_line["workspace"] = slot.workspace
-            if _named := named_store_or_empty(slot.memory_store):
+            # A restricted session's line names no memory store. The store name is
+            # what ``read_session_execution`` reads as an owner claim when the
+            # line carries no execution carrier -- and a restricted session never
+            # writes one (its carrier lives in process and is released on close).
+            # A store here would make the restart refuse the chat as a legacy
+            # member record with no identity. Left out, the restart reads the
+            # session as unbound, and the first turn re-selects the member from
+            # ``agent`` under the retained mode, exactly as the live session did.
+            # ``agent_kind`` stays: it is a display fact, not an owner claim.
+            if _mode == "persistent" and (_named := named_store_or_empty(slot.memory_store)):
                 meta_line["memory_store"] = _named
             if slot.agent_kind:
                 meta_line["agent_kind"] = slot.agent_kind
@@ -4362,8 +4730,51 @@ def _save_slot_to_history(
                 for meta_key in ROWS_ONLY_DEFERRED_META_KEYS:
                     meta_line.pop(meta_key, None)
                 carry_unowned_metadata(meta_line, existing_meta, ROWS_ONLY_OWNED_META_KEYS)
+                # ``memory_mode`` is deferred with the rest, but it is the line's
+                # privacy contract -- every reader that learns from the file gates
+                # on it -- and the contract is a RATCHET that any writer may
+                # tighten. A restricted original handing its unsaved tail to a
+                # PERSISTENT same-key replacement (one that published its own line
+                # before the original ever committed one) must not file private
+                # rows under a line that says persistent, and it must not drop
+                # them either: the rows are the reply the user was watching, and
+                # a refused write here has no retry path (the slot is popped).
+                # So the carried mode is folded with the retained one and the
+                # line is tightened to the stricter value, exactly as the
+                # replacement's own save would have been ratcheted had the
+                # original's line landed first. The two race orders then reach
+                # the same file: private rows and the replacement's rows under
+                # one restricted line, the outcome the turn-start binder already
+                # produces for a persistent slot on a restricted record. A
+                # restricted line names no store (see the full save above), so a
+                # carried ``memory_store`` is dropped with the loosening. Only a
+                # STRICTER source changes anything: ``_mode`` already folds the
+                # line's value in, so it differs from the line exactly when the
+                # source is stricter; a persistent original over a restricted
+                # replacement's line keeps the line's value untouched.
+                line_mode = line_memory_mode(existing_meta)
+                if _mode != line_mode:
+                    logger.info(
+                        "Slot %s save tightened another holder's %s line to %s: %d "
+                        "unsaved %s row(s) land under the stricter mode",
+                        slot.key,
+                        line_mode,
+                        _mode,
+                        len(window),
+                        _mode,
+                    )
+                    meta_line["memory_mode"] = _mode
+                    meta_line.pop("memory_store", None)
+                # The carried durable execution record must never read looser
+                # than the line it sits on; fold the (possibly just ratcheted)
+                # mode into it. A no-op on a record already at least as strict.
+                _tighten_carried_execution(meta_line, _mode)
             else:
                 carry_unowned_metadata(meta_line, existing_meta, SLOT_OWNED_META_KEYS)
+                # The durable execution record is carried, not owned, and it
+                # holds a ``memory_mode`` of its own. The line's mode was just
+                # ratcheted above; the record must never read looser than it.
+                _tighten_carried_execution(meta_line, _mode)
             meta_str = json.dumps(meta_line) + "\n"
 
             # ── Frozen prefix (never rewritten) + freshly serialized window ──
@@ -4483,6 +4894,7 @@ def _save_slot_to_history(
                     _preserve_mtime = None
 
             atomic_write(path, payload, fsync=True)
+            _record_pending_memory_mode(pending_mode_target, _mode)
             # The write committed: the deferred-note drop records it retired
             # are now safe to consume (see the meta build above). Discard is
             # idempotent, and a record consumed here can no longer be needed —
@@ -4834,6 +5246,11 @@ async def save_slot_off_loop(
     may ignore it — the delete already disposed of what they were archiving.
     """
 
+    pending_mode_slot = slot
+    current = state._slots.get(slot.key)
+    if current is not None and slot_history_key(current) == slot_history_key(slot):
+        pending_mode_slot = current
+
     def _do() -> bool:
         return _save_slot_to_history(
             state,
@@ -4846,6 +5263,7 @@ async def save_slot_off_loop(
             expected_history_key=expected_history_key,
             expected_slot_name=expected_slot_name,
             rows_only=rows_only,
+            pending_mode_slot=pending_mode_slot,
         )
 
     def _begin_guarded_metadata_write() -> None:
@@ -4919,6 +5337,13 @@ async def save_slot_off_loop(
                 pass
             return False
         save = active_loop.run_in_executor(None, _do)
+        # ``run_in_executor`` returns an asyncio Future bound to ``active_loop``;
+        # its callbacks therefore already run on that loop. Register before any
+        # await so adoption follows the worker's completion even when the
+        # awaiting task is cancelled, and runs before a normal awaiter resumes.
+        save.add_done_callback(
+            lambda _completed: apply_pending_slot_memory_mode(state, pending_mode_slot)
+        )
         if not guarded_metadata:
             return await save
         _register_guarded_write(save)

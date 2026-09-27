@@ -10,7 +10,7 @@ import time
 from collections.abc import AsyncIterator, Callable
 from contextlib import aclosing
 from pathlib import Path
-from typing import Any
+from typing import Any, AsyncContextManager
 
 from kiro_crew import model_scope
 from kiro_crew.acp.client import (
@@ -92,6 +92,7 @@ from kiro_crew.providers.base import (
 )
 from kiro_crew.providers.cleanup import _is_safe_path
 from kiro_crew.recovery.ladder import InfraError
+from kiro_crew.session_work_dir import mark_run_dir, reclaim_session_work_dir
 from kiro_crew.workspace_cli_settings import (
     CLI_SETTINGS_LOCK_ACTION_TIMEOUT_SECS,
     CLI_SETTINGS_LOCK_TIMEOUT_SECS,
@@ -389,6 +390,7 @@ class AcpProvider(LLMProvider):
         shared_scratch: Path | None = None,
         on_gate_acquired: Callable[[float], None] | None = None,
         on_gate_queued: Callable[[], None] | None = None,
+        disposable_work_dir: bool = False,
     ) -> None:
         # An unrecognized backend would pass every ``_is_<backend>`` check and
         # spawn kiro-cli, so a typo'd config would drive the wrong agent with no
@@ -435,6 +437,16 @@ class AcpProvider(LLMProvider):
         # Its companion for gate ENTRY: the manager freezes the start clock for
         # the span spent waiting for a permit. Same None-is-inert rule.
         self._on_gate_queued: Callable[[], None] | None = on_gate_queued
+        # Whether ``work_dir`` was DERIVED for a one-run session (a subagent, a
+        # stateless cron run) and is this provider's to reclaim at shutdown. An
+        # explicit caller cwd is never marked, whatever key the session has; and
+        # marking only authorizes removing Crew's own residue, never a file the
+        # run wrote (session_work_dir.reclaim_session_work_dir).
+        self._disposable_work_dir: bool = bool(disposable_work_dir)
+        # Installed by the session registry when this provider is registered.
+        # The context manager retains the registry lock from the final ownership
+        # decision through the filesystem reclaim, closing the successor race.
+        self._work_dir_claim_probe: Callable[[], AsyncContextManager[bool]] | None = None
         self._client = AcpClient(**kwargs)
         # Consumer opt-in for the low-fidelity child permission downgrade
         # (see child_fidelity_aware property). Set by fidelity-aware
@@ -1337,12 +1349,42 @@ class AcpProvider(LLMProvider):
                         _namespace,
                     )
                 elif model_is_unusable(configured_model, _advertised):
-                    # A literal miss can be a stale `<namespace>::` qualifier on
-                    # a model the backend fully serves: resolve to the
-                    # advertised spelling and send THAT — same fold the display
-                    # verdict uses, so chip and wire agree. A pin absent under
-                    # either spelling still takes the withhold.
+                    # A literal miss can be a stale `<namespace>::` qualifier on a
+                    # model the backend fully serves: resolve to the advertised
+                    # spelling and send THAT — same fold the display verdict uses,
+                    # so chip and wire agree. Try the fold FIRST, against the
+                    # snapshot we already have: a qualifier-only miss resolves
+                    # here with no wire traffic and must not pay a throwaway
+                    # session/new on every cold start.
                     _send_model = resolve_pin_spelling(configured_model, _advertised)
+                    if not _send_model:
+                        # The fold found nothing, so this looks like a genuine
+                        # miss — but the snapshot was captured seconds ago at
+                        # session/new, always inside the startup race window where
+                        # an entitlement lookup racing a token refresh answers the
+                        # free-tier default. Withholding an entitled pin on that
+                        # unconfirmed answer drops the user's model for the whole
+                        # session with no retry, so revalidate ONCE against the
+                        # live backend and re-run both checks. A failed probe
+                        # leaves _advertised as it was (fail open: no evidence
+                        # never widens or narrows entitlement).
+                        try:
+                            # force=True: this is a one-shot per cold start
+                            # deciding whether to DROP a configured pin, not a
+                            # burst, so it must earn a fresh probe rather than
+                            # honour a recent no-evidence failure replay.
+                            _advertised = (
+                                advertised_model_ids(
+                                    await handle.refresh_available_models(force=True)
+                                )
+                                or _advertised
+                            )
+                        except Exception:
+                            pass
+                        if model_is_unusable(configured_model, _advertised):
+                            _send_model = resolve_pin_spelling(configured_model, _advertised)
+                        else:
+                            _send_model = configured_model
                 if not _send_model and not _foreign_scope:
                     logger.warning(
                         "Configured model %s is not available to this account; "
@@ -1423,6 +1465,25 @@ class AcpProvider(LLMProvider):
         Claude list) rather than a hardcoded set.
         """
         return self._client.available_models()
+
+    async def maybe_refresh_available_models(self, catalog_ids: list[str]) -> list[dict[str, str]]:
+        """Revalidate the advertised-model snapshot on the picker read path.
+
+        The dashboard model list (`/api/models`) narrows the catalog through this
+        provider's snapshot. `self._client` is a plain `AcpClient` before startup
+        (NOT an `LLMProvider`, no revalidation) and becomes an `AcpSessionProvider`
+        (an `LLMProvider`) on the kiro shared-runtime path, which carries the
+        read-path revalidation. Forward when the inner client is an `LLMProvider`
+        (propagating its contract: the read deadline raises
+        :class:`~kiro_crew.acp.session_handle.EntitlementRevalidating` while the
+        probe keeps running, and a probe FAILURE returns the current snapshot,
+        fail open); otherwise return the current snapshot unchanged, so a
+        pre-startup placeholder client or a non-kiro direct client never worsens
+        the picker.
+        """
+        if isinstance(self._client, LLMProvider):
+            return await self._client.maybe_refresh_available_models(catalog_ids)
+        return self.available_models()
 
     def mcp_session_report(self) -> SessionMcpReport:
         """This session's MCP registration report, kept on the inner client.
@@ -1891,6 +1952,13 @@ class AcpProvider(LLMProvider):
         if self.memory_mode != "persistent":
             self._client._resume_session_id = ""
         self.essential_delivery.invalidate()
+        if self._disposable_work_dir:
+            # The ONE place the directory's provenance is written: before any
+            # writer puts a file in it, on every (re)start, idempotent. The
+            # sweep reclaims only a directory that carries this mark and names a
+            # dead predecessor of this data home (session_work_dir); the shutdown
+            # reclaim below keys on the flag and on the mark naming this process.
+            await asyncio.to_thread(mark_run_dir, Path(self._client._work_dir))
         # Re-apply the overlay on every (re)start to cover resume / model swap.
         # (no-op for claude backend — that path applies effort live below.)
         self._apply_effort_overlay()
@@ -1960,6 +2028,74 @@ class AcpProvider(LLMProvider):
         finally:
             if self.memory_mode != "persistent" and session_id:
                 await self.cleanup_session(session_id)
+            if self._disposable_work_dir:
+                await self._reclaim_work_dir()
+
+    def set_work_dir_claim_probe(
+        self,
+        probe: Callable[[], AsyncContextManager[bool]],
+    ) -> None:
+        """Install the registry claim that guards the final reclaim decision."""
+        self._work_dir_claim_probe = probe
+
+    def disown_work_dir(self) -> None:
+        """Drop this provider's claim on its derived work directory.
+
+        The factory flag says the directory was derived from a one-run KEY; it
+        cannot say whether this instance is the one the registry kept for that
+        key. When two providers for the same key race and one is discarded, or a
+        recycled session's successor is already registered, the discarded
+        provider and the live one share the directory, so the registry tells the
+        discarded one to leave it -- the live sibling reclaims it at its own
+        shutdown. A marker nonce could not carry this: whichever instance wrote
+        the marker can be the one torn down while the other lives.
+        """
+        self._disposable_work_dir = False
+
+    async def _reclaim_work_dir(self) -> None:
+        """Remove this run's derived work dir only after its tree and claim end.
+
+        Shutdown can retain PID tracking when a root or descendant survives, so
+        its return alone is not proof that no process still uses this directory
+        as its cwd. The registry claim is the other half: it holds the registry
+        lock from the final no-successor decision through the off-loop reclaim,
+        so a new holder cannot register in between. If cancellation arrives
+        during that reclaim, shutdown waits for its worker before releasing the
+        claim, then propagates the cancellation. An absent, denied, or broken
+        claim fails closed and leaves the directory for the sweep. The reclaim
+        itself accepts a missing marker (the flag is its provenance) and, when a
+        marker is present, requires it to name this data home and this process
+        exactly; nothing about another process is probed.
+        """
+        if getattr(self._client, "process_tree_confirmed_dead", None) is not True:
+            logger.debug("retaining run work dir until its process tree is confirmed dead")
+            return
+        claim_probe = self._work_dir_claim_probe
+        if claim_probe is None:
+            logger.debug("retaining run work dir because no registry claim probe is installed")
+            return
+        work_dir = Path(self._client._work_dir)
+        try:
+            async with claim_probe() as claimed:
+                if not claimed:
+                    logger.debug("retaining claimed run work dir %s", work_dir)
+                    return
+                reclaim = asyncio.ensure_future(
+                    asyncio.to_thread(reclaim_session_work_dir, work_dir)
+                )
+                try:
+                    removed = await asyncio.shield(reclaim)
+                except asyncio.CancelledError:
+                    try:
+                        await reclaim
+                    except BaseException:
+                        pass
+                    raise
+        except Exception:
+            logger.debug("work dir reclaim failed for %s", work_dir, exc_info=True)
+            return
+        if removed:
+            logger.debug("reclaimed run work dir %s", work_dir)
 
     @staticmethod
     def _to_llm_event(e: Any) -> LLMEvent:
@@ -1982,6 +2118,9 @@ class AcpProvider(LLMProvider):
             tool_output=e.tool_output,
             tool_output_digest=e.tool_output_digest,
             tool_output_bytes=e.tool_output_bytes,
+            # The fingerprints the credential card traces a source by. Dropping
+            # them leaves every credential in the reply with no source.
+            tool_output_credentials=e.tool_output_credentials,
             tool_final=e.tool_final,
             # Dropping this clears the task panel and records an empty plan/updated.
             todo=e.todo,
@@ -2003,6 +2142,9 @@ class AcpProvider(LLMProvider):
             # half (child_mcp_identity_trusted) for every crossing event.
             raw_params_trusted=e.raw_params_trusted,
             shell_classified=e.shell_classified,
+            # Dropping this would let a KAS spawn reach the prompt unvetted
+            # against the spawn policy on this surface.
+            spawn_target=e.spawn_target,
             tool_identity_trusted=e.tool_identity_trusted,
             mcp_identity_trusted=e.mcp_identity_trusted,
             server_name=e.server_name,
@@ -2021,6 +2163,9 @@ class AcpProvider(LLMProvider):
             runtime_global=e.runtime_global,
             sub_session_id=e.sub_session_id,
             is_shell=e.is_shell,
+            # The harness's own tool id for a permission request. Dropping it
+            # leaves every KAS call unnamed, so no tool-scoped spec hook fires.
+            harness_tool_id=e.harness_tool_id,
             # Canonical, non-model-authored tool identity (_meta.kiro). The
             # session-directive forgery gate in chat_runner keys on THESE, so
             # dropping them here silently discards every session-bound tool's

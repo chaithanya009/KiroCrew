@@ -144,7 +144,10 @@ completion — this path fires for every terminal state, including runs that
 never executed (the never-ran reading comes from the record's execution marker,
 never from its error wording):
 
-- completed: `The agent finished but result delivery timed out.`
+- completed: `The agent finished, but its result could not be delivered.`
+  The line names no mechanism: `<reason>` above it already carries one, and
+  most call sites pass something other than a timeout (a dead provider, a
+  died ACP process, a raw exception string).
 - failed after execution began: `The agent failed before a result could be delivered.`
 - failed before execution (approval or queued rejection, no output exists):
   `The run failed before it started, so there is no result to deliver.`
@@ -506,7 +509,7 @@ speech rather than as the user.
 | `[Previous run result — do NOT repeat the same content]` | `cron.py` | A recurring cron's own last output, so the turn reports only what changed. |
 | `[RESOURCES]` | `resource_status.py` advisory builder | Host memory crossed the tight/critical threshold, **or** the agent slice sits within `_SLICE_TASKS_TIGHT_RATIO` of its cgroup `pids.max`; take the lighter path this turn. |
 | `[Relevant skills for this message]` | `skills.py` pointer renderer | Skill candidates named by path instead of by injected body. The body must be read before use unless that skill already appears earlier in the conversation, where native history still carries its instructions. |
-| `[INCOGNITO SESSION]` / `[TEMPORARY SESSION]` | `dashboard/chat_utils.py` ephemeral-session prefixes | An instruction, not a tool-level gate: it forbids memory tools (writes in incognito, reads as well in temporary) and keeps nothing of the chat, its history or its lessons. `learn_remove` and the cron tools stay permitted as active user actions, and a cron change persists outside the ephemeral transcript. |
+| `[INCOGNITO SESSION]` / `[TEMPORARY SESSION]` | `dashboard/chat_utils.py` ephemeral-session prefixes | An instruction, not a tool-level gate: it forbids memory tools (writes in incognito, reads as well in temporary) and learns nothing from the chat — the transcript itself is kept in History for the user, but no lesson, memory or summary is derived from it. `learn_remove` and the cron tools stay permitted as active user actions, and a cron change persists outside the transcript. |
 
 ## Adding a new envelope
 

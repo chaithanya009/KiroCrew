@@ -975,34 +975,65 @@ class TestJudgeTickReportsWhetherItAsked:
             captured_receipt.update(receipt)
             return answers
 
+        started = threading.Event()
+        release = threading.Event()
+        commit: dict = {}
+
         def _late_normalizing_append(row, *, commit_event=None):
-            time.sleep(0.07)
+            # The gate's commit signal is captured so the DRIVE can fire it, on the
+            # event loop, once it has waited past the budget. That makes the commit a
+            # deterministic post-budget fact instead of a real day-file write that has
+            # to beat the production grace, which is what this case kept regressing on.
+            commit["event"] = commit_event
+            started.set()
+            release.wait(5.0)
             return original_append(dict(row), commit_event=commit_event)
 
         monkeypatch.setattr(decisions_gate, "_snapshot", lambda: _Config())
         monkeypatch.setattr(decisions_gate, "_consented_for", lambda *_args, **_kwargs: False)
         monkeypatch.setattr(decisions_gate, "_capability_denied", lambda *_args, **_kwargs: False)
         monkeypatch.setattr(decisions_gate, "_oracle", lambda *_args, **_kwargs: _InvalidOracle())
-        monkeypatch.setattr(decisions_gate, "_LOG_BUDGET_SECS", 0.05)
+        monkeypatch.setattr(decisions_gate, "_LOG_BUDGET_SECS", 0.005)
         monkeypatch.setattr(decisions_log, "append", _late_normalizing_append)
         monkeypatch.setattr(decisions_log, "sweep_expired", lambda: 0)
         monkeypatch.setattr(point.core, "decide", _decide)
 
         trace: dict = {}
-        verdict = asyncio.run(
-            point.judge_tick(
-                "watch it",
-                evidence=[
-                    {
-                        "source": "session:chat-1",
-                        "kind": point.KIND_TRANSCRIPT_TAIL,
-                        "age_s": 1.0,
-                        "text": "new evidence",
-                    }
-                ],
-                trace=trace,
+
+        async def drive():
+            task = asyncio.create_task(
+                point.judge_tick(
+                    "watch it",
+                    evidence=[
+                        {
+                            "source": "session:chat-1",
+                            "kind": point.KIND_TRANSCRIPT_TAIL,
+                            "age_s": 1.0,
+                            "text": "new evidence",
+                        }
+                    ],
+                    trace=trace,
+                )
             )
-        )
+            # Wait for the worker rather than sleeping a guessed interval past the
+            # budget: a sleep chosen to outlast it is what made this case depend on
+            # the runner. Once the worker is parked on ``release`` the budget can only
+            # expire, so "the append lands after the budget" is a fact.
+            deadline = time.monotonic() + 5.0
+            while not started.is_set():
+                assert time.monotonic() < deadline, "append worker never started"
+                await asyncio.sleep(0.001)
+            await asyncio.sleep(decisions_gate._LOG_BUDGET_SECS * 4)
+            # The post-budget commit, fired here on the event loop. Nothing about the
+            # receipt is left to a real write beating the PRODUCTION grace, which stays
+            # at the 0.10 s the gate ships: the signal ``gate._write`` reads is set
+            # synchronously, after the budget has provably expired, so the only thing
+            # the grace still bounds is the wait that is already parked on it.
+            commit["event"].set()
+            release.set()
+            return await task
+
+        verdict = asyncio.run(drive())
         row = judge.verdict_entry(
             verdict,
             trace["evidence_items"],
@@ -1297,6 +1328,45 @@ class TestVerdictIdBound:
         )
         assert len(stored["id"]) == len(label["verdict_id"])
         assert stored["id"] == label["verdict_id"]
+
+
+class TestTheStoredPullRequestBaselineIsBoundOnLoad:
+    """The clip on the WRITE path constrains only what this build wrote.
+
+    The store is writable by an auto-approved agent shell, so the bound that matters is
+    the one the loader applies to whatever the file holds. Without it an oversized value
+    is retained and re-serialized on every persist, for the life of the loop.
+    """
+
+    @staticmethod
+    def _bound(raw):
+        from kiro_crew.autonudge import _bounded_judge_pr_seen
+
+        return _bounded_judge_pr_seen(raw)
+
+    def test_an_oversized_id_list_is_capped(self):
+        from kiro_crew import autonudge as _an
+
+        loaded = self._bound({"digest": "a" * 16, "remarks": [f"c{i}" for i in range(5_000)]})
+        assert len(loaded["remarks"]) == _an._JUDGE_PR_SEEN_REMARKS
+
+    def test_a_long_id_and_a_long_digest_are_clipped(self):
+        from kiro_crew import autonudge as _an
+
+        loaded = self._bound({"digest": "d" * 9_000, "remarks": ["x" * 9_000]})
+        assert len(loaded["digest"]) == _an._JUDGE_PR_SEEN_DIGEST_CHARS
+        assert len(loaded["remarks"][0]) == _an._JUDGE_MAX_TARGET_CHARS
+
+    def test_an_unknown_key_is_not_retained(self):
+        loaded = self._bound({"digest": "a" * 16, "remarks": ["c1"], "prose": "x" * 9_000})
+        assert set(loaded) == {"digest", "remarks"}, "a row that grew a field is not carried"
+
+    def test_a_wrong_shape_loads_as_no_baseline(self):
+        for raw in ("not a dict", 7, None, []):
+            assert self._bound(raw) == {}, raw
+        assert self._bound({"digest": 7, "remarks": [1, None, "c1"]}) == {
+            "remarks": ["c1"]
+        }, "a rejected digest or id costs at most a repeat delivery, which fires"
 
 
 class TestStoredHistoryLoader:

@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, TypeVar
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, NamedTuple, TypeVar
 
 from aiohttp import web
 
@@ -68,7 +68,7 @@ from kiro_crew.dashboard.slot_queue_repository import (
 )
 from kiro_crew.dashboard.slot_registry import SlotRegistry
 from kiro_crew.dashboard.system_notices import is_system_notice
-from kiro_crew.dashboard.websocket_hub import WebSocketHub
+from kiro_crew.dashboard.websocket_hub import SLOT_PATCH_WS_FLAG, WebSocketHub
 from kiro_crew.deny_guidance import remediation_for
 from kiro_crew.deny_notice import (  # noqa: F401 -- re-exported for dashboard importers
     _DENY_CAUSE_TEXT,
@@ -110,11 +110,13 @@ from kiro_crew.preview_text import strip_markdown_preview
 from kiro_crew.release_channel import channel as _release_channel_of_build
 from kiro_crew.safety_override import cached_disabled_approval_modes, safety_override
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+from kiro_crew.security.credential_sources import CredentialEvidence
 from kiro_crew.sel import sel
 from kiro_crew.session_compaction import (
     COMPACT_OUTCOME_COMPACTED,
     COMPACT_OUTCOME_RECYCLED,
     COMPACT_OUTCOME_RESTARTED_UNCOMPACTABLE,
+    COMPACT_OUTCOME_WAITING_FOR_SUBAGENTS,
 )
 
 if TYPE_CHECKING:
@@ -317,6 +319,10 @@ def _registry_for(state: Any) -> SlotRegistry:
 #: against this one number, so raising the ceiling is a single edit and no entry
 #: point can silently drift to a different limit.
 MAX_LIVE_SLOTS = 500
+
+#: Fields whose dashboard-user projection is identical for every slot-patch
+#: audience. Per-audience fields such as ``source_links`` require a full frame.
+_SLOT_PATCH_FIELDS = frozenset({"pinned", "title", "folder_id"})
 
 #: The most live slots ONE creator may hold, as a sub-ceiling under
 #: :data:`MAX_LIVE_SLOTS`. The global ceiling alone bounds the total but not the
@@ -770,6 +776,9 @@ def _delivery_key(content: str) -> str:
 # Slot-list broadcast coalescing window. The sub-agent slots debouncer in
 # slack/gateway.py hardcodes the same value independently; the two are not shared.
 _SLOTS_BROADCAST_INTERVAL_S: float = 0.2
+# A successful plain persistent-memory create hands its full-list publication past
+# the HTTP response by this fixed interval. Callers may name the operation only.
+_DEFERRED_SLOTS_FLUSH_DELAY_S: float = 0.01
 
 
 def native_subagent_output_tail(chunks: list[str], limit: int = NATIVE_SUBAGENT_OUTPUT_TAIL) -> str:
@@ -1148,6 +1157,10 @@ _AUTO_RESTART_UNCOMPACTABLE_NOTICE = (
     "♻️ Context reached {pct:.0f}% and this backend cannot compact at all, so "
     "the session was restarted. The conversation above is still here; the agent no "
     "longer remembers it."
+)
+_AUTO_COMPACT_WAITING_NOTICE = (
+    "⏸ Auto-compact failed at {pct:.0f}%. The session is waiting for its sub-agents "
+    "to finish before it restarts. Your messages are kept."
 )
 _AUTO_COMPACT_FAILED_NOTICE = (
     "⚠ Auto-compact failed at {pct:.0f}% — will retry after cooldown. "
@@ -1959,8 +1972,15 @@ def build_stale_recovery_prompt() -> str:
 
 
 # Shell output-redirection target, e.g. `> build.log` / `>> build.log`. The
-# character class excludes `&` so fd-dup forms (`2>&1`, `>&2`) self-exclude.
-_REDIRECT_TARGET_RE = re.compile(r">>?\s*([^\s;|&]+)")
+# operator must open a token: nothing but whitespace (or the start of the
+# string) may precede it, optionally through a single fd digit (`2>`, `1>>`)
+# or the both-streams `&>`. That keeps the `>` inside `->` and `=>` — Markdown
+# prose, JS fat arrows — from reading as a redirect, which matters because the
+# scanned text is the stalled tool's raw input and is a file's content when the
+# tool is a file write. The target class excludes `&` so fd-dup forms (`2>&1`,
+# `>&2`) self-exclude, and `)` so a path at the end of a parenthesis does not
+# carry the parenthesis along.
+_REDIRECT_TARGET_RE = re.compile(r"(?<![^\s])(?:\d|&)?>>?\s*([^\s;|&)]+)")
 
 
 def extract_log_redirect_target(command: str) -> str:
@@ -1969,7 +1989,9 @@ def extract_log_redirect_target(command: str) -> str:
     Used by the tool-stall recovery nudge: when a long command redirected its
     output (long commands typically redirect, e.g. ``> build.log 2>&1``), the model
     should inspect that file's tail instead of blindly re-running the command.
-    ``/dev/null`` and fd-dups (``2>&1``) are ignored.
+    ``/dev/null`` and fd-dups (``2>&1``) are ignored, and so is a ``>`` that is
+    part of another token (``->``, ``=>``): the text scanned is whatever input the
+    stalled tool received, which for a file write is the file's content.
     """
     for m in _REDIRECT_TARGET_RE.finditer(command or ""):
         target = m.group(1).strip("\"'")
@@ -2250,6 +2272,39 @@ def mint_tags_revision() -> str:
     return f"{epoch:016d}.{seq:020d}-{uuid.uuid4().hex[:8]}"
 
 
+class CrewLogPrevious(NamedTuple):
+    """What a `session/opened` should say about the store its slot was writing.
+
+    Three states, because an empty ``sid`` carries two different facts and a log
+    that records the wrong one reads as something it is not. ``sid`` set is the
+    predecessor, named. Empty with ``undecided`` false says the slot has no earlier
+    store, which makes this log a chain START. Empty with ``undecided`` true says it
+    HAS one that could not be determined, so the log is a chain BREAK -- a later
+    fold may pass over a chain start when ranking, and must refuse on a break rather
+    than electing the log before it.
+
+    A FOURTH state keeps those two honest: ``undecided`` ``None`` says nothing was
+    determined either way. A source can come back empty because it looked and there
+    is nothing, or because it had nothing to give -- a store holding units it cannot
+    rank, handing the question on. Only the first is a finding about the slot.
+    Recording the second as one would have a log with earlier siblings declare itself
+    their chain start, in an append-only entry, and a later fold would pass over it.
+
+    ``from_mapping`` says the ``sid`` came from the slot's session mapping rather
+    than from the slot's own record or its units. That matters because the mapping
+    is a generation behind while an allocation holds the prior resumable id for a
+    provider that defers promotion, and whether it is doing so CANNOT be read where
+    the resolver runs: the marker is an attribute of a live session, and the
+    resolver runs before the session for this turn exists. A flagged id is
+    therefore provisional, and the decision to cite it or record a break is made
+    where the marker is answerable.
+    """
+
+    sid: str
+    undecided: bool | None
+    from_mapping: bool = False
+
+
 class SlotOrigin:
     """Slot creation origin — who initiated the slot.
 
@@ -2396,6 +2451,8 @@ class _ChatSlot:
         "_source_links_cache",
         "_source_links_revision",
         "_closing",
+        "credential_evidence",
+        "segment_raw_text",
         "key",
         "title",
         "agent",
@@ -2407,6 +2464,8 @@ class _ChatSlot:
         "served_model",
         "_session_requested_model",
         "_crew_log_previous_sid",
+        "_crew_log_previous_undecided",
+        "_crew_log_previous_from_mapping",
         "_crew_log_opened_sid",
         "reasoning_effort",
         "autocompact_pct",
@@ -2559,6 +2618,7 @@ class _ChatSlot:
         "theme_consent",
         "theme_consent_sha",
         "memory_mode",
+        "_pending_memory_mode",
         "_ephemeral",
         "_pending_context",
         "_deferred_notes",
@@ -2676,6 +2736,23 @@ class _ChatSlot:
         # than an earlier store. Cleared once `session/opened` has carried it, so
         # the next supersede of this slot latches afresh. "" = nothing to follow.
         self._crew_log_previous_sid: str = ""
+        # Whether the resolver COULD NOT NAME this slot's predecessor, as opposed to
+        # there being none. Both leave the id above empty and they are different
+        # facts: the first says an edge exists and is unrecorded, the second says the
+        # log is a chain start. The announce writes them differently so a later fold
+        # can pass over the chain start and refuse on the unrecorded one. ``None`` is
+        # the third fact and the default: nothing was determined either way, so the
+        # announce states nothing -- which is what a source handing the question on
+        # leaves behind, and what a slot no resolver has answered for holds.
+        self._crew_log_previous_undecided: bool | None = None
+        # Whether the id above came from the slot's SESSION MAPPING rather than from
+        # this process's own record of the store the slot is on. A mapped id is
+        # provisional, because the mapping is deliberately a generation behind while
+        # an allocation holds the prior resumable id for a provider that defers
+        # promotion -- and whether it is doing so cannot be read when the id is
+        # latched, since the marker belongs to a session that does not exist yet.
+        # The edge is downgraded to a break as it is taken, where the answer is real.
+        self._crew_log_previous_from_mapping: bool = False
         # The store a `session/opened` of this slot was last written FOR, recorded
         # as the edge above is handed over. It is what the slot's next allocation
         # names as its predecessor: the mapping can be a generation behind while a
@@ -2741,6 +2818,17 @@ class _ChatSlot:
         # I/O. A DEPTH: two retractions can overlap on one slot, and each must
         # release only its own acquisition (see ``begin_close``).
         self._closing = 0
+        # This turn's tool results, reduced to sources and credential
+        # fingerprints, so a credential in the reply can name where it came
+        # from. Memory only and cleared at every turn start; see
+        # ``security.credential_sources``.
+        self.credential_evidence = CredentialEvidence()
+        # The current segment's text as the model wrote it, before any
+        # redaction. The run loop redacts each streamed delta as it arrives,
+        # which removes a value whole-in-one-delta before the segment flush can
+        # describe it; the flush redacts THIS copy instead when it agrees with
+        # the redacted one. Memory only, never persisted, dropped at each flush.
+        self.segment_raw_text: str | None = ""
         self.total_messages: int = 0  # lifetime count (survives trimming)
         self._task: asyncio.Task[Any] | None = None
         # Monotonic publication history for turn ownership. ``task`` returns to
@@ -3342,6 +3430,8 @@ class _ChatSlot:
                 f"invalid memory_mode {memory_mode!r}, must be one of {VALID_MEMORY_MODES}"
             )
         self.memory_mode: str = memory_mode
+        # A save thread records a stricter folded line mode for loop-side adoption.
+        self._pending_memory_mode: str | None = None
         self._ephemeral: bool = ephemeral  # Incognito mode: no memory writes
         self._pending_context: list[dict[str, Any]] = []
         self._deferred_notes: list[dict[str, Any]] = []
@@ -4361,7 +4451,9 @@ class _ChatSlot:
         """
         self.served_model = model_id or ""
 
-    def latch_crew_log_previous(self, sid: str) -> None:
+    def latch_crew_log_previous(
+        self, sid: str, *, undecided: bool | None = None, from_mapping: bool = False
+    ) -> None:
         """Remember the crew log store this slot was writing, if none is remembered.
 
         Called by every site that is about to ALLOCATE a session for this slot,
@@ -4396,29 +4488,101 @@ class _ChatSlot:
         chosen = self._crew_log_opened_sid or sid
         if chosen:
             self._crew_log_previous_sid = chosen
+            # The flag describes THIS latch, so the winning branch clears it rather
+            # than leaving an earlier one's reason standing. An earlier latch can have
+            # set it with no sid -- the prefetch's store read refused while this turn's
+            # resolver then named one -- and the two halves leave together, so a stale
+            # true would hand the entry a named edge reported undetermined, which is a
+            # pair the entry's own reader is promised never to see.
+            self._crew_log_previous_undecided = False
+            # Provisional only when the MAPPING supplied the id. The slot's own record
+            # wins over ``sid`` here, and that record is this process's own statement
+            # about which store the slot is on, so it is never provisional. Set on this
+            # branch ALONE, which is what makes it mean "a mapped id is latched": an
+            # answer naming nothing has no provenance to record, and flagging it would
+            # have the take write a break claiming a predecessor exists.
+            self._crew_log_previous_from_mapping = bool(
+                from_mapping and not self._crew_log_opened_sid
+            )
+            return
+        # Nothing nameable. ``undecided`` says WHY, and only here can it be known:
+        # the resolver that could not read the store is the one caller that can tell
+        # "this slot has no earlier store" from "it has one I could not name" from
+        # "nothing here determined either".
+        #
+        # ASSIGNED, not merely set. Two latches before one entry is owed is ordinary,
+        # since the eager prefetch and the turn each run their own resolver, and a
+        # later answer supersedes an earlier one: a prefetch whose store read REFUSED
+        # carries no information about the content, so leaving its refusal standing
+        # would have the entry report a predecessor as existing-but-unnameable for a
+        # slot the turn's own successful read determined has none. The branch above
+        # does the same for the reason beside a named id.
+        self._crew_log_previous_undecided = undecided
 
-    def take_crew_log_previous(self, *, now_writing: str) -> str:
-        """The latched predecessor store id, clearing it as it is handed over.
+    def take_crew_log_previous(
+        self, *, now_writing: str, replay_pending: bool = False
+    ) -> "CrewLogPrevious":
+        """The latched predecessor edge, clearing it as it is handed over.
 
         Read-and-clear, because the value is owed to exactly one
         ``session/opened``: leaving it behind would make the NEXT store of this
         slot cite a predecessor two links back and skip the store between them,
-        which is the one thing a chain walker cannot detect. Returns ``""`` when
-        nothing is latched, which the emitter reads as "no edge to write".
+        which is the one thing a chain walker cannot detect. An empty ``sid`` with
+        ``undecided`` false is "no edge to write".
+
+        Both halves leave in ONE call for the same reason ``now_writing`` does: the
+        sid and the reason it is empty are one statement, and a caller that could
+        take the sid alone would write a log that claims to be a chain start when
+        the truth is that its predecessor was never determined.
+
+        ``replay_pending`` is asked HERE, not where the id was read, and the
+        placement is the point. A latch happens before this turn's session is
+        allocated, and the replay marker is an attribute of a live session, so a
+        resolver asking it gets "no replay owed" both when none is owed and when
+        there is nobody to ask -- and the second of those is a cold start, which is
+        precisely when the mapping is most likely to be holding the older
+        generation. By the time an entry is taken the session exists, so the answer
+        means what it says. It applies only to an id the MAPPING supplied: the
+        slot's own record is this process's statement about which store it is on.
 
         ``now_writing`` is the store that entry is FOR, and recording it here is
         what lets the slot's next allocation name a predecessor without consulting
-        anything outside this process. The two belong in one call because they are
-        one handover: the edge cannot be spent without saying which store is
-        becoming this slot's current one, so a caller cannot take the first and
-        forget the second. It is recorded whether or not an entry is written, since
-        it states which store the slot is on rather than what was appended.
+        anything outside this process. It is recorded whether or not an entry is
+        written, since it states which store the slot is on rather than what was
+        appended.
         """
-        sid = self._crew_log_previous_sid
+        edge = CrewLogPrevious(
+            sid=self._crew_log_previous_sid, undecided=self._crew_log_previous_undecided
+        )
+        if self._crew_log_previous_from_mapping and replay_pending:
+            # The mapping supplied this id and it is knowingly a generation behind:
+            # allocation holds the prior resumable id there for a provider that
+            # defers promotion. Citing it makes two successive stores name one
+            # predecessor and leaves the store between them cited by nobody. The id
+            # still PROVES a predecessor exists, so the honest entry is a break.
+            #
+            # No emptiness test beside the flag, because the flag is set only where a
+            # sid was latched: an answer that named nothing is not provenance, it is
+            # the absence of one, and a break claiming a predecessor exists must not
+            # be written for it.
+            #
+            # The downgrade happens here rather than where the id was read because
+            # only here is the question answerable. The marker lives on a live
+            # session, the resolver runs BEFORE this turn's session exists, and a
+            # missing session reads as "no replay owed" -- which is exactly the
+            # cold-start case where the mapping is most likely to be holding the
+            # older generation.
+            edge = CrewLogPrevious(sid="", undecided=True)
         self._crew_log_previous_sid = ""
+        # Cleared to "nothing determined", not to "determined there is none": with the
+        # edge spent, no resolver has answered for whatever store this slot opens next,
+        # and an entry written before one does must state nothing rather than claim to
+        # start the slot's chain.
+        self._crew_log_previous_undecided = None
+        self._crew_log_previous_from_mapping = False
         if now_writing:
             self._crew_log_opened_sid = now_writing
-        return sid
+        return edge
 
     def forget_session_model_state(self) -> None:
         """Drop every fact that described the session being torn down.
@@ -4689,6 +4853,7 @@ class DashboardState:
     # below; these only supply the "nothing suspended, not restoring" baseline.
     _slots_push_suspend: int = 0
     _slots_push_pending: bool = False
+    _slots_push_overlapped: bool = False
     restoring_open_slots: bool = False
     # push_slots_update() coalescing state, on that same read path. The lock
     # defaults to None rather than to a shared Lock(): a None lock means "no
@@ -4698,6 +4863,13 @@ class DashboardState:
     _slots_broadcast_lock: "threading.Lock | None" = None
     _slots_broadcast_timer: "asyncio.TimerHandle | None" = None
     _slots_broadcast_last: float = 0.0
+    # Who the next coalesced slots broadcast is owed to, written under
+    # ``_slots_broadcast_lock``. A ``push_slots_update(legacy_only=True)`` owes
+    # the full list only to consumers that cannot apply a ``slot_patch`` frame;
+    # any ordinary push owes it to everyone and wins. Both False (the state of a
+    # direct ``_do_slots_broadcast`` call) means everyone.
+    _slots_push_all_owed: bool = False
+    _slots_push_legacy_owed: bool = False
     # The one loop this dashboard is served on. Every surface that hands work in
     # from a foreign thread -- the coalesced slots broadcast, an off-loop
     # websocket send, the log handler's fan-out -- resolves it through
@@ -4924,9 +5096,10 @@ class DashboardState:
         # Broadcast: each SSE client gets its own queue; _notify_event wakes all
         self._sse_queues: list[asyncio.Queue[dict[str, Any]]] = []
         self._notify_event = asyncio.Event()
-        # Depth + pending flag for suspend_slots_push(); see that method.
+        # Depth + pending/overlap flags for suspend_slots_push(); see that method.
         self._slots_push_suspend = 0
         self._slots_push_pending = False
+        self._slots_push_overlapped = False
         # Time-based coalescing state for push_slots_update(). Guarded by a
         # threading.Lock because callers are not all on the event loop.
         self._slots_broadcast_lock = threading.Lock()
@@ -5315,7 +5488,9 @@ class DashboardState:
             slot = self.get_slot(slot_key)
             if slot is None:
                 return
-            if not success:
+            if outcome == COMPACT_OUTCOME_WAITING_FOR_SUBAGENTS:
+                template = _AUTO_COMPACT_WAITING_NOTICE
+            elif not success:
                 template = _AUTO_COMPACT_FAILED_NOTICE
             elif outcome == COMPACT_OUTCOME_RESTARTED_UNCOMPACTABLE:
                 template = _AUTO_RESTART_UNCOMPACTABLE_NOTICE
@@ -6186,9 +6361,15 @@ class DashboardState:
             redact_secret=redact_credentials,
         )
 
-    async def post_question_card(self, slot_key: str, questions: list[dict]) -> int:
-        """Post a non-blocking owner-only question card."""
-        return await _questions_for(self).post_card(self, slot_key, questions)
+    async def post_question_card(
+        self, slot_key: str, questions: list[dict], *, native: bool = False
+    ) -> int:
+        """Post a non-blocking owner-only question card.
+
+        ``native`` marks kiro-cli's own mid-turn ``AskUserQuestion`` card; see
+        ``QuestionCoordinator.post_card``.
+        """
+        return await _questions_for(self).post_card(self, slot_key, questions, native=native)
 
     def mark_question_pending(
         self,
@@ -6197,6 +6378,7 @@ class DashboardState:
         blocking: bool,
         card_id: str,
         questions: list[dict] | None = None,
+        native: bool = False,
     ) -> None:
         """Record one unanswered question and push the slot status."""
         _questions_for(self).mark_pending(
@@ -6205,6 +6387,7 @@ class DashboardState:
             blocking=blocking,
             card_id=card_id,
             questions=questions,
+            native=native,
         )
 
     def clear_question_pending(
@@ -6783,10 +6966,24 @@ class DashboardState:
         from kiro_crew.dashboard.chat_utils import (
             redact_display_content,
             serialize_wire_content,
+            with_allowed_links_restored,
         )
 
+        restored_meta: dict | None = None
         if role != "user" and content:
-            content = redact_display_content(content)
+            # The same allowed-host scope as _prepare_messages, so the live
+            # frame and the history agree on an allowed link: its placeholder
+            # becomes the address again, then the display pass runs.
+            from kiro_crew.security.exfil import scoped_exempt_hosts
+            from kiro_crew.security.redaction_allow import allowed_hosts_for
+
+            _slot = self.get_slot(slot_key)
+            with scoped_exempt_hosts(allowed_hosts_for(getattr(_slot, "workspace", None))):
+                if isinstance(content, str) and isinstance(msg.get("meta"), dict):
+                    shown = with_allowed_links_restored({"content": content, "meta": msg["meta"]})
+                    content = shown["content"]
+                    restored_meta = shown["meta"]
+                content = redact_display_content(content)
         else:
             # The wire-string invariant covers EVERY row: a structured user
             # row or a falsy container serializes to text without redaction.
@@ -6836,7 +7033,7 @@ class DashboardState:
         # test_rehydrate_does_not_broadcast_replayed_messages and
         # test_restore_recent_sessions_does_not_broadcast_either. Do not relax
         # it further without re-checking that meta is still absent.
-        direct_meta = msg.get("meta")
+        direct_meta = restored_meta if restored_meta is not None else msg.get("meta")
         if direct_meta and isinstance(direct_meta, dict):
             payload["meta"] = {**(payload.get("meta") or {}), **direct_meta}
         self._broadcast(payload)
@@ -8037,7 +8234,7 @@ class DashboardState:
             slot.clear_mcp_report()
 
     @contextlib.contextmanager
-    def suspend_slots_push(self) -> "Iterator[None]":
+    def suspend_slots_push(self) -> "Iterator[Callable[[str], None]]":
         """Coalesce every ``push_slots_update()`` inside the block into one at exit.
 
         ``get_or_create_slot`` broadcasts the FULL slot list on each call, so a bulk
@@ -8045,24 +8242,67 @@ class DashboardState:
         work for intermediate states no client will ever render (measured ~1.3s at
         N=77, and it grows quadratically). Wrap the restore, emit one broadcast.
 
+        The yielded callback accepts only an operation label and lets a successful
+        request move the coalesced flush by the state-owned fixed delay past its
+        response. Existing callers ignore it and retain the synchronous flush. A
+        deferred callback that fires during an active suspension transfers its
+        publication debt to that suspension rather than publishing inside it. If
+        suspensions overlap before the debt reaches depth zero, the outermost exit
+        publishes synchronously: one request cannot delay another context's
+        publication contract.
+
         Depth-counted so nested use is safe (an inner block must not flush early),
         and ``@contextmanager``'s try/finally unwinds the depth even if the body
         raises. Only flushes if something actually asked to push. A flush that
         itself fails while the body's own exception is unwinding annotates its
         exception (`PEP 678`) so the buried original stays visible — the flush's
-        exception otherwise replaces the body's in the caller's view, demoting
-        the actual fault to ``__context__``.
+        exception otherwise replaces the body's in the caller's view. A deferred
+        flush is honored only after a clean body exit; every exception keeps the
+        old synchronous failure propagation.
         """
+        deferred_operation: str | None = None
+
+        def defer_flush(operation: str = "slots update") -> None:
+            nonlocal deferred_operation
+            deferred_operation = operation
+
         self._slots_push_suspend += 1
+        if self._slots_push_suspend > 1:
+            self._slots_push_overlapped = True
         try:
-            yield
+            yield defer_flush
         finally:
             self._slots_push_suspend -= 1
+            overlapped = self._slots_push_overlapped
+            if self._slots_push_suspend == 0:
+                self._slots_push_overlapped = False
             if self._slots_push_suspend == 0 and self._slots_push_pending:
                 self._slots_push_pending = False
                 # Captured BEFORE the flush call: inside the `except` block below,
                 # sys.exc_info() would already name the flush's own exception.
                 unwinding_over = sys.exc_info()[1]
+                if deferred_operation is not None and unwinding_over is None and not overlapped:
+                    loop = self.serving_loop
+                    if loop is not None and loop is self._running_loop():
+                        try:
+                            loop.call_later(
+                                _DEFERRED_SLOTS_FLUSH_DELAY_S,
+                                self._deferred_slots_flush,
+                                deferred_operation,
+                                1,
+                            )
+                            lock = self._slots_broadcast_lock
+                            if lock is not None:
+                                with lock:
+                                    if self._slots_broadcast_timer is not None:
+                                        self._slots_broadcast_timer.cancel()
+                                        self._slots_broadcast_timer = None
+                            return
+                        except RuntimeError:
+                            # A loop closing between lookup and scheduling cannot
+                            # drop the announcement. Fall back to the old immediate
+                            # flush and let its failure retain caller visibility.
+                            pass
                 try:
                     self.push_slots_update()
                 except BaseException as flush_exc:
@@ -8074,7 +8314,68 @@ class DashboardState:
                         )
                     raise
 
-    def push_slots_update(self) -> None:
+    def _deferred_slots_flush(self, operation: str, retries_remaining: int) -> None:
+        """Publish one fresh snapshot, retrying a deferred failure once.
+
+        This deliberately bypasses the leading/trailing coalescer at depth zero:
+        returning from ``push_slots_update`` can mean that a bare trailing callback
+        owns the real serialization, which would put its exception back under
+        asyncio's generic callback handler. During an active suspension, however,
+        the outermost context owns the safe flush, so transfer the publication debt
+        to it through ``push_slots_update``. Before each direct attempt, an armed
+        trailing callback is canceled under the coalescing lock and the new window
+        is stamped; a failed attempt therefore leaves only its bounded retry armed.
+        Each attempt re-serializes current state, so the retry reconciles every
+        mutation that landed in the meantime.
+        """
+        if self._slots_push_suspend:
+            self.push_slots_update()
+            return
+
+        try:
+            lock = self._slots_broadcast_lock
+            if lock is not None:
+                with lock:
+                    if self._slots_broadcast_timer is not None:
+                        self._slots_broadcast_timer.cancel()
+                        self._slots_broadcast_timer = None
+                    self._slots_broadcast_last = time.monotonic()
+            self._do_slots_broadcast()
+            return
+        except Exception:
+            logger.error(
+                "Deferred slots publication failed for %s; retries remaining=%d",
+                operation,
+                retries_remaining,
+                exc_info=True,
+            )
+
+        if retries_remaining <= 0:
+            return
+        loop = self.serving_loop
+        if loop is None or loop is not self._running_loop():
+            logger.error(
+                "Deferred slots publication retry could not be scheduled for %s: "
+                "serving loop is unavailable",
+                operation,
+            )
+            return
+        try:
+            loop.call_later(
+                _SLOTS_BROADCAST_INTERVAL_S,
+                self._deferred_slots_flush,
+                operation,
+                retries_remaining - 1,
+            )
+        except RuntimeError:
+            logger.error(
+                "Deferred slots publication retry could not be scheduled for %s: "
+                "serving loop is closing",
+                operation,
+                exc_info=True,
+            )
+
+    def push_slots_update(self, *, legacy_only: bool = False) -> None:
         """Push slots, keeping provider status confined to owner websockets.
 
         Coalesces on a leading plus trailing edge: the first call after an idle
@@ -8084,7 +8385,22 @@ class DashboardState:
         so an uncoalesced burst redraws the whole sidebar once per mutation for
         what the user sees as one change. The trailing flush re-serializes at
         delivery time, so a coalesced frame is never a stale frame.
+
+        ``legacy_only`` owes the full list only to consumers that cannot apply a
+        ``slot_patch`` frame (SSE readers, app tokens, a tab whose bundle
+        predates the frame). :meth:`push_slot_patch` and
+        :meth:`push_slot_removed` use it: the patch already reached every
+        socket that declared the capability, so those sockets skip this
+        broadcast. An ordinary call absorbed into the same window widens the
+        broadcast back to everyone.
         """
+        lock = self._slots_broadcast_lock
+        if lock is not None:
+            with lock:
+                if legacy_only:
+                    self._slots_push_legacy_owed = True
+                else:
+                    self._slots_push_all_owed = True
         if self._slots_push_suspend:
             # Inside suspend_slots_push(); remember that a push is owed and let the
             # outermost block emit a single coalesced broadcast on exit.
@@ -8093,7 +8409,6 @@ class DashboardState:
 
         now = time.monotonic()
         broadcast_now = False
-        lock = self._slots_broadcast_lock
         if lock is None:
             # Partially-constructed state (built via __new__): no coalescing.
             self._do_slots_broadcast()
@@ -8198,6 +8513,35 @@ class DashboardState:
                 self._slots_broadcast_last = time.monotonic()
         self._do_slots_broadcast()
 
+    def _take_slots_audience(self) -> bool:
+        """Consume the owed-audience flags; True when only legacy consumers are owed."""
+        lock = self._slots_broadcast_lock
+        if lock is None:
+            return False
+        with lock:
+            legacy_only = self._slots_push_legacy_owed and not self._slots_push_all_owed
+            self._slots_push_legacy_owed = False
+            self._slots_push_all_owed = False
+        return legacy_only
+
+    def _has_legacy_slots_audience(self) -> bool:
+        """True when some consumer can only learn slot changes from a full list.
+
+        That is every SSE reader, and every open socket that did not declare
+        the ``slot_patch`` capability at connect: an app token, a companion
+        window, or a tab still running a bundle from before the frame existed.
+        App sockets count even when their scope would filter the list to
+        nothing, because asking the scope gate here would audit a denial per
+        socket per metadata edit; the cost is one serialization that the
+        pre-patch protocol paid on every edit anyway.
+        """
+        if getattr(self, "_sse_queues", None):
+            return True
+        return any(
+            not ws.closed and not ws.get(SLOT_PATCH_WS_FLAG, False)
+            for ws in list(getattr(self, "_ws_clients", None) or ())
+        )
+
     def _do_slots_broadcast(self) -> None:
         """Serialize and broadcast the slot list. Bypasses coalescing."""
         from kiro_crew.dashboard.handlers.source_providers import (
@@ -8206,6 +8550,13 @@ class DashboardState:
         from kiro_crew.platform.governance_profiles import (
             governance_answer_generation,
         )
+
+        legacy_only = self._take_slots_audience()
+        if legacy_only and not self._has_legacy_slots_audience():
+            # Every consumer already applied the patch this broadcast was owed
+            # for, so serializing the whole list would reach nobody.
+            self._emit_member_slot_transitions()
+            return
 
         yolo_active = self.is_yolo_active()  # expire first if needed
         # PUBLIC-repo chip status rides the general frame so any authenticated
@@ -8226,6 +8577,10 @@ class DashboardState:
         # One serialization pass for all three audiences -- see
         # ``serialize_slot_views`` for why three passes stalled the event loop.
         owner_ws_clients = getattr(self, "_owner_ws_clients", None)
+        if legacy_only and owner_ws_clients:
+            owner_ws_clients = {
+                ws for ws in owner_ws_clients if not ws.get(SLOT_PATCH_WS_FLAG, False)
+            }
         slots_data, slots_data_ws, owner_slots = self.serialize_slot_views(
             owner=bool(owner_ws_clients)
         )
@@ -8299,6 +8654,9 @@ class DashboardState:
                 # tree alone is not a change signal.
                 "foldersGeneration": self.folders_generation(),
                 "governanceGeneration": answer_generation,
+                # Read by ``_broadcast`` to skip sockets that already applied
+                # the ``slot_patch`` this broadcast was owed for.
+                "_legacy_only": legacy_only,
             }
         )
         # The owner frame is the owner's ONLY slots frame — `_send_ws_all` skips
@@ -8318,9 +8676,20 @@ class DashboardState:
                     folders=_safe_folder_tree(getattr(self, "_folders", None)),
                     folders_gen=self.folders_generation(),
                     governance_gen=answer_generation,
-                )
+                ),
+                **({"skip_slot_patch_clients": True} if legacy_only else {}),
             )
 
+        self._emit_member_slot_transitions()
+
+    def _emit_member_slot_transitions(self) -> None:
+        """Log slot/opened and slot/closed for member-driven slots.
+
+        Runs after every slots broadcast and after :meth:`push_slot_removed`,
+        which is how a close reaches the log when no consumer needed the full
+        list. It diffs against the last-seen set, so a second call for the same
+        registry state emits nothing.
+        """
         # Best-effort per-member event log: emit slot/opened and slot/closed
         # for slots DRIVEN by a member (created_by is a member NAME), diffed
         # against the last-seen set on this state object. Additive; never
@@ -8519,6 +8888,87 @@ class DashboardState:
         if full:
             self.push_slots_update()
 
+    def push_slot_patch(self, key: str, fields: Iterable[str]) -> None:
+        """Publish a metadata edit to one slot without re-sending the slot list.
+
+        Sockets that declared the ``slot_patch`` capability receive
+        ``{"type": "slot_patch", "data": {"slots": [{"key", <field>: ...}]}}``,
+        a row carrying only the named fields, and merge it into their copy of
+        the row. Every other consumer gets the full list through
+        ``push_slots_update(legacy_only=True)``, so an old tab kept open across
+        a gateway restart sees the same thing it always did.
+
+        The values come from the dashboard-user projection of the slot, so a
+        patched field reads exactly as it would in the full frame (the title is
+        redacted the same way). Only fields in :data:`_SLOT_PATCH_FIELDS` are
+        accepted because ``source_links`` and other per-audience fields require
+        a full frame. A slot that is gone or still under construction falls back
+        to an ordinary full push.
+        """
+        field_names = tuple(fields)
+        unsupported = sorted(set(field_names) - _SLOT_PATCH_FIELDS)
+        if unsupported:
+            raise ValueError(f"unsupported slot patch fields: {', '.join(unsupported)}")
+        slot = self._slots.get(key)
+        under_construction = getattr(self, "_slots_under_construction", None) or ()
+        if slot is None or key in under_construction:
+            self.push_slots_update()
+            return
+        if self._has_legacy_slots_audience():
+            self.push_slots_update(legacy_only=True)
+        if not self._has_slot_patch_clients():
+            return
+        row = self.serialize_slot(slot, dashboard_user=True)
+        patch: dict[str, Any] = {"key": key}
+        for field in field_names:
+            if field in row:
+                patch[field] = row[field]
+        self._send_slot_patch({"slots": [patch]})
+
+    def push_slot_removed(self, key: str) -> None:
+        """Publish that slot *key* left the registry without re-sending the list.
+
+        Patch-capable sockets receive ``{"slots": [...], "removed": [key]}``.
+        The ``slots`` rows re-state the ``parent`` of every row whose creator is
+        not live, because a removed conductor turns its workers' ``parent.key``
+        to ``None`` in the full frame; carrying those rows keeps the sidebar's
+        nesting identical to what a full list would have produced. Everyone else
+        gets the full list, as with :meth:`push_slot_patch`.
+
+        A key that is registered again (a same-name replacement landed while the
+        close was tearing down) is not removed: the full push describes it.
+        """
+        if key in self._slots:
+            self.push_slots_update()
+            return
+        if self._has_legacy_slots_audience():
+            self.push_slots_update(legacy_only=True)
+        if self._has_slot_patch_clients():
+            under_construction = getattr(self, "_slots_under_construction", None) or ()
+            rows: list[dict[str, Any]] = [
+                {"key": k} for k in list(self._slots) if k not in under_construction
+            ]
+            _attach_slot_parents(rows, getattr(self, "spend_slot_by_session", None))
+            orphans = [
+                {"key": row["key"], "parent": row["parent"]}
+                for row in rows
+                if isinstance(row.get("parent"), dict)
+                and row["parent"].get("key") is None
+                and not row.get("lineage_pending")
+            ]
+            self._send_slot_patch({"slots": orphans, "removed": [key]})
+        self._emit_member_slot_transitions()
+
+    def _has_slot_patch_clients(self) -> bool:
+        return any(
+            not ws.closed and ws.get(SLOT_PATCH_WS_FLAG, False)
+            for ws in list(getattr(self, "_ws_clients", None) or ())
+        )
+
+    def _send_slot_patch(self, data: dict[str, Any]) -> None:
+        """Serialize one ``slot_patch`` frame and hand it to patch-capable sockets."""
+        _websocket_for(self).send_ws_slot_patch(json.dumps({"type": "slot_patch", "data": data}))
+
     def push_session_summary(self, key: str) -> None:
         """Broadcast that a session's intent summary was regenerated.
 
@@ -8614,6 +9064,8 @@ class DashboardState:
                     "slots": slots_list,
                     "yolo": note.get("_yolo", False),
                     "channelTrusted": note.get("channelTrusted", False),
+                    # Consumed by ``_send_ws_all``; never serialized to a client.
+                    "_legacy_only": bool(note.get("_legacy_only", False)),
                 }
                 # Built by `_slots_ws_frame`, NOT inline: the owner frame in
                 # `_do_slots_broadcast` has to carry an identical key set, and it
@@ -8698,8 +9150,11 @@ class DashboardState:
     def _send_ws_all(self, msg_type: str, data: object, msg: str) -> None:
         _websocket_for(self)._send_ws_all(msg_type, data, msg)
 
-    def _send_ws_owners(self, msg: str) -> None:
-        _websocket_for(self)._send_ws_owners(msg)
+    def _send_ws_owners(self, msg: str, *, skip_slot_patch_clients: bool = False) -> None:
+        if skip_slot_patch_clients:
+            _websocket_for(self)._send_ws_owners(msg, skip_slot_patch_clients=True)
+        else:
+            _websocket_for(self)._send_ws_owners(msg)
 
     def broadcast_ws(self, msg_type: str, data: object) -> None:
         # Mirror first, broadcast second. A relay reader consumes the SSE stream,

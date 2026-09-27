@@ -799,6 +799,11 @@ class AcpEvent:
     #: carried no result payload; a measured empty payload has byte length 0.
     tool_output_digest: str = ""
     tool_output_bytes: int = -1
+    #: ``(fingerprint, section)`` for every credential redacted from the result,
+    #: from ``security.credential_sources.tool_output_fingerprints``. Keyed
+    #: digests only: the dashboard uses them to name where a credential in a
+    #: later reply came from, and the value itself is never carried.
+    tool_output_credentials: tuple[tuple[str, str | None], ...] = ()
     tool_final: bool = False  # True when this tool_result is the final (status=completed) update
     #: The backend's own status on this ``tool_call_update``, verbatim and
     #: unmapped: ``completed``, ``failed``, and whatever else it sends.
@@ -845,9 +850,12 @@ class AcpEvent:
     #: several sessions on one runtime (see ``JsonRpcMessage.fanout_no_owner``).
     #: A consumer must not read such an event as ITS OWN activity -- it is
     #: another tenant's traffic. Set by the roster broadcast (which never names
-    #: an owner) and by the MCP registration notifications when the frame did
-    #: not name this session -- a registration frame MAY carry a
-    #: ``params.sessionId``, and one that does is owned by the session it names.
+    #: an owner), by the compaction, clear and agent-switch notices and the steer
+    #: echoes when their frame was fanned out, and by the MCP registration
+    #: notifications when the frame did not name this session -- a registration
+    #: frame MAY carry a ``params.sessionId``, and one that does is owned by the
+    #: session it names. A ``session/update`` names its session by protocol and is
+    #: routed to it, so its events leave the flag clear.
     #: The same event kind reached through a routed ``session/update`` (the KAS
     #: sub-agent lifecycle path) leaves it False, because that frame belongs to
     #: exactly one session.
@@ -873,6 +881,11 @@ class AcpEvent:
     #: classification (cache hit), not the miss-default False.
     raw_params_trusted: bool = False
     shell_classified: bool = False
+    #: spawn_target: the agent a KAS sub-agent spawn will start, read from the
+    #: engine-written ``_meta.kiro.consent.resource`` of a consent-classified
+    #: request (``_dispatch.kas_consent_tool``). Empty on every other event. The
+    #: hook gate vets it against ``capabilities.spawn`` before anything is asked.
+    spawn_target: str = ""
     #: tool_identity_trusted: tool_name below came from a provenance-verified
     #: adapter-authored identity channel, never a title or inline fallback.
     #: Security gates must require this flag in addition to a recognized name.
@@ -897,6 +910,11 @@ class AcpEvent:
     # callers that gate on these get no match).
     tool_name: str = ""
     mcp_server_name: str = ""
+    #: The tool id a harness states on a ``session/request_permission`` in
+    #: ``_meta.kiro.toolId`` (KAS: ``run_command`` for a shell command). Set only
+    #: on a permission event, and only from that engine-written field, never from
+    #: the title or the model's arguments. Empty when the frame carries none.
+    harness_tool_id: str = ""
     # Diff content block fields — authoritative before/after text from kiro-cli
     # for write tools. Used by chat_runner to derive the "before" snapshot
     # without a racy disk read (the write has already landed by the time the
