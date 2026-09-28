@@ -126,6 +126,13 @@ sandboxed spawn on the host. That case warns too.
 to one managed path (`agent_scratch.scratch_root()` is `config_dir() / "scratch"`) with no
 override, so a link there is not a relocation the product offers.
 
+On macOS, a private window inside a masked directory leaves the masked parent's
+metadata readable. `mkdir -p` and Node inspect that parent before using the
+window; denying its `lstat` makes an otherwise writable `$KIROCREW_SCRATCH` and
+`$TMPDIR` appear unusable. Seatbelt still denies reading the parent's directory
+contents and all reads, writes, and links in sibling windows. The same rule
+applies to a private window inside a caller-supplied `extra_hidden_dirs` mask.
+
 Masking a credential leaf as a FILE leaves its publish temp to account for separately,
 because a mask covers a path and the temp has a different one. The gateway's two auth
 stores — `token_signing.key` and `refresh_chains.json` — publish through

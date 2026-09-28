@@ -102,6 +102,14 @@ class TestSeatbeltHonoursAWindowInsideACallerMask:
         assert not any(_SIBLING in ln and "require-not" in ln for ln in lines)
         assert not any(ln.lstrip().startswith("(allow") and _APPS in ln for ln in lines)
 
+    def test_mask_parent_allows_metadata_but_not_listing_or_sibling_reads(self) -> None:
+        lines = _seatbelt(extra_hidden_dirs=(_APPS,), extra_private_dirs=(_DATA,))
+        parent = json.dumps(_APPS)
+        reads = _rules_for(lines, "file-read*", _APPS)
+        assert any(f"(require-not (literal {parent}))" in ln for ln in reads)
+        assert f"(deny file-read-data (literal {parent}))" in lines
+        assert not any(f"(require-not (subpath {json.dumps(_SIBLING)}))" in ln for ln in reads)
+
     def test_an_exposed_file_keeps_its_read_carve_out_beside_a_window(self) -> None:
         """A tree can carry both: the window (read-write, its own state) and a
         read-only exposed file. The window branch must not drop either."""
@@ -227,6 +235,14 @@ class TestTwoWindowsInTheScratchMask:
                 assert matching, (operation, window)
                 assert any(except_window in ln for ln in matching), (operation, window)
         assert not any(_OTHER_TREE in ln and "require-not" in ln for ln in lines)
+
+    def test_scratch_parent_is_stat_only_for_tools_entering_a_window(self) -> None:
+        lines = _seatbelt(**self._KWARGS)
+        parent = json.dumps(_SCRATCH)
+        reads = _rules_for(lines, "file-read*", _SCRATCH)
+        assert any(f"(require-not (literal {parent}))" in ln for ln in reads)
+        assert f"(deny file-read-data (literal {parent}))" in lines
+        assert not any(f"(require-not (subpath {json.dumps(_OTHER_TREE)}))" in ln for ln in reads)
 
     def test_a_single_window_spawn_is_unchanged(self) -> None:
         """The first-process shape (no tree to inherit) still gets exactly one window."""

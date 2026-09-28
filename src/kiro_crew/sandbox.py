@@ -8343,9 +8343,17 @@ def _build_seatbelt_profile(
             # A private window (the spawn's own scratch) inside a masked tree:
             # deny the tree except the window, in every direction, so siblings
             # stay hidden while the process keeps read-write on its own dir.
+            # Programs such as mkdir -p and Node inspect each ancestor before
+            # entering the window. Permit metadata on the masked parent itself,
+            # but not directory contents or any sibling's metadata.
             exceptions = " ".join(f"(require-not (subpath {json.dumps(w)}))" for w in windows)
             predicate = f"(require-all (subpath {json.dumps(target)}) {exceptions})"
-            for operation in ("file-read*", "file-write*", "file-link"):
+            rules.append(
+                f"(deny file-read* (require-all {predicate} "
+                f"(require-not (literal {json.dumps(target)}))))"
+            )
+            rules.append(f"(deny file-read-data (literal {json.dumps(target)}))")
+            for operation in ("file-write*", "file-link"):
                 rules.append(f"(deny {operation} {predicate})")
             continue
         if _hidden_path_contains_visible_path(
@@ -8473,7 +8481,8 @@ def _build_seatbelt_profile(
             # the process's own state, so it stays read-WRITE (a read-only
             # window would fail the deps swap renames the view exists to keep
             # working), while every sibling -- and anything installed into the
-            # tree after the profile was built -- stays denied.
+            # tree after the profile was built -- stays denied. Let tools stat
+            # the parent on their way into the window, without listing it.
             window_exceptions = " ".join(
                 f"(require-not (subpath {json.dumps(w)}))" for w in windows
             )
@@ -8484,7 +8493,11 @@ def _build_seatbelt_profile(
                 f" (require-not (literal {json.dumps(f)}))" for f in carved_here
             )
             subpath = f"(subpath {json.dumps(target)})"
-            rules.append(f"(deny file-read* (require-all {subpath} {read_exceptions}))")
+            rules.append(
+                f"(deny file-read* (require-all {subpath} {read_exceptions} "
+                f"(require-not (literal {json.dumps(target)}))))"
+            )
+            rules.append(f"(deny file-read-data (literal {json.dumps(target)}))")
             for operation in ("file-write*", "file-link"):
                 rules.append(f"(deny {operation} (require-all {subpath} {window_exceptions}))")
             continue
